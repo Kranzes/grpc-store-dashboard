@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+	<style>
+		path { fill: none; stroke: #1e66f5; stroke-width: 1.8; stroke-linecap: round }
+		circle { fill: #7287fd }
+		.hub { fill: #1e66f5 }
+		@media (prefers-color-scheme: dark) {
+			path { stroke: #8aadf4 }
+			circle { fill: #b7bdf8 }
+			.hub { fill: #8aadf4 }
+		}
+	</style>
+	<path d="M6 12h4m0 0c3 0 3-6 7-6m-7 6c3 0 3 6 7 6m-7-6h7"/>
+	<circle class="hub" cx="5" cy="12" r="2.6"/>
+	<circle cx="18.5" cy="6" r="2.1"/>
+	<circle cx="18.5" cy="12" r="2.1"/>
+	<circle cx="18.5" cy="18" r="2.1"/>
+</svg>

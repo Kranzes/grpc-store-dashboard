@@ -1,0 +1,95 @@
+{
+  "nodes": {
+    "niks3": {
+      "inputs": {
+        "nixpkgs": [
+          "nix-grpc-store",
+          "nixpkgs"
+        ],
+        "treefmt-nix": "treefmt-nix"
+      },
+      "locked": {
+        "lastModified": 1794484118,
+        "narHash": "sha256-yChquUsnIzRAsFg8fti4jw/4WxUc4xTJfs0BrZfcTHE=",
+        "owner": "Mic92",
+        "repo": "niks3",
+        "rev": "7fb409f485e91cce1fd0105e022a2f26a7a4fcd0",
+        "type": "github"
+      },
+      "original": {
+        "owner": "Mic92",
+        "repo": "niks3",
+        "type": "github"
+      }
+    },
+    "nix-grpc-store": {
+      "inputs": {
+        "niks3": "niks3",
+        "nixpkgs": "nixpkgs"
+      },
+      "locked": {
+        "lastModified": 1794505023,
+        "narHash": "sha256-Kwv13UPXk1dtfLfuxM25qAlnDG/BlOE18tdZj3hOUOo=",
+        "owner": "Mic92",
+        "repo": "nix-grpc-store",
+        "rev": "f9d3adb7baad4f15d5c5260c4fb8b53078d1094e",
+        "type": "github"
+      },
+      "original": {
+        "owner": "Mic92",
+        "repo": "nix-grpc-store",
+        "rev": "f9d3adb7baad4f15d5c5260c4fb8b53078d1094e",
+        "type": "github"
+      }
+    },
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1793826729,
+        "narHash": "sha256-D5H7H+qMoTGI/jJtxKP4u7BdjkFnUyhOovTrf3pTOr0=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "6dadaf4375be35033e1c84395adbd53ff5fded96",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixpkgs-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "nix-grpc-store": "nix-grpc-store",
+        "nixpkgs": [
+          "nix-grpc-store",
+          "nixpkgs"
+        ]
+      }
+    },
+    "treefmt-nix": {
+      "inputs": {
+        "nixpkgs": [
+          "nix-grpc-store",
+          "niks3",
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1791885023,
+        "narHash": "sha256-C3alQ2MEt0zVrUSho5NUDo3jmhbff72++bfwoqT9Omo=",
+        "owner": "numtide",
+        "repo": "treefmt-nix",
+        "rev": "0d6d739a833ba9a9c93034862e4a7b061a062a1c",
+        "type": "github"
+      },
+      "original": {
+        "owner": "numtide",
+        "repo": "treefmt-nix",
+        "type": "github"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}

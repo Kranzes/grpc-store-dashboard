@@ -1,0 +1,1089 @@
+From 1c48dede572be3450ff8678a5e2e5afbf8978115 Mon Sep 17 00:00:00 2001
+From: Ilan Joselevich <personal@ilanjoselevich.com>
+Date: Tue, 10 Nov 2026 19:27:59 +0100
+Subject: [PATCH 11/12] scheduler: keep recent builds and serve them as
+ Events.RecentBuilds
+
+A watcher knows only what finished since it connected. A reload, a
+second tab or a failover leaves a build list empty, and finished builds
+pass through the event stream once. The scheduler now remembers them.
+
+It keeps two rings of shared, immutable records next to the counters:
+the last 10,000 builds that finished on a builder, without error text,
+and the last 2,000 failures, with the masked text DrvGone carries. A
+record names the derivation, its system, the builder, the outcome and
+status, the assignment, when it was assigned, started and finished,
+and up to 4 identities of the clients that waited on it. Cache hits and
+queued drops stay out. A new term clears both rings, as it clears the
+counters.
+
+Events.RecentBuilds returns them newest first, in batches of 256: up to
+1,000 records older than before_ms, up to 256 failures with their text,
+or the newest record of up to 16 named derivations. The last batch says
+whether the ring holds anything older. A call copies pointers under the
+dispatcher's lock and serializes after releasing it. It authorizes as
+Watch does, takes at most 4 calls per caller and 16 at once, and
+answers UNAVAILABLE on a passive node. A new gauge counts what each
+ring holds.
+
+events-test covers the caps, the text only in the failures ring, what
+stays out, and a new term. events-grpc-test covers paging, the failures
+ring, named derivations, anonymous callers, the per-caller cap and a
+passive node.
+---
+ proto/events.proto              |  50 +++++++
+ src/daemon/dispatcher-events.cc | 153 +++++++++++++++++++--
+ src/daemon/dispatcher.cc        |  12 +-
+ src/daemon/dispatcher.hh        |  43 +++++-
+ src/daemon/events.cc            | 129 ++++++++++++++++--
+ src/daemon/events.hh            |   8 ++
+ src/daemon/metrics.hh           |  14 ++
+ tests/events-grpc-test.cc       | 234 ++++++++++++++++++++++++++++++++
+ tests/events-test.cc            | 134 ++++++++++++++++++
+ 9 files changed, 746 insertions(+), 31 deletions(-)
+
+diff --git a/proto/events.proto b/proto/events.proto
+index 2dfd6f6..3b377aa 100644
+--- a/proto/events.proto
++++ b/proto/events.proto
+@@ -42,10 +42,60 @@ package nix.remote;
+ // Kept self-contained (no imports) so clients can vendor this one file.
+ service Events {
+   rpc Watch(WatchRequest) returns (stream WatchEvents);
++  // Builds that finished on a builder while this scheduler was active, newest
++  // first, in batches. Same role and anonymous rule as Watch. At most 4 calls
++  // per caller and 16 in all at once; RESOURCE_EXHAUSTED beyond that. A
++  // passive node answers UNAVAILABLE.
++  rpc RecentBuilds(RecentBuildsRequest) returns (stream RecentBuildsBatch);
+ }
+ 
+ message WatchRequest {}
+ 
++// The scheduler keeps two rings, both emptied when it becomes the active
++// scheduler: the last 10,000 builds that finished on a builder (BUILT,
++// FAILED, CANCELLED, and DROPPED after an assignment), without error text,
++// and the last 2,000 FAILED ones, with it.
++message RecentBuildsRequest {
++  // Only builds that finished before this, Unix ms. 0 = now.
++  uint64 before_ms = 1;
++  // At most this many, 0 = 256, capped at 1000; with with_error, capped at 256.
++  uint32 limit = 2;
++  // From the failures ring, which keeps failures longer than the builds ring.
++  bool failed_only = 3;
++  // Fill FinishedBuild.error. Only with failed_only.
++  bool with_error = 4;
++  // Only these derivations (base names, at most 16), the newest record of
++  // each, error included. before_ms, limit and failed_only are ignored.
++  repeated string drv_paths = 5;
++}
++
++message RecentBuildsBatch {
++  // At most 256 per batch.
++  repeated FinishedBuild builds = 1;
++  // Last batch only: the ring holds nothing older than the last row sent.
++  bool complete = 2;
++  // Last batch only: the oldest finish time the ring holds, 0 if empty.
++  uint64 oldest_ms = 3;
++}
++
++message FinishedBuild {
++  string drv_path = 1;
++  string system = 2;
++  string worker_addr = 3;
++  DrvGone.Outcome outcome = 4;
++  DrvGone.Status status = 5;
++  // FAILED, with with_error or drv_paths only: as DrvGone.error.
++  string error = 6;
++  uint64 assign_id = 7;
++  // 0 when unknown (adopted after a restart).
++  uint64 assigned_ms = 8;
++  // 0: the builder did not report it.
++  uint64 build_started_ms = 9;
++  uint64 finished_ms = 10;
++  // Identities of the clients that waited on it when it finished, at most 4.
++  repeated string requested_by = 11;
++}
++
+ // Events are batched per stream message, like the scheduler's other streams.
+ message WatchEvents {
+   repeated WatchEvent msgs = 1;
+diff --git a/src/daemon/dispatcher-events.cc b/src/daemon/dispatcher-events.cc
+index ceb25f4..f34f99d 100644
+--- a/src/daemon/dispatcher-events.cc
++++ b/src/daemon/dispatcher-events.cc
+@@ -12,6 +12,7 @@
+ #include <functional>
+ #include <iterator>
+ #include <map>
++#include <memory>
+ #include <optional>
+ #include <random>
+ #include <ratio>
+@@ -206,6 +207,9 @@ void Dispatcher::startServingLocked()
+     servingSinceMs = sampledAtMs = nowMs();
+     counters.Clear();
+     history.clear();
++    recentAll.clear();
++    recentFailed.clear();
++    metrics.schedRecentBuilds(0, 0);
+     for (auto & info : workerInfo) {
+         info.totals.clear();
+     }
+@@ -363,7 +367,8 @@ void Dispatcher::drvChangedLocked(sched::DrvId drv, DrvState::Cause cause, std::
+     }
+ }
+ 
+-void Dispatcher::drvGoneLocked(std::string drvPath, DrvGone::Outcome outcome, sched::WorkerId wid, const Done * done)
++void Dispatcher::drvGoneLocked(
++    std::string drvPath, DrvGone::Outcome outcome, sched::WorkerId wid, const Done * done, const Assignment * assignment)
+ {
+     switch (outcome) {
+     case DrvGone::BUILT:
+@@ -384,11 +389,20 @@ void Dispatcher::drvGoneLocked(std::string drvPath, DrvGone::Outcome outcome, sc
+             counters.set_published_bytes(counters.published_bytes() + output.nar_size());
+         }
+     }
++    // Only builders that report it send a status, and only with BUILT and FAILED.
++    bool const reported = done != nullptr && (outcome == DrvGone::BUILT || outcome == DrvGone::FAILED);
++    // Not every builder masks, and U+FFFD can triple the size: mask and
++    // cut again. Never logged.
++    std::string error;
++    if (reported && outcome == DrvGone::FAILED && !done->error().empty()) {
++        error = cutMiddle(redactSecrets(cleanUtf8(done->error())), errorCap);
++    }
++    if (wid != sched::noWorker && assignment != nullptr) {
++        rememberLocked(drvPath, outcome, wid, reported ? done : nullptr, *assignment, error);
++    }
+     if (eventWatchers.empty()) {
+         return;
+     }
+-    // Only builders that report it send a status, and only with BUILT and FAILED.
+-    bool const reported = done != nullptr && (outcome == DrvGone::BUILT || outcome == DrvGone::FAILED);
+     WatchEvent event;
+     auto & gone = *event.mutable_drv_gone();
+     gone.set_drv_path(std::move(drvPath));
+@@ -406,14 +420,122 @@ void Dispatcher::drvGoneLocked(std::string drvPath, DrvGone::Outcome outcome, sc
+     if (reported && DrvGone::Status_IsValid(done->status())) {
+         gone.set_status(static_cast<DrvGone::Status>(done->status()));
+     }
+-    // Every builder may not mask, and U+FFFD can triple the size: mask and
+-    // cut again. Never logged.
+-    if (reported && outcome == DrvGone::FAILED && !done->error().empty()) {
+-        gone.set_error(cutMiddle(redactSecrets(cleanUtf8(done->error())), errorCap));
+-    }
++    gone.set_error(std::move(error));
+     emitLocked(std::move(event));
+ }
+ 
++auto Dispatcher::assignmentLocked(const sched::Entry & ent) const -> Assignment
++{
++    Assignment out{
++        .assignId = ent.assignId, .assignMs = ent.assignMs, .buildStartedMs = ent.buildStartedMs, .system = ent.system};
++    for (auto const cid : ent.followers) {
++        if (out.requestedBy.size() >= maxRequestedBy) {
++            break;
++        }
++        if (auto const client = clients.find(cid);
++            client != clients.end() && !std::ranges::contains(out.requestedBy, client->second->identity)) {
++            out.requestedBy.push_back(client->second->identity);
++        }
++    }
++    return out;
++}
++
++void Dispatcher::rememberLocked(
++    const std::string & drvPath, DrvGone::Outcome outcome, sched::WorkerId wid, const Done * done,
++    const Assignment & assignment, const std::string & error)
++{
++    auto record = std::make_shared<nix::remote::FinishedBuild>();
++    record->set_drv_path(drvPath);
++    record->set_system(assignment.system);
++    record->set_worker_addr(core.worker(wid).addr);
++    record->set_outcome(outcome);
++    if (done != nullptr && DrvGone::Status_IsValid(done->status())) {
++        record->set_status(static_cast<DrvGone::Status>(done->status()));
++    }
++    record->set_assign_id(assignment.assignId);
++    record->set_assigned_ms(assignment.assignMs > 0 ? wallMs(assignment.assignMs) : 0);
++    record->set_build_started_ms(assignment.buildStartedMs);
++    record->set_finished_ms(wallMs(nowMs()));
++    for (const auto & identity : assignment.requestedBy) {
++        record->add_requested_by(identity);
++    }
++    // The builds ring never holds text, so it keeps none alive past the
++    // failures ring.
++    if (outcome == DrvGone::FAILED) {
++        auto failed = std::make_shared<nix::remote::FinishedBuild>(*record);
++        failed->set_error(error);
++        recentFailed.push_back(std::move(failed));
++        if (recentFailed.size() > recentFailuresKept) {
++            recentFailed.pop_front();
++        }
++    }
++    recentAll.push_back(std::move(record));
++    if (recentAll.size() > recentBuildsKept) {
++        recentAll.pop_front();
++    }
++    metrics.schedRecentBuilds(recentAll.size(), recentFailed.size());
++}
++
++auto Dispatcher::recentCounts() -> std::pair<size_t, size_t>
++{
++    const Lock lock(*this);
++    return {recentAll.size(), recentFailed.size()};
++}
++
++auto Dispatcher::recentBuilds(const nix::remote::RecentBuildsRequest & request) -> std::optional<RecentAnswer>
++{
++    static constexpr uint32_t defaultLimit = 256;
++    static constexpr uint32_t maxLimit = 1000;
++    static constexpr uint32_t maxWithError = 256;
++    static constexpr int maxPaths = 16;
++    const Lock lock(*this);
++    if (lettingGo) {
++        return std::nullopt;
++    }
++    RecentAnswer answer;
++    if (request.drv_paths_size() > 0) {
++        // The newest record of each, from the failures ring first, which
++        // holds the text.
++        for (int idx = 0; idx < std::min(request.drv_paths_size(), maxPaths); idx++) {
++            const auto & path = request.drv_paths(idx);
++            auto const newest = [&](const auto & ring) -> std::shared_ptr<const nix::remote::FinishedBuild> {
++                auto const found = std::ranges::find_if(
++                    ring.rbegin(), ring.rend(), [&](const auto & rec) -> bool { return rec->drv_path() == path; });
++                return found == ring.rend() ? nullptr : *found;
++            };
++            auto record = newest(recentFailed);
++            auto const any = newest(recentAll);
++            // A newer build of it that did not fail wins.
++            if (!record || (any && any->finished_ms() > record->finished_ms())) {
++                record = any;
++            }
++            if (record) {
++                answer.builds.push_back(std::move(record));
++            }
++        }
++        answer.complete = true;
++        return answer;
++    }
++    const auto & ring = request.failed_only() ? recentFailed : recentAll;
++    auto limit = request.limit() == 0 ? defaultLimit : std::min(request.limit(), maxLimit);
++    if (request.with_error()) {
++        limit = std::min(limit, maxWithError);
++    }
++    auto iter = ring.rbegin();
++    if (request.before_ms() != 0) {
++        // Records go in as builds end, and finished_ms comes from a steady
++        // clock, so each ring is in order.
++        iter = std::make_reverse_iterator(std::ranges::partition_point(
++            ring, [&](const auto & rec) -> bool { return rec->finished_ms() < request.before_ms(); }));
++    }
++    for (; iter != ring.rend() && answer.builds.size() < limit; ++iter) {
++        answer.builds.push_back(*iter);
++    }
++    answer.complete = iter == ring.rend();
++    answer.oldestMs = ring.empty() ? 0 : ring.front()->finished_ms();
++    return answer;
++}
++
+ // Carries the latest report too, so the worker is no longer dirty.
+ void Dispatcher::workerChangedLocked(sched::WorkerId wid)
+ {
+@@ -581,7 +703,7 @@ auto Dispatcher::heldLocked(sched::WorkerId wid) const -> std::vector<Tracked>
+             continue;
+         }
+         if (const auto & ent = core.entry(drv); ent && ent->worker == wid) {
+-            held.push_back({.drv = drv, .path = ent->drvPath, .worker = wid});
++            held.push_back({.drv = drv, .path = ent->drvPath, .worker = wid, .assignment = assignmentLocked(*ent)});
+         }
+     }
+     return held;
+@@ -628,7 +750,8 @@ void Dispatcher::settledLocked(const std::vector<Tracked> & tracked, DrvState::C
+         // may be back under another id, which adoptedLocked reports.
+         if (!ent || ent->drvPath != was.path) {
+             if (!core.findDrv(was.path)) {
+-                drvGoneLocked(was.path, DrvGone::DROPPED, was.worker);
++                drvGoneLocked(
++                    was.path, DrvGone::DROPPED, was.worker, nullptr, was.assignment ? &*was.assignment : nullptr);
+             }
+             continue;
+         }
+@@ -669,7 +792,7 @@ void Dispatcher::adoptedLocked(sched::WorkerId wid, const nix::remote::Hello & h
+     }
+ }
+ 
+-void Dispatcher::doneLocked(sched::WorkerId wid, const Done & done, bool assigned)
++void Dispatcher::doneLocked(sched::WorkerId wid, const Done & done, bool assigned, const Assignment * assignment)
+ {
+     if (!assigned) {
+         return; // stale: not this worker's
+@@ -682,17 +805,17 @@ void Dispatcher::doneLocked(sched::WorkerId wid, const Done & done, bool assigne
+             counters.set_requeued(counters.requeued() + 1);
+             drvChangedLocked(*drv, DrvState::CAUSE_REQUEUED, giveBackReason(done));
+         } else {
+-            drvGoneLocked(done.drv_path(), DrvGone::DROPPED, wid);
++            drvGoneLocked(done.drv_path(), DrvGone::DROPPED, wid, nullptr, assignment);
+         }
+         break;
+     case Done::BUILT:
+-        drvGoneLocked(done.drv_path(), DrvGone::BUILT, wid, &done);
++        drvGoneLocked(done.drv_path(), DrvGone::BUILT, wid, &done, assignment);
+         break;
+     case Done::FAILED:
+-        drvGoneLocked(done.drv_path(), DrvGone::FAILED, wid, &done);
++        drvGoneLocked(done.drv_path(), DrvGone::FAILED, wid, &done, assignment);
+         break;
+     default:
+-        drvGoneLocked(done.drv_path(), DrvGone::CANCELLED, wid);
++        drvGoneLocked(done.drv_path(), DrvGone::CANCELLED, wid, nullptr, assignment);
+     }
+ }
+ 
+diff --git a/src/daemon/dispatcher.cc b/src/daemon/dispatcher.cc
+index 9daeb20..ef43382 100644
+--- a/src/daemon/dispatcher.cc
++++ b/src/daemon/dispatcher.cc
+@@ -920,6 +920,14 @@ void Dispatcher::onDone(sched::WorkerId wid, const nix::remote::Done & done)
+     if (done.outcome() == nix::remote::Done::FAILED) {
+         metrics.schedFailure(statusLabel(done.status()));
+     }
++    // The entry as it was, for the recent builds rings: the Core call may retire it.
++    std::optional<Assignment> before;
++    if (auto const drv = core.findDrv(done.drv_path())) {
++        if (const auto & ent = core.entry(*drv); ent && ent->worker == wid) {
++            before = assignmentLocked(*ent);
++        }
++    }
++    auto const * const assignment = before ? &*before : nullptr;
+     if (done.outcome() == nix::remote::Done::GIVEN_BACK || done.outcome() == nix::remote::Done::NO_SHOW) {
+         bool const held = core.giveBack(
+             lease, done.reason() == nix::remote::Done::DRAINING ? sched::GaveBack::worker : sched::GaveBack::drv);
+@@ -935,7 +943,7 @@ void Dispatcher::onDone(sched::WorkerId wid, const nix::remote::Done & done)
+             }
+         }
+         metrics.event("given_back_" + nix::remote::Done::Reason_Name(done.reason()));
+-        doneLocked(wid, done, held);
++        doneLocked(wid, done, held, assignment);
+         placeabilityChangedLocked(); // its followers may have no worker left
+         return;
+     }
+@@ -946,7 +954,7 @@ void Dispatcher::onDone(sched::WorkerId wid, const nix::remote::Done & done)
+         }
+     }
+     bool const assigned = core.done(lease, outputs);
+-    doneLocked(wid, done, assigned);
++    doneLocked(wid, done, assigned, assignment);
+ }
+ 
+ auto Dispatcher::workerMsgLocked(Worker & worker, const nix::remote::WorkerMsg & msg) -> bool
+diff --git a/src/daemon/dispatcher.hh b/src/daemon/dispatcher.hh
+index fb6bd18..91d3277 100644
+--- a/src/daemon/dispatcher.hh
++++ b/src/daemon/dispatcher.hh
+@@ -159,6 +159,22 @@ public:
+     // Dispatch passes run so far. For tests.
+     [[nodiscard]] auto dispatchPasses() -> uint64_t;
+ 
++    // Events.RecentBuilds: builds that finished on a builder in this term,
++    // newest first, as the request selects them. Only pointers are copied
++    // under the mutex. nullopt: not serving.
++    static constexpr size_t recentBuildsKept = 10000;
++    static constexpr size_t recentFailuresKept = 2000;
++    static constexpr size_t maxRequestedBy = 4;
++    struct RecentAnswer
++    {
++        std::vector<std::shared_ptr<const nix::remote::FinishedBuild>> builds;
++        bool complete = false;
++        uint64_t oldestMs = 0;
++    };
++    auto recentBuilds(const nix::remote::RecentBuildsRequest & request) -> std::optional<RecentAnswer>;
++    // Records in the builds ring and the failures ring.
++    [[nodiscard]] auto recentCounts() -> std::pair<size_t, size_t>;
++
+     // URLs per worker, and in Counters, before the rest add up under "other".
+     static constexpr size_t maxWorkerUrls = 32;
+     static constexpr size_t maxFarmUrls = 64;
+@@ -270,14 +286,30 @@ private:
+     std::deque<nix::remote::CounterSample> history ABSL_GUARDED_BY(mutex);
+     double sampledAtMs ABSL_GUARDED_BY(mutex) = 0;
+ 
++    // What the scheduler knew of a drv's assignment, taken before a Core
++    // call retires the entry, for the recent builds rings.
++    struct Assignment
++    {
++        uint64_t assignId = 0;
++        double assignMs = 0;
++        uint64_t buildStartedMs = 0;
++        std::string system;
++        std::vector<std::string> requestedBy; // distinct, at most maxRequestedBy
++    };
++
+     // A drv a Core call may change or retire, as it was before.
+     struct Tracked
+     {
+         sched::DrvId drv;
+         std::string path;
+         sched::WorkerId worker;
++        std::optional<Assignment> assignment = std::nullopt;
+     };
+ 
++    // Newest last, as they finished.
++    std::deque<std::shared_ptr<const nix::remote::FinishedBuild>> recentAll ABSL_GUARDED_BY(mutex);
++    std::deque<std::shared_ptr<const nix::remote::FinishedBuild>> recentFailed ABSL_GUARDED_BY(mutex);
++
+     [[nodiscard]] auto nowMs() const -> double;
+     void debugLog(std::initializer_list<LogField> fields) const;
+     [[nodiscard]] auto systemFor(std::string_view system) const -> std::string_view;
+@@ -348,8 +380,15 @@ private:
+     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) auto clientEventLocked(const Client & client) const -> nix::remote::WatchEvent;
+     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void drvChangedLocked(
+         sched::DrvId drv, nix::remote::DrvState::Cause cause, std::string reason = {});
++    // `assignment`: what the entry held before it went, when it had a worker.
+     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void drvGoneLocked(
+-        std::string drvPath, nix::remote::DrvGone::Outcome outcome, sched::WorkerId wid, const nix::remote::Done * done = nullptr);
++        std::string drvPath, nix::remote::DrvGone::Outcome outcome, sched::WorkerId wid,
++        const nix::remote::Done * done = nullptr, const Assignment * assignment = nullptr);
++    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) auto assignmentLocked(const sched::Entry & ent) const -> Assignment;
++    // Into the rings: every finished build, and failures again with text.
++    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void rememberLocked(
++        const std::string & drvPath, nix::remote::DrvGone::Outcome outcome, sched::WorkerId wid,
++        const nix::remote::Done * done, const Assignment & assignment, const std::string & error);
+     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void workerChangedLocked(sched::WorkerId wid);
+     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void clientConnectedLocked(const Client & client);
+     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void clientLeftLocked(sched::ClientId cid);
+@@ -369,7 +408,7 @@ private:
+         sched::WorkerId wid, const nix::remote::Hello & hel, const std::vector<Tracked> & before);
+     // `assigned`: the Core call found the drv on `wid` and changed it.
+     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void doneLocked(
+-        sched::WorkerId wid, const nix::remote::Done & done, bool assigned);
++        sched::WorkerId wid, const nix::remote::Done & done, bool assigned, const Assignment * assignment);
+ };
+ 
+ } // namespace nixgrpc
+diff --git a/src/daemon/events.cc b/src/daemon/events.cc
+index 56c518c..cae72f3 100644
+--- a/src/daemon/events.cc
++++ b/src/daemon/events.cc
+@@ -1,10 +1,16 @@
+ // Events.Watch: auth and the stream caps. WatchReactor does the rest.
++// Events.RecentBuilds: the same auth, and the scheduler's rings in batches.
+ 
+ #include "events.hh"
+ 
+ #include <absl/synchronization/mutex.h>
++#include <cstddef>
++#include <expected>
++#include <functional>
+ #include <string>
++#include <string_view>
+ #include <utility>
++#include <vector>
+ 
+ #include <grpcpp/server_context.h>
+ #include <grpcpp/support/server_callback.h>
+@@ -52,6 +58,113 @@ void StreamLimit::release(const std::string & caller)
+     }
+ }
+ 
++namespace {
++
++// Who may read the scheduler's events: never anonymous callers, whatever
++// --allow-anonymous grants, because the events name clients and derivations.
++auto admit(const Auth & auth, const grpc::CallbackServerContext & context, std::string_view method)
++    -> std::expected<Caller, grpc::Status>
++{
++    auto caller = auth.identify(context);
++    if (caller.kind == Caller::Kind::anonymous) {
++        if (auth.metrics != nullptr) {
++            auth.metrics->countDenied(std::string(method), "anonymous");
++        }
++        logLine(
++            LogLevel::info,
++            {{"event", "denied"}, {"method", std::string(method)}, {"cn", caller.name}, {"role", "anonymous"}});
++        return std::unexpected(grpc::Status{
++            grpc::StatusCode::UNAUTHENTICATED, std::string(method) + " requires a TLS client certificate or bearer token"});
++    }
++    if (auto status = auth.authorize(caller, method, Role::watch); !status.ok()) {
++        return std::unexpected(std::move(status));
++    }
++    return caller;
++}
++
++// Writes prepared batches one after another, then OK.
++class BatchWriter final : public grpc::ServerWriteReactor<nix::remote::RecentBuildsBatch>
++{
++public:
++    BatchWriter(std::vector<nix::remote::RecentBuildsBatch> batches, std::function<void()> done)
++        : batches(std::move(batches))
++        , done(std::move(done))
++    {
++        next();
++    }
++
++    void OnWriteDone(bool isOk) override
++    {
++        if (!isOk) {
++            Finish({grpc::StatusCode::CANCELLED, "the client went away"});
++            return;
++        }
++        next();
++    }
++
++    void OnDone() override
++    {
++        done();
++        delete this; // NOLINT(cppcoreguidelines-owning-memory): created by EventsService::RecentBuilds
++    }
++
++private:
++    void next()
++    {
++        if (sent == batches.size()) {
++            Finish(grpc::Status::OK);
++            return;
++        }
++        StartWrite(&batches.at(sent++));
++    }
++
++    std::vector<nix::remote::RecentBuildsBatch> batches;
++    size_t sent = 0;
++    std::function<void()> done;
++};
++
++} // namespace
++
++auto EventsService::RecentBuilds(grpc::CallbackServerContext * context, const nix::remote::RecentBuildsRequest * request)
++    -> grpc::ServerWriteReactor<nix::remote::RecentBuildsBatch> *
++{
++    using Reject = RejectWriter<nix::remote::RecentBuildsBatch>;
++    if (!active_) {
++        return new Reject(WatchReactor::passive()); // NOLINT(cppcoreguidelines-owning-memory): deletes itself in OnDone
++    }
++    auto const admitted = admit(*auth, *context, "RecentBuilds");
++    if (!admitted) {
++        return new Reject(admitted.error()); // NOLINT(cppcoreguidelines-owning-memory)
++    }
++    const auto & caller = *admitted;
++    if (!recentCalls.acquire(caller.name)) {
++        return new Reject( // NOLINT(cppcoreguidelines-owning-memory)
++            {grpc::StatusCode::RESOURCE_EXHAUSTED, "too many RecentBuilds calls, for this caller or in all"});
++    }
++    auto release = [this, name = caller.name] -> void { recentCalls.release(name); };
++    auto answer = dispatcher->recentBuilds(*request);
++    if (!answer) {
++        release();
++        return new Reject(WatchReactor::passive()); // NOLINT(cppcoreguidelines-owning-memory)
++    }
++    // Copied out of the shared records, after the dispatcher's lock.
++    bool const withError = request->drv_paths_size() > 0 || (request->failed_only() && request->with_error());
++    std::vector<nix::remote::RecentBuildsBatch> batches(1);
++    for (const auto & record : answer->builds) {
++        if (batches.back().builds_size() == recentBatch) {
++            batches.emplace_back();
++        }
++        auto & out = *batches.back().add_builds();
++        out = *record;
++        if (!withError) {
++            out.clear_error();
++        }
++    }
++    batches.back().set_complete(answer->complete);
++    batches.back().set_oldest_ms(answer->oldestMs);
++    return new BatchWriter(std::move(batches), std::move(release)); // NOLINT(cppcoreguidelines-owning-memory)
++}
++
+ auto EventsService::Watch(grpc::CallbackServerContext * context, const nix::remote::WatchRequest * /*request*/)
+     -> grpc::ServerWriteReactor<nix::remote::WatchEvents> *
+ {
+@@ -59,19 +172,11 @@ auto EventsService::Watch(grpc::CallbackServerContext * context, const nix::remo
+     if (!active_) {
+         return new Reject(WatchReactor::passive()); // NOLINT(cppcoreguidelines-owning-memory): deletes itself in OnDone
+     }
+-    auto const caller = auth->identify(*context);
+-    // The stream names clients and derivations: never for anonymous callers,
+-    // whatever --allow-anonymous grants.
+-    if (caller.kind == Caller::Kind::anonymous) {
+-        if (auth->metrics != nullptr) {
+-            auth->metrics->countDenied("Watch", "anonymous");
+-        }
+-        logLine(LogLevel::info, {{"event", "denied"}, {"method", "Watch"}, {"cn", caller.name}, {"role", "anonymous"}});
+-        return new Reject({grpc::StatusCode::UNAUTHENTICATED, "Watch requires a TLS client certificate or bearer token"}); // NOLINT(cppcoreguidelines-owning-memory)
+-    }
+-    if (auto const status = auth->authorize(caller, "Watch", Role::watch); !status.ok()) {
+-        return new Reject(status); // NOLINT(cppcoreguidelines-owning-memory)
++    auto const admitted = admit(*auth, *context, "Watch");
++    if (!admitted) {
++        return new Reject(admitted.error()); // NOLINT(cppcoreguidelines-owning-memory)
+     }
++    const auto & caller = *admitted;
+     if (!streams.acquire(caller.name)) {
+         logLine(LogLevel::info, {{"event", "watch_stream_refused"}, {"cn", caller.name}});
+         return new Reject({grpc::StatusCode::RESOURCE_EXHAUSTED, "too many Watch streams, for this caller or in all"}); // NOLINT(cppcoreguidelines-owning-memory)
+diff --git a/src/daemon/events.hh b/src/daemon/events.hh
+index 43309f1..c20b8dd 100644
+--- a/src/daemon/events.hh
++++ b/src/daemon/events.hh
+@@ -50,8 +50,15 @@ public:
+ 
+     EventsService(Dispatcher & dispatcher, Auth & auth, IdleTracker & idle);
+ 
++    // RecentBuilds calls at once.
++    static constexpr unsigned maxRecentCalls = 16;
++    static constexpr unsigned maxRecentCallsPerCaller = 4;
++    static constexpr int recentBatch = 256;
++
+     auto Watch(grpc::CallbackServerContext * context, const nix::remote::WatchRequest * request)
+         -> grpc::ServerWriteReactor<nix::remote::WatchEvents> * override;
++    auto RecentBuilds(grpc::CallbackServerContext * context, const nix::remote::RecentBuildsRequest * request)
++        -> grpc::ServerWriteReactor<nix::remote::RecentBuildsBatch> * override;
+ 
+     void setActive(bool active)
+     {
+@@ -64,6 +71,7 @@ private:
+     IdleTracker * idle;
+     std::atomic<bool> active_{true};
+     StreamLimit streams{maxStreams, maxStreamsPerCaller};
++    StreamLimit recentCalls{maxRecentCalls, maxRecentCallsPerCaller};
+ };
+ 
+ } // namespace nixgrpc
+diff --git a/src/daemon/metrics.hh b/src/daemon/metrics.hh
+index 21ad878..0f76600 100644
+--- a/src/daemon/metrics.hh
++++ b/src/daemon/metrics.hh
+@@ -163,6 +163,13 @@ class Metrics
+                                                     .Help("GetBuildLog calls following a running build now")
+                                                     .Register(*registry)
+                                                     .Add({});
++    prometheus::Family<prometheus::Gauge> * recentBuildsFam =
++        &prometheus::BuildGauge()
++             .Name("nix_grpc_sched_recent_builds")
++             .Help("Records in the scheduler's recent builds rings: builds, failures")
++             .Register(*registry);
++    prometheus::Gauge * recentBuildsAll = &recentBuildsFam->Add({{"ring", "builds"}});
++    prometheus::Gauge * recentBuildsFailed = &recentBuildsFam->Add({{"ring", "failures"}});
+     prometheus::Family<prometheus::Counter> * buildLogUploads =
+         &prometheus::BuildCounter()
+              .Name("nix_grpc_build_log_uploads_total")
+@@ -454,6 +461,13 @@ public:
+         schedSystemFam->Remove(gauge);
+     }
+ 
++    // How many records the scheduler's recent builds rings hold.
++    void schedRecentBuilds(size_t builds, size_t failures) const
++    {
++        recentBuildsAll->Set(static_cast<double>(builds));
++        recentBuildsFailed->Set(static_cast<double>(failures));
++    }
++
+     void schedClients(int delta) const
+     {
+         sched->Add({{"kind", "clients"}}).Increment(delta);
+diff --git a/tests/events-grpc-test.cc b/tests/events-grpc-test.cc
+index 15fa2fa..a3154e2 100644
+--- a/tests/events-grpc-test.cc
++++ b/tests/events-grpc-test.cc
+@@ -722,6 +722,239 @@ void testService()
+     srv.server->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds(1));
+ }
+ 
++// Workers of 50 slots each, for `capacity` builds at once. run() ends
++// builds named <tag><n> as `outcome` says.
++struct Builds
++{
++    static constexpr uint32_t slots = 50;
++    std::vector<std::unique_ptr<FakeWorker>> workers;
++
++    Builds(Farm & farm, size_t capacity)
++    {
++        for (size_t first = 0; first < capacity; first += slots) {
++            auto & wkr = *workers.emplace_back(std::make_unique<FakeWorker>());
++            rpc::WorkerMsgs hello;
++            auto * hel = hello.add_msgs()->mutable_hello();
++            hel->set_addr(std::format("w-{}:50051", first));
++            hel->add_systems("x86_64-linux");
++            hel->set_max_jobs(slots);
++            farm.disp.workerMsgs(wkr.worker, hello);
++        }
++    }
++
++    void run(Farm & farm, size_t count, std::string_view tag, const std::function<rpc::Done::Outcome(size_t)> & outcome)
++    {
++        auto const client = farm.client("ci-" + std::string(tag));
++        rpc::ClientMsgs wants;
++        for (size_t idx = 0; idx < count; idx++) {
++            wants.add_msgs()->mutable_want()->set_drv_path(std::format("{:032}-{}{}.drv", idx, tag, idx));
++        }
++        farm.disp.clientMsgs(client, wants);
++        for (auto & wkr : workers) {
++            rpc::WorkerMsgs dones;
++            const std::scoped_lock lock(wkr->mutex);
++            for (const auto & exp : std::exchange(wkr->expected, {})) {
++                auto const & path = exp.drv_path();
++                auto const out = outcome(static_cast<size_t>(std::stoull(path.substr(0, 32))));
++                auto * done = dones.add_msgs()->mutable_done();
++                done->set_drv_path(path);
++                done->set_assign_id(exp.assign_id());
++                done->set_outcome(out);
++                if (out == rpc::Done::FAILED) {
++                    done->set_status(rpc::Done::STATUS_PERMANENT_FAILURE);
++                    // About 3 KiB, so 256 of them fill more than a stream window.
++                    done->set_error("error: " + std::string(3000, 'x') + " " + path + " failed");
++                }
++            }
++            farm.disp.workerMsgs(wkr->worker, dones);
++        }
++    }
++};
++
++struct Recent
++{
++    grpc::ClientContext ctx;
++    std::unique_ptr<grpc::ClientReader<rpc::RecentBuildsBatch>> reader;
++    std::vector<rpc::RecentBuildsBatch> batches;
++
++    Recent(rpc::Events::Stub & stub, const rpc::RecentBuildsRequest & request)
++    {
++        ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(20));
++        reader = stub.RecentBuilds(&ctx, request);
++    }
++
++    auto finish() -> grpc::Status
++    {
++        rpc::RecentBuildsBatch batch;
++        while (reader->Read(&batch)) {
++            batches.push_back(batch);
++        }
++        return reader->Finish();
++    }
++
++    [[nodiscard]] auto builds() const -> std::vector<rpc::FinishedBuild>
++    {
++        std::vector<rpc::FinishedBuild> out;
++        for (const auto & batch : batches) {
++            out.insert(out.end(), batch.builds().begin(), batch.builds().end());
++        }
++        return out;
++    }
++};
++
++// Events.RecentBuilds through the service: paging, the failures ring and
++// its text, drv_paths, the last batch's fields, and the service's checks.
++void testRecentBuilds()
++{
++    Farm farm;
++    std::optional<oidc::Verifier> verifier;
++    Tls const tls("dash-viewer");
++    Auth auth{.oidc = &verifier};
++    auth.acl.addRule(tls.name + "=watch");
++    auth.acl.allowAnonymous(Role::write);
++    IdleTracker idle;
++    EventsService service(farm.disp, auth, idle);
++    Server srv(service, tls);
++    auto const ask = [&](const rpc::RecentBuildsRequest & req) -> Recent * {
++        auto * call = new Recent(*srv.certStub, req);
++        assert(call->finish().ok());
++        return call;
++    };
++    // 1,200 builds, a quarter of them failed, in two rounds a few ms apart.
++    Builds pool(farm, 600);
++    auto const quarter = [](size_t idx) -> rpc::Done::Outcome {
++        return idx % 4 == 0 ? rpc::Done::FAILED : rpc::Done::BUILT;
++    };
++    pool.run(farm, 600, "a", quarter);
++    std::this_thread::sleep_for(std::chrono::milliseconds(20));
++    pool.run(farm, 600, "b", quarter);
++
++    // Newest first, 256 per batch, at most 1000; the last batch says more is left.
++    rpc::RecentBuildsRequest all;
++    all.set_limit(5000);
++    std::unique_ptr<Recent> first(ask(all));
++    auto rows = first->builds();
++    assert(rows.size() == 1000 && first->batches.size() == 4);
++    assert(first->batches.front().builds_size() == EventsService::recentBatch);
++    assert(!first->batches.back().complete() && first->batches.back().oldest_ms() > 0);
++    for (size_t idx = 1; idx < rows.size(); idx++) {
++        assert(rows.at(idx - 1).finished_ms() >= rows.at(idx).finished_ms());
++        assert(rows.at(idx).error().empty());
++    }
++    assert(rows.front().drv_path().contains("-b"));
++    // Paging by before_ms, here the oldest of the late round, reaches the
++    // oldest, and says so.
++    rpc::RecentBuildsRequest older;
++    older.set_before_ms(rows.at(599).finished_ms());
++    assert(rows.at(599).drv_path().contains("-b") && rows.at(600).drv_path().contains("-a"));
++    older.set_limit(1000);
++    std::unique_ptr<Recent> page(ask(older));
++    auto const rest = page->builds();
++    assert(rest.size() == 600 && page->batches.back().complete());
++    assert(page->batches.back().oldest_ms() == rest.back().finished_ms());
++    for (const auto & row : rest) {
++        assert(row.finished_ms() < older.before_ms() && row.drv_path().contains("-a"));
++    }
++    // The failures ring: text only with with_error, and then at most 256.
++    rpc::RecentBuildsRequest fails;
++    fails.set_failed_only(true);
++    fails.set_limit(1000);
++    std::unique_ptr<Recent> bare(ask(fails));
++    assert(bare->builds().size() == 300);
++    for (const auto & row : bare->builds()) {
++        assert(row.outcome() == rpc::DrvGone::FAILED && row.error().empty());
++    }
++    fails.set_with_error(true);
++    std::unique_ptr<Recent> texts(ask(fails));
++    assert(texts->builds().size() == 256);
++    for (const auto & row : texts->builds()) {
++        assert(row.error().ends_with(" failed") && row.status() == rpc::DrvGone::STATUS_PERMANENT_FAILURE);
++    }
++    // with_error needs failed_only.
++    all.set_with_error(true);
++    std::unique_ptr<Recent> noText(ask(all));
++    for (const auto & row : noText->builds()) {
++        assert(row.error().empty());
++    }
++    // drv_paths: the newest record of each, with its text.
++    rpc::RecentBuildsRequest some;
++    some.add_drv_paths(std::format("{:032}-a0.drv", 0));
++    some.add_drv_paths(std::format("{:032}-b1.drv", 1));
++    some.add_drv_paths("unknown.drv");
++    std::unique_ptr<Recent> named(ask(some));
++    auto const found = named->builds();
++    assert(found.size() == 2);
++    assert(found.at(0).outcome() == rpc::DrvGone::FAILED && found.at(0).error().ends_with(" failed"));
++    assert(found.at(1).outcome() == rpc::DrvGone::BUILT && found.at(1).worker_addr().starts_with("w-"));
++    assert(named->batches.back().complete());
++
++    // Anonymous callers are refused, as for Watch.
++    {
++        Recent anon(*srv.stub, all);
++        assert(anon.finish().error_code() == grpc::StatusCode::UNAUTHENTICATED);
++    }
++    // Four calls per caller, a fifth is refused. The calls write without
++    // waiting for the client, so the four are held inside the dispatcher: a
++    // watcher's send blocks while it holds the mutex.
++    std::mutex gate;
++    std::condition_variable opened;
++    bool blocking = false;
++    bool open = false;
++    auto const watcher = farm.disp.watch(
++        [&](rpc::WatchEvent && event) -> bool {
++            [[maybe_unused]] auto const dropped = std::move(event);
++            std::unique_lock lock(gate);
++            if (blocking) {
++                opened.wait(lock, [&] -> bool { return open; });
++            }
++            return true;
++        },
++        [] -> void {});
++    assert(watcher);
++    {
++        const std::scoped_lock lock(gate);
++        blocking = true;
++    }
++    std::thread holder([&] -> void {
++        rpc::ClientMsgs want;
++        want.add_msgs()->mutable_want()->set_drv_path("held.drv");
++        farm.disp.clientMsgs(farm.client("ci-held"), want);
++    });
++    std::vector<std::unique_ptr<Recent>> held;
++    std::vector<std::thread> readers;
++    held.reserve(EventsService::maxRecentCallsPerCaller);
++    readers.reserve(EventsService::maxRecentCallsPerCaller);
++    for (unsigned idx = 0; idx < EventsService::maxRecentCallsPerCaller; idx++) {
++        held.push_back(std::make_unique<Recent>(*srv.certStub, all));
++    }
++    for (auto & call : held) {
++        readers.emplace_back([&call] -> void { assert(call->finish().ok()); });
++    }
++    std::this_thread::sleep_for(std::chrono::milliseconds(500));
++    {
++        Recent fifth(*srv.certStub, all);
++        assert(fifth.finish().error_code() == grpc::StatusCode::RESOURCE_EXHAUSTED);
++    }
++    // Freed, the four finish.
++    {
++        const std::scoped_lock lock(gate);
++        open = true;
++    }
++    opened.notify_all();
++    holder.join();
++    for (auto & reader : readers) {
++        reader.join();
++    }
++    farm.disp.unwatch(*watcher);
++    // A passive node answers UNAVAILABLE.
++    service.setActive(false);
++    {
++        Recent passive(*srv.certStub, all);
++        assert(passive.finish().error_code() == grpc::StatusCode::UNAVAILABLE);
++    }
++    srv.server->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds(1));
++}
++
+ // What the daemon writes to stderr, its log, while this lives. The text
+ // goes back to stderr at the end, so the test's own log keeps it.
+ class CapturedLog
+@@ -1105,6 +1338,7 @@ try {
+     testErrorBatchCut();
+     testLimit();
+     testService();
++    testRecentBuilds();
+     testForwardedViewer(args.at(1));
+     testTokenExpiry(args.at(1), args.at(2));
+     testWatchFlags();
+diff --git a/tests/events-test.cc b/tests/events-test.cc
+index 1bc1ea7..7c9490d 100644
+--- a/tests/events-test.cc
++++ b/tests/events-test.cc
+@@ -1807,6 +1807,139 @@ void testProgress()
+     disp.unwatch(*watcher);
+ }
+ 
++// Runs `count` builds named <tag><n> on `wkr` (63 slots) and ends each as
++// `outcome(n)` says, in rounds of what the worker holds.
++void runBuilds(
++    Dispatcher & disp, Session & wkr, const Dispatcher::ClientPtr & client, const std::string & tag, size_t count,
++    const std::function<rpc::Done::Outcome(size_t)> & outcome)
++{
++    constexpr size_t round = 63;
++    for (size_t first = 0; first < count; first += round) {
++        rpc::ClientMsgs wants;
++        for (size_t idx = first; idx < std::min(count, first + round); idx++) {
++            wants.add_msgs()->mutable_want()->set_drv_path(std::format("{:032}-{}.drv", idx, tag));
++        }
++        disp.clientMsgs(client, wants);
++        std::vector<std::pair<std::string, uint64_t>> held;
++        {
++            const std::scoped_lock lock(wkr.mutex);
++            for (const auto & cmd : std::exchange(wkr.cmds, {})) {
++                if (cmd.has_expect()) {
++                    held.emplace_back(cmd.expect().drv_path(), cmd.expect().assign_id());
++                }
++            }
++        }
++        rpc::WorkerMsgs dones;
++        for (const auto & [path, assignId] : held) {
++            auto const idx = static_cast<size_t>(std::stoull(path.substr(0, 32)));
++            auto const out = outcome(idx);
++            *dones.add_msgs() = doneMsg(
++                path, assignId, out, out == rpc::Done::FAILED ? rpc::Done::STATUS_PERMANENT_FAILURE : rpc::Done::STATUS_BUILT,
++                out == rpc::Done::FAILED ? "error: builder failed\n" + path : "");
++        }
++        disp.workerMsgs(wkr.worker, dones);
++    }
++}
++
++auto recentOf(Dispatcher & disp, const std::vector<std::string> & paths) -> std::vector<rpc::FinishedBuild>
++{
++    rpc::RecentBuildsRequest req;
++    for (const auto & path : paths) {
++        req.add_drv_paths(path);
++    }
++    std::vector<rpc::FinishedBuild> out;
++    for (const auto & rec : disp.recentBuilds(req)->builds) {
++        out.push_back(*rec);
++    }
++    return out;
++}
++
++// The rings: every build that finished on a builder, and failures again
++// with their text, each capped, emptied by a new term.
++void testRecentBuilds()
++{
++    Metrics metrics("");
++    std::unordered_set<std::string> const present{"cached-out"};
++    Dispatcher disp(
++        {.defaultSystem = std::string(x86),
++         .present = [&](const std::vector<std::string> & keys) -> std::unordered_set<std::string> {
++             std::unordered_set<std::string> out;
++             for (const auto & key : keys) {
++                 if (present.contains(key)) {
++                     out.insert(key);
++                 }
++             }
++             return out;
++         },
++         .lookupThreads = 0},
++        metrics);
++    Session wkr;
++    sendOne(disp, wkr.worker, helloMsg("w1", 63));
++    auto const client = disp.connectClient([](const rpc::SchedMsg &) -> bool { return true; }, [] -> void {}, "ci");
++    // Every fourth fails: 10,500 builds, 2,625 failures.
++    constexpr size_t builds = 10500;
++    runBuilds(disp, wkr, client, "r", builds, [](size_t idx) -> rpc::Done::Outcome {
++        return idx % 4 == 0 ? rpc::Done::FAILED : rpc::Done::BUILT;
++    });
++    auto [all, failed] = disp.recentCounts();
++    assert(all == Dispatcher::recentBuildsKept && failed == Dispatcher::recentFailuresKept);
++    // The oldest went first.
++    assert(recentOf(disp, {std::format("{:032}-r.drv", 0)}).empty());
++    auto const kept = recentOf(disp, {std::format("{:032}-r.drv", builds - 1), std::format("{:032}-r.drv", builds - 4)});
++    assert(kept.size() == 2);
++    assert(kept.at(0).outcome() == rpc::DrvGone::BUILT && kept.at(0).error().empty());
++    assert(kept.at(1).outcome() == rpc::DrvGone::FAILED && kept.at(1).error().starts_with("error: builder failed"));
++    assert(kept.at(0).worker_addr() == "w1" && kept.at(0).assign_id() > 0 && kept.at(0).finished_ms() > 0);
++    assert(kept.at(0).assigned_ms() > 0 && kept.at(0).requested_by_size() == 1 && kept.at(0).requested_by(0) == "ci");
++    // A failure's record in the builds ring has no text; the failures ring's has.
++    rpc::RecentBuildsRequest newest;
++    newest.set_limit(10);
++    for (const auto & rec : disp.recentBuilds(newest)->builds) {
++        assert(rec->error().empty());
++    }
++    newest.set_failed_only(true);
++    auto const fails = disp.recentBuilds(newest)->builds;
++    assert(fails.size() == 10);
++    for (const auto & rec : fails) {
++        assert(rec->outcome() == rpc::DrvGone::FAILED && !rec->error().empty());
++    }
++
++    // Cache hits and queued drops do not enter the rings.
++    rpc::ClientMsgs other;
++    auto * hit = other.add_msgs()->mutable_want();
++    hit->set_drv_path("hit.drv");
++    hit->add_out_keys("cached-out");
++    auto * queued = other.add_msgs()->mutable_want();
++    queued->set_drv_path("nowhere.drv");
++    queued->set_system("riscv64-linux");
++    disp.clientMsgs(client, other);
++    rpc::ClientMsgs cancel;
++    cancel.add_msgs()->mutable_cancel()->set_drv_path("nowhere.drv");
++    disp.clientMsgs(client, cancel);
++    assert(disp.recentCounts() == std::pair(all, failed));
++    assert(recentOf(disp, {"hit.drv", "nowhere.drv"}).empty());
++
++    // requested_by keeps at most 4 distinct identities.
++    std::vector<Dispatcher::ClientPtr> waiting;
++    for (int idx = 0; idx < 6; idx++) {
++        waiting.push_back(disp.connectClient(
++            [](const rpc::SchedMsg &) -> bool { return true; }, [] -> void {}, "user-" + std::to_string(idx % 5)));
++        rpc::ClientMsgs want;
++        want.add_msgs()->mutable_want()->set_drv_path("shared.drv");
++        disp.clientMsgs(waiting.back(), want);
++    }
++    sendOne(disp, wkr.worker, doneMsg("shared.drv", wkr.assignId("shared.drv"), rpc::Done::BUILT, rpc::Done::STATUS_BUILT));
++    auto const shared = recentOf(disp, {"shared.drv"});
++    assert(shared.size() == 1 && shared.front().requested_by_size() == 4);
++    std::set<std::string> const names(shared.front().requested_by().begin(), shared.front().requested_by().end());
++    assert(names.size() == 4);
++
++    // A new term starts empty.
++    disp.restarting();
++    disp.serving();
++    assert(disp.recentCounts() == std::pair(size_t{0}, size_t{0}));
++}
++
+ } // namespace
+ // NOLINTEND(*-magic-numbers, *-avoid-unchecked-container-access, bugprone-unchecked-optional-access, readability-identifier-length, cert-msc32-c, cert-msc51-cpp, bugprone-random-generator-seed, misc-use-internal-linkage)
+ 
+@@ -1820,6 +1953,7 @@ try {
+     testVersionCut();
+     testReports();
+     testProgress();
++    testRecentBuilds();
+     testRandom();
+     return 0;
+ } catch (std::exception & err) {
+-- 
+2.56.0
+

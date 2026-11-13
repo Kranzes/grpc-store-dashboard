@@ -1,0 +1,3 @@
+# A farm's dashboard is not for search engines.
+User-agent: *
+Disallow: /

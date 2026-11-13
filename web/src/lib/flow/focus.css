@@ -1,0 +1,29 @@
+/*
+ * Focus on the map. While something is focused, the map fades every node and
+ * rate label, and one adopted stylesheet, focusCss in focus.ts, brings back
+ * the bright ones by their class token. A focus change is one class toggle
+ * and one sheet replacement; no node component re-renders. Lines fade on the
+ * line canvas in lineLayer.ts, where their dots keep moving.
+ *
+ * Faded lines drop below 3:1 against the map on purpose, since they are
+ * context while the user looks at one line, and the panel carries the
+ * numbers.
+ * Faded nodes keep their text at AA: opacity would break it in Latte, so
+ * their text turns to --fg-muted and only non-text marks fade.
+ */
+
+.farm-map.focusing .rate-label {
+	visibility: hidden;
+}
+
+.farm-map.focusing .farm-live {
+	--fg: var(--fg-muted);
+	--warn-fg: var(--fg-muted);
+	--danger-fg: var(--fg-muted);
+	--accent-strong: var(--fg-muted);
+	--chrome: 0.35;
+	--node-shadow: none;
+	--node-border: var(--border-subtle);
+	--badge-bg: transparent;
+	--fail-ring: var(--border-subtle);
+}

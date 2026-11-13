@@ -1,0 +1,15 @@
+{
+	"extends": "$app/tsconfig",
+	"compilerOptions": {
+		"strict": true,
+		"types": ["$app/types", "node"]
+	},
+	"include": [
+		"src",
+		"e2e",
+		"vite.config.ts",
+		"vitest-client-env.ts",
+		"eslint.config.js",
+		"playwright.config.ts"
+	]
+}

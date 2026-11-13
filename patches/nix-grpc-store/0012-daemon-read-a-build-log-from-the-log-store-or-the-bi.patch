@@ -1,0 +1,1224 @@
+From 03eba1107fe4133fabfa2895fc7de06e81e04fe5 Mon Sep 17 00:00:00 2001
+From: Ilan Joselevich <personal@ilanjoselevich.com>
+Date: Tue, 10 Nov 2026 19:31:36 +0100
+Subject: [PATCH 12/12] daemon: read a build log from the log store or the
+ binary cache
+
+A builder that left the farm takes Nix's kept logs with it, and a node
+asked about a build it never ran has nothing to send. After LIVE and
+KEPT, GetBuildLog now asks the farm's log store (--build-log-store),
+then its binary cache (--niks3-cache-url).
+
+The log store's copy is read whole with getBuildLog and served as
+STORE. niks3 already uploads the log of every built output it pushes as
+log/<drv>, so the node fetches <url>/log/<drv> through Nix's file
+transfer, which applies its netrc and decodes niks3's zstd, and serves
+it as CACHE. Both go through the decode cache, so offsets, limits and
+tails work on them, and they share its two decode slots. Uploads are at
+most 64 MiB, so a node holds at most 128 MiB of store reads in memory.
+At shutdown the daemon destroys the decode cache before the log store.
+
+A store or cache that cannot be read, through an outage or expired
+credentials, is passed over, so the other can still answer. When
+neither has the log, an unreadable one answers UNAVAILABLE rather than
+NOT_FOUND or DATA_LOSS. HTTP 404, and the 403 S3 sends for a key it
+does not have, read as NOT_FOUND. Messages name a URL without its user,
+password or query, since they go to watchers. The cache holds built
+logs only, until niks3's next garbage collection.
+
+Helm passes niks3.cacheURL to the builders too, and the buildLogStore
+option says that nodes read from the store.
+
+log-cache-test covers a missing log and one that stops partway, from a
+source that can and cannot be read. In checks.vm, one test server plays
+the binary cache and the log stores. The mTLS daemon reads a zstd log
+through a cache URL with credentials and a query, from the start and
+from an offset, and gets NOT_FOUND for 403 and UNAVAILABLE for 401 with
+no credentials in the message. The module's daemon answers from its log
+store once the kept file is gone. A daemon whose store answers 401
+falls back to the cache, and answers UNAVAILABLE when the cache has
+nothing either. In checks.farm, the builder that did not run a build
+may answer with the cache's copy of its log.
+---
+ .../helm/nix-grpc-farm/templates/worker.yaml  |   4 +
+ nixos/common.nix                              |   3 +-
+ proto/nix_remote.proto                        |   8 +-
+ src/daemon/build-log-service.cc               | 244 +++++++++++++++---
+ src/daemon/build-log-service.hh               |  40 ++-
+ src/daemon/log-cache.hh                       |  17 +-
+ src/daemon/main.cc                            |  58 +++--
+ src/daemon/options.hh                         |   3 +-
+ tests/e2e/transfer.rs                         | 104 +++++++-
+ tests/farm.nix                                |   4 +-
+ tests/log-cache-test.cc                       |  79 +++++-
+ tests/nixos-test.nix                          |  86 ++++--
+ 12 files changed, 528 insertions(+), 122 deletions(-)
+
+diff --git a/deploy/helm/nix-grpc-farm/templates/worker.yaml b/deploy/helm/nix-grpc-farm/templates/worker.yaml
+index 39e0785..f304d35 100644
+--- a/deploy/helm/nix-grpc-farm/templates/worker.yaml
++++ b/deploy/helm/nix-grpc-farm/templates/worker.yaml
+@@ -206,6 +206,10 @@ spec:
+             - --log-level={{ $root.Values.logLevel }}
+             - --niks3={{ $root.Values.niks3.serverURL }}
+             - --niks3-token-file=/secrets/niks3/token
++            {{- if $root.Values.niks3.cacheURL }}
++            # The builder reads build logs it does not have from the cache.
++            - --niks3-cache-url={{ $root.Values.niks3.cacheURL }}
++            {{- end }}
+             {{- with $root.Values.niks3.pushFlags }}
+             - --niks3-push=niks3 push {{ join " " . }}
+             {{- end }}
+diff --git a/nixos/common.nix b/nixos/common.nix
+index 694a3a2..0f73a79 100644
+--- a/nixos/common.nix
++++ b/nixos/common.nix
+@@ -391,7 +391,8 @@ in
+       description = ''
+         Nix store URL a builder copies each build's log to, failed builds
+         included, so the logs outlive the builder. Read them with
+-        `nix log --store <URL>`. Use a bucket of its own, since niks3's
++        `nix log --store <URL>`. Nodes answer GetBuildLog from it too, for
++        logs they do not have. Use a bucket of its own, since niks3's
+         garbage collection deletes the same keys in its bucket. A drain
+         waits up to a minute for the last uploads.
+       '';
+diff --git a/proto/nix_remote.proto b/proto/nix_remote.proto
+index b8d39f5..53a3d35 100644
+--- a/proto/nix_remote.proto
++++ b/proto/nix_remote.proto
+@@ -128,9 +128,11 @@ message NarFrame {
+ //
+ // INVALID_ARGUMENT: a bad path, or tail or limit with follow. NOT_FOUND: no
+ // log of it here or in a store this node reads. UNIMPLEMENTED: this node keeps
+-// no logs. DATA_LOSS: a .bz2 log does not decompress. OUT_OF_RANGE: offset
+-// past the end of a finished log. RESOURCE_EXHAUSTED: too many log calls on
+-// this node or from this caller, or no decode slot within 10 s.
++// no logs. DATA_LOSS: a .bz2 log does not decompress. UNAVAILABLE: a store
++// this node reads could not be read just now, and no other source had the
++// log. OUT_OF_RANGE: offset past the end of a finished log.
++// RESOURCE_EXHAUSTED: too many log calls on this node or from this caller,
++// or no decode slot within 10 s.
+ // UNAUTHENTICATED "bearer token expired": a follow call outlived its bearer
+ // token by a minute, as Events.Watch does.
+ //
+diff --git a/src/daemon/build-log-service.cc b/src/daemon/build-log-service.cc
+index d9bf6a0..430d51b 100644
+--- a/src/daemon/build-log-service.cc
++++ b/src/daemon/build-log-service.cc
+@@ -6,6 +6,7 @@
+ #include <chrono>
+ #include <cstddef>
+ #include <cstdint>
++#include <exception>
+ #include <expected>
+ #include <filesystem>
+ #include <functional>
+@@ -31,8 +32,11 @@
+ #include <grpcpp/server_context.h>
+ #include <grpcpp/support/status.h>
+ 
++#include <nix/store/filetransfer.hh>
+ #include <nix/store/local-fs-store.hh>
+ #include <nix/store/path.hh>
++#include <nix/util/serialise.hh>
++#include <nix/util/url.hh>
+ #include <nix/util/error.hh>
+ #include <nix/util/finally.hh>
+ 
+@@ -46,6 +50,7 @@
+ #include "nix_remote.pb.h"
+ #include "pump.hh"
+ #include "push.hh"
++#include "substituter-url.hh"
+ 
+ namespace nixgrpc {
+ 
+@@ -121,6 +126,40 @@ auto countNewlines(std::string_view data) -> uint64_t
+     return static_cast<uint64_t>(std::ranges::count(data, '\n'));
+ }
+ 
++auto damagedLog(const std::string & name) -> grpc::Status
++{
++    return {grpc::StatusCode::DATA_LOSS, name + " does not decompress"};
++}
++
++auto unreadableLog(const std::string & name) -> grpc::Status
++{
++    return {grpc::StatusCode::UNAVAILABLE, name + " cannot be read now"};
++}
++
++auto noLog(const std::string & drv, const std::string & node) -> grpc::Status
++{
++    return {grpc::StatusCode::NOT_FOUND, "no build log of " + drv + " on " + node};
++}
++
++// The answer of a call that could not start on a decode. When the source
++// has no such log or could not be read, `found` goes false: nothing was sent
++// yet, so the call may try the next source.
++auto notStarted(const grpc::Status & status, const std::string & name, bool & found) -> grpc::Status
++{
++    switch (status.error_code()) {
++    case grpc::StatusCode::NOT_FOUND:
++        found = false;
++        return grpc::Status::OK;
++    case grpc::StatusCode::UNAVAILABLE:
++        found = false;
++        return unreadableLog(name);
++    case grpc::StatusCode::DATA_LOSS:
++        return damagedLog(name);
++    default:
++        return status;
++    }
++}
++
+ auto clientGone() -> grpc::Status
+ {
+     return {grpc::StatusCode::CANCELLED, "the client went away"};
+@@ -425,20 +464,56 @@ auto BuildLogService::serve(
+                  "no build log of " + request.drv_path() + " on " + config.advertise
+                      + ": another build of it runs here and replaced the log"});
+         }
+-        if (!logDir) {
++        if (!logDir && config.cacheUrl.empty() && !config.storeLog) {
+             return done({grpc::StatusCode::UNIMPLEMENTED, config.advertise + " keeps no build logs"});
+         }
+         bool found = false;
+-        auto status = kept(call, *logDir, found);
+-        if (found) {
++        if (logDir) {
++            auto status = kept(call, *logDir, found);
++            if (found) {
++                return done(std::move(status));
++            }
++        }
++        if (auto status = fromStores(call, found); found) {
+             return done(std::move(status));
+         }
+-        return done({grpc::StatusCode::NOT_FOUND, "no build log of " + request.drv_path() + " on " + config.advertise});
++        return done(noLog(request.drv_path(), config.advertise));
+     } catch (StreamClosed &) {
+         return done(clientGone());
+     }
+ }
+ 
++auto BuildLogService::fromStores(Call & call, bool & found) -> grpc::Status
++{
++    std::string_view unreadableSource = "none";
++    grpc::Status unreadable;
++    auto const tried = [&](grpc::Status status) -> std::optional<grpc::Status> {
++        if (found) {
++            return status;
++        }
++        if (!status.ok() && unreadable.ok()) {
++            unreadableSource = call.source;
++            unreadable = std::move(status);
++        }
++        return std::nullopt;
++    };
++    if (config.storeLog) {
++        call.source = "store";
++        if (auto status = tried(fromStore(call, found))) {
++            return *status;
++        }
++    }
++    if (!config.cacheUrl.empty()) {
++        call.source = "cache";
++        if (auto status = tried(fromCache(call, found))) {
++            return *status;
++        }
++    }
++    call.source = unreadableSource;
++    found = !unreadable.ok();
++    return unreadable;
++}
++
+ auto BuildLogService::live(Call & call, const Builder::Running & run) -> grpc::Status
+ {
+     auto & shared = *run.shared;
+@@ -525,9 +600,21 @@ auto BuildLogService::kept(Call & call, const std::filesystem::path & logDir, bo
+             return plain(call, file.get(), info);
+         }
+         if (::stat(bz2.c_str(), &info) == 0) {
+-            found = true;
+             call.source = "kept";
+-            return decoded(call, bz2, mtimeNs(info));
++            auto const mtime = mtimeNs(info);
++            Decoding const how{
++                .key = bz2.string() + "@" + std::to_string(mtime),
++                .name = bz2.string(),
++                .source = BuildLogInfo::SOURCE_KEPT,
++                .modifiedMs = mtime / nsPerMs,
++                .decode = [bz2](const LogCache::Write & write) -> LogCache::Decoded {
++                    UniqueFd const file(::open(bz2.c_str(), O_RDONLY | O_CLOEXEC)); // NOLINT(cppcoreguidelines-pro-type-vararg)
++                    if (!file) {
++                        return LogCache::Decoded::missing;
++                    }
++                    return bunzip2(file.get(), write) ? LogCache::Decoded::ok : LogCache::Decoded::failed;
++                }};
++            return decoded(call, how, found);
+         }
+     }
+     return grpc::Status::OK;
+@@ -582,22 +669,16 @@ auto BuildLogService::plain(Call & call, int file, const struct stat & stat) ->
+     return grpc::Status::OK;
+ }
+ 
+-auto BuildLogService::entry(Call & call, const std::filesystem::path & bz2, uint64_t mtime)
+-    -> std::expected<LogCache::Reader, grpc::Status>
++auto BuildLogService::entry(Call & call, const Decoding & how) -> std::expected<LogCache::Reader, grpc::Status>
+ {
+-    auto const key = bz2.string() + "@" + std::to_string(mtime);
+-    if (auto reader = cache.find(key)) {
++    if (auto reader = cache.find(how.key)) {
+         return std::move(*reader);
+     }
+     auto slot = decodeSlot(call);
+     if (!slot) {
+         return std::unexpected(slot.error());
+     }
+-    auto decode = [bz2](const LogCache::Write & write) -> bool {
+-        UniqueFd const file(::open(bz2.c_str(), O_RDONLY | O_CLOEXEC)); // NOLINT(cppcoreguidelines-pro-type-vararg)
+-        return file && bunzip2(file.get(), write);
+-    };
+-    return cache.start(key, std::move(decode), std::move(*slot));
++    return cache.start(how.key, how.decode, std::move(*slot));
+ }
+ 
+ // Where a call on a cached decode starts, once the entry holds it: the
+@@ -609,14 +690,22 @@ auto BuildLogService::startIn(Call & call, const LogCache::Reader & entry, LogCa
+     const auto & request = call.request;
+     auto const start = request.offset();
+     state = entry->state();
+-    while (!state.ended() && (request.tail() != 0 || state.written < start)) {
++    // Until it holds the start, or a first byte, so a missing log is known.
++    while (!state.ended() && (request.tail() != 0 || state.written < start || state.written == 0)) {
+         if (call.cancelled()) {
+             return std::unexpected(clientGone());
+         }
+         state = entry->waitPast(state.written, cancelPoll);
+     }
++    if (state.missing) {
++        return std::unexpected(grpc::Status{grpc::StatusCode::NOT_FOUND, ""});
++    }
+     if (state.failed && state.written < start) {
+-        return std::unexpected(grpc::Status{grpc::StatusCode::DATA_LOSS, "the log does not decompress"});
++        return std::unexpected(grpc::Status{grpc::StatusCode::DATA_LOSS, ""});
++    }
++    // Nothing to send from here: the next source may have it.
++    if (state.unavailable && state.written <= start) {
++        return std::unexpected(grpc::Status{grpc::StatusCode::UNAVAILABLE, ""});
+     }
+     if (request.tail() != 0 && state.complete) {
+         return entry->lineStartAtOrAfter(tailStart(start, state.written, request.tail()));
+@@ -644,9 +733,10 @@ auto BuildLogService::info(
+     return out;
+ }
+ 
+-auto BuildLogService::decoded(Call & call, const std::filesystem::path & bz2, uint64_t mtime) -> grpc::Status
++auto BuildLogService::decoded(Call & call, const Decoding & how, bool & found) -> grpc::Status
+ {
+-    auto opened = entry(call, bz2, mtime);
++    found = true;
++    auto opened = entry(call, how);
+     if (!opened) {
+         return opened.error();
+     }
+@@ -654,20 +744,18 @@ auto BuildLogService::decoded(Call & call, const std::filesystem::path & bz2, ui
+     // entry that did not fit goes now and not after that decode.
+     std::optional<LogCache::Reader> held(std::move(*opened));
+     auto const & entry = *held;
+-    auto const damaged = [&] -> grpc::Status { return {grpc::StatusCode::DATA_LOSS, bz2.string() + " does not decompress"}; };
+     LogCache::State state;
+     auto const start = startIn(call, entry, state);
+     if (!start) {
+-        return start.error().error_code() == grpc::StatusCode::DATA_LOSS ? damaged() : start.error();
++        return notStarted(start.error(), how.name, found);
+     }
+     if (state.uncached && state.written <= *start) {
+         held.reset();
+-        return direct(call, bz2, *start, false);
++        return direct(call, how, *start, false);
+     }
+     call.offset = *start;
+     call.stream.setInfo(info(
+-        call, BuildLogInfo::SOURCE_KEPT, mtime / nsPerMs, *start, state.complete ? state.written : 0,
+-        entry->linesBefore(*start)));
++        call, how.source, how.modifiedMs, *start, state.complete ? state.written : 0, entry->linesBefore(*start)));
+ 
+     auto left = call.limit();
+     auto pos = *start;
+@@ -687,13 +775,17 @@ auto BuildLogService::decoded(Call & call, const std::filesystem::path & bz2, ui
+         if (state.complete) {
+             break;
+         }
+-        if (state.failed) {
++        if (state.failed || state.missing) {
+             call.stream.flush();
+-            return damaged();
++            return damagedLog(how.name);
++        }
++        if (state.unavailable) {
++            call.stream.flush();
++            return unreadableLog(how.name);
+         }
+         if (state.uncached) {
+             held.reset();
+-            return direct(call, bz2, pos, true);
++            return direct(call, how, pos, true);
+         }
+         if (call.cancelled()) {
+             return clientGone();
+@@ -704,6 +796,80 @@ auto BuildLogService::decoded(Call & call, const std::filesystem::path & bz2, ui
+     return grpc::Status::OK;
+ }
+ 
++// The binary cache's copy, `<url>/log/<drv>`, through Nix's file transfer,
++// so the node's netrc applies and a Content-Encoding is decoded. It goes
++// through the decode cache like a .bz2 kept log. HTTP 404 is no log, and so
++// is 403, as Nix takes it from a binary cache: S3 answers 403 for a key that
++// does not exist when the bucket cannot be listed.
++auto BuildLogService::fromCache(Call & call, bool & found) -> grpc::Status
++{
++    // The path goes before a query, which a substituter URL can have for
++    // Nix's store settings, such as ?priority=10.
++    auto const & cacheUrl = config.cacheUrl;
++    auto const query = std::min(cacheUrl.find_first_of("?#"), cacheUrl.size());
++    auto url = cacheUrl.substr(0, query);
++    while (url.ends_with('/')) {
++        url.pop_back();
++    }
++    url += "/log/" + call.request.drv_path() + cacheUrl.substr(query);
++    Decoding const how{
++        .key = "cache " + url,
++        // Messages go to watchers: no user, password or query.
++        .name = reduceSubstituterUrl(cacheUrl) + "/log/" + call.request.drv_path(),
++        .source = BuildLogInfo::SOURCE_CACHE,
++        .decode = [url](const LogCache::Write & write) -> LogCache::Decoded {
++            struct Stopped : std::exception
++            {
++            };
++            nix::LambdaSink sink([&](std::string_view data) -> void {
++                if (!write(data)) {
++                    throw Stopped{};
++                }
++            });
++            try {
++                nix::getFileTransfer()->download(nix::FileTransferRequest(nix::VerbatimURL(url)), sink);
++            } catch (Stopped &) {
++                return LogCache::Decoded::ok;
++            } catch (nix::FileTransferError & err) {
++                return err.error == nix::FileTransfer::NotFound || err.error == nix::FileTransfer::Forbidden
++                           ? LogCache::Decoded::missing
++                           : LogCache::Decoded::unavailable;
++            } catch (std::exception &) {
++                return LogCache::Decoded::unavailable;
++            }
++            return LogCache::Decoded::ok;
++        }};
++    return decoded(call, how, found);
++}
++
++// The farm's log store, read whole into memory (uploads are at most
++// 64 MiB), written to the decode cache, freed, and served from that cache.
++auto BuildLogService::fromStore(Call & call, bool & found) -> grpc::Status
++{
++    Decoding const how{
++        .key = "store " + call.request.drv_path(),
++        .name = "the log store's copy",
++        .source = BuildLogInfo::SOURCE_STORE,
++        .decode = [read = config.storeLog, drv = call.request.drv_path()](const LogCache::Write & write) -> LogCache::Decoded {
++            std::optional<std::string> log;
++            try {
++                log = read(drv);
++            } catch (std::exception &) {
++                return LogCache::Decoded::unavailable;
++            }
++            if (!log) {
++                return LogCache::Decoded::missing;
++            }
++            for (std::string_view rest = *log; !rest.empty(); rest.remove_prefix(std::min(rest.size(), readSize))) {
++                if (!write(rest.substr(0, readSize))) {
++                    break;
++                }
++            }
++            return LogCache::Decoded::ok;
++        }};
++    return decoded(call, how, found);
++}
++
+ auto BuildLogService::decodeSlot(Call & call) -> std::expected<DecodeSlots::Slot, grpc::Status>
+ {
+     auto slot = slots.acquire(call.caller.name, decodeWait, [&] -> bool { return call.cancelled(); });
+@@ -715,21 +881,16 @@ auto BuildLogService::decodeSlot(Call & call) -> std::expected<DecodeSlots::Slot
+ 
+ // A log the cache does not hold: decoded again for this call alone, from
+ // the start, skipping what comes before `from`.
+-auto BuildLogService::direct(Call & call, const std::filesystem::path & bz2, uint64_t from, bool infoSent) -> grpc::Status
++auto BuildLogService::direct(Call & call, const Decoding & how, uint64_t from, bool infoSent) -> grpc::Status
+ {
+     auto const slot = decodeSlot(call);
+     if (!slot) {
+         return slot.error();
+     }
+-    UniqueFd const file(::open(bz2.c_str(), O_RDONLY | O_CLOEXEC)); // NOLINT(cppcoreguidelines-pro-type-vararg)
+-    if (!file) {
+-        auto const err = errno;
+-        return {grpc::StatusCode::INTERNAL, "cannot open " + bz2.string() + ": " + std::system_category().message(err)};
+-    }
+     uint64_t pos = 0;
+     uint64_t lines = 0;
+     auto left = call.limit();
+-    bool const decodes = bunzip2(file.get(), [&](std::string_view data) -> bool {
++    auto const result = how.decode([&](std::string_view data) -> bool {
+         if (pos + data.size() <= from) {
+             lines += countNewlines(data);
+             pos += data.size();
+@@ -744,7 +905,7 @@ auto BuildLogService::direct(Call & call, const std::filesystem::path & bz2, uin
+         if (!infoSent) {
+             infoSent = true;
+             call.offset = from;
+-            call.stream.setInfo(info(call, BuildLogInfo::SOURCE_KEPT, 0, from, 0, lines));
++            call.stream.setInfo(info(call, how.source, how.modifiedMs, from, 0, lines));
+         }
+         data = data.substr(0, static_cast<size_t>(std::min<uint64_t>(left, data.size())));
+         call.stream.add(data);
+@@ -755,9 +916,16 @@ auto BuildLogService::direct(Call & call, const std::filesystem::path & bz2, uin
+     if (call.cancelled()) {
+         return clientGone();
+     }
+-    if (!decodes) {
++    if (result == LogCache::Decoded::failed) {
+         call.stream.flush();
+-        return {grpc::StatusCode::DATA_LOSS, bz2.string() + " does not decompress"};
++        return damagedLog(how.name);
++    }
++    if (result == LogCache::Decoded::unavailable) {
++        call.stream.flush();
++        return unreadableLog(how.name);
++    }
++    if (result == LogCache::Decoded::missing && !infoSent) {
++        return noLog(call.request.drv_path(), config.advertise);
+     }
+     if (!infoSent && pos < from) {
+         return pastTheEnd();
+@@ -765,7 +933,7 @@ auto BuildLogService::direct(Call & call, const std::filesystem::path & bz2, uin
+     if (!infoSent) {
+         // An offset at the very end: no bytes, but the info all the same.
+         call.offset = from;
+-        call.stream.setInfo(info(call, BuildLogInfo::SOURCE_KEPT, 0, from, pos, lines));
++        call.stream.setInfo(info(call, how.source, how.modifiedMs, from, pos, lines));
+     }
+     call.stream.finish(false);
+     return grpc::Status::OK;
+diff --git a/src/daemon/build-log-service.hh b/src/daemon/build-log-service.hh
+index e74aa40..aca4429 100644
+--- a/src/daemon/build-log-service.hh
++++ b/src/daemon/build-log-service.hh
+@@ -1,8 +1,10 @@
+ #pragma once
+ // GetBuildLog (proto/nix_remote.proto): a derivation's build log, from the
+-// spill while it builds here (LIVE), else from the file Nix kept (KEPT).
+-// A .bz2 kept log is decoded once into the decode cache (log-cache.hh), so
+-// offsets and tails work on it and N viewers cost one decode.
++// spill while it builds here (LIVE), else from the file Nix kept (KEPT),
++// else from the farm's log store (STORE) or binary cache (CACHE). A .bz2
++// kept log and a store or cache log are decoded once into the decode cache
++// (log-cache.hh), so offsets and tails work on them and N viewers cost one
++// decode.
+ 
+ #include <chrono>
+ #include <cstdint>
+@@ -55,6 +57,12 @@ public:
+     struct Config
+     {
+         std::string advertise;
++        // The farm's binary cache (--niks3-cache-url), for logs this node
++        // does not have. Empty: none.
++        std::string cacheUrl;
++        // The farm's log store (--build-log-store): a log by derivation,
++        // nullopt when it has none. Unset: no store.
++        std::function<std::optional<std::string>(const std::string & drvPath)> storeLog;
+         LogCache::Limits cache;
+     };
+ 
+@@ -85,15 +93,31 @@ private:
+     auto live(Call & call, const Builder::Running & run) -> grpc::Status;
+     auto kept(Call & call, const std::filesystem::path & logDir, bool & found) -> grpc::Status;
+     auto plain(Call & call, int file, const struct stat & stat) -> grpc::Status;
+-    // `mtime`: of the .bz2, in ns since the epoch, which keys the cache.
+-    auto decoded(Call & call, const std::filesystem::path & bz2, uint64_t mtime) -> grpc::Status;
+-    auto entry(Call & call, const std::filesystem::path & bz2, uint64_t mtime)
+-        -> std::expected<LogCache::Reader, grpc::Status>;
++    // A log served through the decode cache: a .bz2 kept log, or one from
++    // the log store or the binary cache.
++    struct Decoding
++    {
++        std::string key;  // the cache's key: what it is and its version
++        std::string name; // for messages
++        nix::remote::BuildLogInfo::Source source = nix::remote::BuildLogInfo::SOURCE_UNSPECIFIED;
++        uint64_t modifiedMs = 0;
++        LogCache::Decode decode;
++    };
++    // `found`: false when the source has no such log, or could not be read
++    // before anything was sent; then the status says why, or is OK.
++    auto decoded(Call & call, const Decoding & how, bool & found) -> grpc::Status;
++    auto entry(Call & call, const Decoding & how) -> std::expected<LogCache::Reader, grpc::Status>;
+     static auto startIn(Call & call, const LogCache::Reader & entry, LogCache::State & state)
+         -> std::expected<uint64_t, grpc::Status>;
+     // A decode slot, waited for as long as decodeWait.
+     auto decodeSlot(Call & call) -> std::expected<DecodeSlots::Slot, grpc::Status>;
+-    auto direct(Call & call, const std::filesystem::path & bz2, uint64_t from, bool infoSent) -> grpc::Status;
++    auto fromCache(Call & call, bool & found) -> grpc::Status;
++    auto fromStore(Call & call, bool & found) -> grpc::Status;
++    // The log store, then the binary cache. One that could not be read is
++    // passed over, and its error is the answer, with `found` set, when the
++    // other has no log either.
++    auto fromStores(Call & call, bool & found) -> grpc::Status;
++    auto direct(Call & call, const Decoding & how, uint64_t from, bool infoSent) -> grpc::Status;
+     // The info message of a log that is not live.
+     auto info(
+         const Call & call,
+diff --git a/src/daemon/log-cache.hh b/src/daemon/log-cache.hh
+index 5ebbd8e..83ef26f 100644
+--- a/src/daemon/log-cache.hh
++++ b/src/daemon/log-cache.hh
+@@ -164,9 +164,11 @@ public:
+ 
+     // Writes the decoded log through `write`, which returns false when the
+     // decode should stop: nobody reads it any more, or it does not fit.
+-    // Returns false when the log does not decode.
++    // Says whether the log decoded, did not, does not exist, or could not
++    // be read: its source cannot be reached or answered with an error.
+     using Write = std::function<bool(std::string_view)>;
+-    using Decode = std::function<bool(const Write & write)>;
++    enum class Decoded : std::uint8_t { ok, failed, missing, unavailable };
++    using Decode = std::function<Decoded(const Write & write)>;
+ 
+     // What an entry holds at one moment.
+     struct State
+@@ -174,6 +176,9 @@ public:
+         uint64_t written = 0;
+         bool complete = false; // the whole log is here: written is its size
+         bool failed = false;   // it did not decode; written is what came before
++        bool missing = false;  // there is no such log
++        // The source could not be read; written is what came before.
++        bool unavailable = false;
+         // The cache dropped it: too big for the cache (this time, or lately),
+         // or no temp file. The bytes written stay readable; the rest needs a
+         // decode of its own.
+@@ -181,7 +186,7 @@ public:
+ 
+         [[nodiscard]] auto ended() const -> bool
+         {
+-            return complete || failed || uncached;
++            return complete || failed || uncached || missing || unavailable;
+         }
+     };
+ 
+@@ -443,8 +448,12 @@ private:
+             // Too big, or nobody is left to see it.
+             if (!fits || stopping || !read) {
+                 entry.current.uncached = true;
+-            } else if (decoded) {
++            } else if (decoded == Decoded::ok) {
+                 entry.current.complete = true;
++            } else if (decoded == Decoded::missing && entry.current.written == 0) {
++                entry.current.missing = true;
++            } else if (decoded == Decoded::unavailable) {
++                entry.current.unavailable = true;
+             } else {
+                 entry.current.failed = true;
+             }
+diff --git a/src/daemon/main.cc b/src/daemon/main.cc
+index 9c3832e..3cd3621 100644
+--- a/src/daemon/main.cc
++++ b/src/daemon/main.cc
+@@ -18,7 +18,7 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <exception>
+-#include <expected>
++#include <functional>
+ #include <future>
+ #include <filesystem>
+ #include <map>
+@@ -131,17 +131,32 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
+     nixgrpc::Auth & auth;
+     nixgrpc::Backends backends;
+     nixgrpc::Coordinator & coord;
+-    nixgrpc::BuildLogService buildLogs;
+ 
+     nixgrpc::LocalStore local;
+     nixgrpc::UploadClaims uploads;
+     nixgrpc::SessionRoots sessions{[this] -> nix::ref<nix::Store> { return local.scoped(); }};
+-    // --build-log-store, opened by the uploader's thread on first use.
++    // --build-log-store, opened on first use.
+     std::string logStoreUrl;
++    std::mutex logStoreMutex;
+     std::shared_ptr<nix::Store> logStore;
+-    // Last: its thread uses the members above.
++    // After the log store: its decode threads read from it.
++    nixgrpc::BuildLogService buildLogs;
++    // Last: its thread uses the store above.
+     std::unique_ptr<nixgrpc::LogUploader> uploader;
+ 
++    auto openLogStore() -> nix::LogStore &
++    {
++        std::scoped_lock const lock(logStoreMutex);
++        if (!logStore) {
++            logStore = nix::openStore(logStoreUrl).get_ptr();
++        }
++        auto * const logs = dynamic_cast<nix::LogStore *>(logStore.get());
++        if (logs == nullptr) {
++            throw nix::Error("--build-log-store '%s' keeps no build logs", logStoreUrl);
++        }
++        return *logs;
++    }
++
+     auto logDir() -> std::optional<std::filesystem::path>
+     {
+         auto const localStore = local.shared();
+@@ -295,7 +310,8 @@ public:
+         nixgrpc::Auth & auth,
+         nixgrpc::Coordinator & coord,
+         const std::string & advertise,
+-        std::string buildLogStore)
++        const std::string & cacheUrl,
++        const std::string & buildLogStore)
+         : workerName(std::move(workerName))
+         , metrics(metrics)
+         , idle(idle)
+@@ -305,9 +321,18 @@ public:
+               .socketPath = std::move(socketPath),
+               .activities = coord.tally != nullptr ? coord.tally->activitySink() : nixgrpc::ActivitySink{}}
+         , coord(coord)
+-        , buildLogs({.advertise = advertise}, metrics, coord.builder ? &*coord.builder : nullptr)
+         , local(std::move(storeUri))
+-        , logStoreUrl(std::move(buildLogStore))
++        , logStoreUrl(buildLogStore)
++        , buildLogs(
++              {.advertise = advertise,
++               .cacheUrl = cacheUrl,
++               .storeLog = buildLogStore.empty()
++                               ? std::function<std::optional<std::string>(const std::string &)>{}
++                               : [this](const std::string & drv) -> std::optional<std::string> {
++                                     return openLogStore().getBuildLog(nix::StorePath(drv));
++                                 }},
++              metrics,
++              coord.builder ? &*coord.builder : nullptr)
+     {
+         if (!logStoreUrl.empty() && coord.builder) {
+             uploader = std::make_unique<nixgrpc::LogUploader>(
+@@ -315,7 +340,9 @@ public:
+                     auto const dir = logDir();
+                     return dir ? nixgrpc::readKeptLog(*dir, drv, limit) : std::nullopt;
+                 },
+-                [this](const std::string & drv, std::string_view log) -> void { addToLogStore(drv, log); },
++                [this](const std::string & drv, std::string_view log) -> void {
++                    openLogStore().addBuildLog(nix::StorePath(drv), log);
++                },
+                 metrics);
+         }
+     }
+@@ -613,19 +640,6 @@ public:
+         });
+     }
+ 
+-    // Called on the uploader's thread only.
+-    void addToLogStore(const std::string & drv, std::string_view log)
+-    {
+-        if (!logStore) {
+-            logStore = nix::openStore(logStoreUrl).get_ptr();
+-        }
+-        auto * const logs = dynamic_cast<nix::LogStore *>(logStore.get());
+-        if (logs == nullptr) {
+-            throw nix::Error("--build-log-store '%s' keeps no build logs", logStoreUrl);
+-        }
+-        logs->addBuildLog(nix::StorePath(drv), log);
+-    }
+-
+     // Outputs built on another node live only in the cache. Clients read them back through us.
+     void substituteIfRemote(nix::Store & store, const nix::StorePath & path) const
+     {
+@@ -1311,7 +1325,7 @@ try {
+          {"max_jobs", std::to_string(options.maxJobs)}});
+     NixRemoteService service(
+         options.socketPath, options.storeUri, options.workerName, metrics, idle, options.logLevel, auth, coord,
+-        options.advertise, options.buildLogStore);
++        options.advertise, options.niks3CacheUrl, options.buildLogStore);
+ 
+     grpc::EnableDefaultHealthCheckService(true);
+     grpc::ServerBuilder builder;
+diff --git a/src/daemon/options.hh b/src/daemon/options.hh
+index 3abc5c8..fc7ab13 100644
+--- a/src/daemon/options.hh
++++ b/src/daemon/options.hh
+@@ -36,7 +36,8 @@ struct Options
+     xfcc::TrustedProxies proxies;
+     std::string oidcConfig;
+     Niks3Config niks3;
+-    // The farm cache as builders substitute from it, for the event stream.
++    // The farm cache as builders substitute from it, for the event stream,
++    // and for build logs this node does not have.
+     std::string niks3CacheUrl;
+     // A Nix store URL builders copy each build's log to. Empty: none.
+     std::string buildLogStore;
+diff --git a/tests/e2e/transfer.rs b/tests/e2e/transfer.rs
+index f2bd643..4675778 100644
+--- a/tests/e2e/transfer.rs
++++ b/tests/e2e/transfer.rs
+@@ -736,8 +736,70 @@ fn build_log_needs_only_watch() {
+     assert_eq!(denied.code(), 7, "{denied:?}");
+ }
+ 
++/// A node without the log answers from the farm's binary cache
++/// (--niks3-cache-url), here a server on 8090 that sends zstd as niks3 does,
++/// named with a user, a password and a query. It answers NOT_FOUND when the
++/// cache has none either or answers 403 as S3 does, and UNAVAILABLE, not
++/// DATA_LOSS, when the cache refuses the read, with none of the URL's
++/// credentials or query in the message.
++#[test]
++fn build_log_from_the_binary_cache() {
++    let base = log_drv(
++        "cached-grpc",
++        "i=0; while [ $i -lt 500 ]; do echo cached line $i; i=$((i+1)); done; echo > $out",
++    );
++    assert!(build_now(&cert_store("client"), "cached-grpc"));
++    let kept = kept_path(&base);
++    succeed(&[
++        "sh",
++        "-c",
++        r#"bzcat "$1.bz2" > /tmp/cached.want && mkdir -p /srv/cache/log && zstd -q < /tmp/cached.want > "/srv/cache/log/$2.zst" && mv "$1.bz2" /tmp/cached.bz2"#,
++        "sh",
++        &kept,
++        &base,
++    ]);
++    let tls = tls_args("client");
++    let call = |extra: &[&str]| {
++        let mut args = vec![base.as_str()];
++        args.extend(extra);
++        args.extend(strs(&tls));
++        build_log(&args)
++    };
++    let got = call(&["--out", "/tmp/cached.got"]);
++    assert_eq!(got.code(), 0, "{got:?}");
++    assert_eq!(got.get("source"), "cache", "{got:?}");
++    same_bytes("/tmp/cached.got", "/tmp/cached.want");
++    let part = call(&["--offset", "1234", "--out", "/tmp/cached.part"]);
++    assert!(part.code() == 0 && part.num("offset") == 1234, "{part:?}");
++    succeed(&["sh", "-c", "tail -c +1235 /tmp/cached.want | cmp - /tmp/cached.part"]);
++    let lines = succeed(&["sh", "-c", "head -c 1234 /tmp/cached.want | tr -cd '\\n' | wc -c"]);
++    assert_eq!(part.num("first_line"), lines.trim().parse::<u64>().unwrap(), "{part:?}");
++    // A derivation the cache does not know either.
++    let mut none = vec!["00000000000000000000000000000009-nowhere.drv"];
++    none.extend(strs(&tls));
++    let missing = build_log(&none);
++    assert_eq!(missing.code(), 5, "{missing:?}");
++    let mut denied = vec!["00000000000000000000000000000008-denied.drv"];
++    denied.extend(strs(&tls));
++    let refused = build_log(&denied);
++    assert_eq!(refused.code(), 14, "{refused:?}");
++    assert!(
++        refused.get("message").contains("cannot be read") && refused.num("has_info") == 0,
++        "{refused:?}"
++    );
++    let message = refused.get("message");
++    assert!(message.contains("http://127.0.0.1:8090/log/"), "{refused:?}");
++    assert!(!message.contains("hunter2") && !message.contains("priority"), "{refused:?}");
++    let mut forbidden = vec!["00000000000000000000000000000005-forbidden.drv"];
++    forbidden.extend(strs(&tls));
++    let unknown = build_log(&forbidden);
++    assert_eq!(unknown.code(), 5, "{unknown:?}");
++    succeed(&["sh", "-c", r#"mv /tmp/cached.bz2 "$1.bz2""#, "sh", &kept]);
++}
++
+ /// The daemon on 50051 copies build logs to a log store. A failed build's
+-/// log gets there, and `nix log --store` reads it.
++/// log gets there, `nix log --store` reads it, and once the kept file is
++/// gone GetBuildLog answers from the store.
+ #[test]
+ fn failed_build_log_reaches_the_log_store() {
+     let base = log_drv(
+@@ -745,10 +807,17 @@ fn failed_build_log_reaches_the_log_store() {
+         "echo stored line one; echo stored line two; exit 1",
+     );
+     assert!(!build_now(STORE, "stored-grpc"));
+-    wait_until_succeeds(&["test", "-s", &format!("/srv/logstore/log/{base}")], 60);
++    wait_until_succeeds(&["test", "-s", &format!("/srv/cache/logstore/log/{base}")], 60);
+     let drv = format!("/nix/store/{base}");
+-    let log = succeed(&["nix", "log", "--store", "http://127.0.0.1:8090", &drv]);
++    let log = succeed(&["nix", "log", "--store", "http://127.0.0.1:8090/logstore", &drv]);
+     assert!(log.contains("stored line two"), "{log}");
++    let kept = kept_path(&base);
++    succeed(&["sh", "-c", r#"bzcat "$1.bz2" > /tmp/stored.want && mv "$1.bz2" /tmp/stored.bz2"#, "sh", &kept]);
++    let got = build_log(&[&base, "--url", "http://127.0.0.1:50051", "--out", "/tmp/stored.got"]);
++    assert_eq!(got.code(), 0, "{got:?}");
++    assert_eq!(got.get("source"), "store", "{got:?}");
++    same_bytes("/tmp/stored.got", "/tmp/stored.want");
++    succeed(&["sh", "-c", r#"mv /tmp/stored.bz2 "$1.bz2""#, "sh", &kept]);
+ }
+ 
+ /// The daemon on 50054 uploads to a log store that takes 20 s per upload.
+@@ -774,11 +843,36 @@ fn log_store_skips_large_logs_and_drains() {
+                 == Some(1.0)
+         })
+     });
+-    fail(&["test", "-e", &format!("/srv/logstore/slow/log/{big}")]);
++    fail(&["test", "-e", &format!("/srv/cache/slow/log/{big}")]);
+ 
+     let last = log_drv("last-grpc", "echo the last build; echo > $out");
+     assert!(build_now(store, "last-grpc"));
+     succeed(&["systemctl", "kill", "-s", "TERM", LOGSTORE]);
+     retry(90, "the daemon exits", || unit_state(LOGSTORE) != "active");
+-    succeed(&["test", "-s", &format!("/srv/logstore/slow/log/{last}")]);
++    succeed(&["test", "-s", &format!("/srv/cache/slow/log/{last}")]);
++}
++
++/// A log store that cannot be read (the daemon at 50055, whose store
++/// answers 401) does not hide the binary cache's copy: GetBuildLog goes on
++/// to the cache, and when the cache has none either it answers UNAVAILABLE
++/// for the store, not NOT_FOUND or DATA_LOSS.
++#[test]
++fn build_log_store_down_falls_back_to_the_cache() {
++    wait_for_unit("nix-grpc-daemon-logstore-denied.service");
++    wait_for_open_port(50055);
++    let base = "00000000000000000000000000000007-fallback.drv";
++    succeed(&[
++        "sh",
++        "-c",
++        r#"mkdir -p /srv/cache/log && printf 'from the cache\n' > "/srv/cache/log/$1""#,
++        "sh",
++        base,
++    ]);
++    let got = build_log(&[base, "--url", "http://127.0.0.1:50055", "--out", "/tmp/fallback.got"]);
++    assert_eq!(got.code(), 0, "{got:?}");
++    assert_eq!(got.get("source"), "cache", "{got:?}");
++    succeed(&["sh", "-c", "printf 'from the cache\\n' | cmp - /tmp/fallback.got"]);
++    let none = build_log(&["00000000000000000000000000000006-nowhere.drv", "--url", "http://127.0.0.1:50055"]);
++    assert_eq!(none.code(), 14, "{none:?}");
++    assert!(none.get("message").contains("log store"), "{none:?}");
+ }
+diff --git a/tests/farm.nix b/tests/farm.nix
+index 05195bf..15bd7d8 100644
+--- a/tests/farm.nix
++++ b/tests/farm.nix
+@@ -455,9 +455,9 @@ pkgs.testers.runNixOSTest {
+         assert want == got, (want, got)
+ 
+         # Another builder kept no log of it. It says who answered, and has
+-        # nothing.
++        # nothing, or the farm cache's copy once niks3 has pushed it.
+         other = log_call(b, w2)
+-        assert other["node"] == w2 and other["code"] == "5", other
++        assert other["node"] == w2 and (other["code"] == "5" or other["source"] == "cache"), other
+ 
+     with subtest("viewers a proxy names read build logs and share their rule's metrics series"):
+         # A dashboard's proxy names a signed-in viewer by user and any other
+diff --git a/tests/log-cache-test.cc b/tests/log-cache-test.cc
+index 7472773..e813ad3 100644
+--- a/tests/log-cache-test.cc
++++ b/tests/log-cache-test.cc
+@@ -43,14 +43,14 @@ auto numbered(std::size_t lines) -> std::string
+ // Writes `text` in pieces of `piece` bytes, and counts its runs.
+ auto decoder(const std::string & text, std::atomic<int> & runs, std::size_t piece = 1000) -> LogCache::Decode
+ {
+-    return [&text, &runs, piece](const LogCache::Write & write) -> bool {
++    return [&text, &runs, piece](const LogCache::Write & write) -> LogCache::Decoded {
+         runs++;
+         for (std::size_t pos = 0; pos < text.size(); pos += piece) {
+             if (!write(std::string_view(text).substr(pos, piece))) {
+-                return true;
++                return LogCache::Decoded::ok;
+             }
+         }
+-        return true;
++        return LogCache::Decoded::ok;
+     };
+ }
+ 
+@@ -107,16 +107,16 @@ void aReaderThatJoinsMidDecodeGetsTheSameBytes()
+     std::mutex mutex;
+     std::condition_variable gate;
+     bool open = false;
+-    auto decode = [&](const LogCache::Write & write) -> bool {
++    auto decode = [&](const LogCache::Write & write) -> LogCache::Decoded {
+         auto const half = text.size() / 2;
+         if (!write(std::string_view(text).substr(0, half))) {
+-            return true;
++            return LogCache::Decoded::ok;
+         }
+         std::unique_lock lock(mutex);
+         gate.wait(lock, [&] -> bool { return open; });
+         lock.unlock();
+         (void) write(std::string_view(text).substr(half));
+-        return true;
++        return LogCache::Decoded::ok;
+     };
+     auto first = cache.start("b@1", decode, slot(slots));
+     while (first->state().written == 0) {
+@@ -202,18 +202,18 @@ void theDecodeGoesOnWhileAnotherReaderRemains()
+     auto const text = numbered(50000);
+     std::atomic<std::size_t> progress{0};
+     std::atomic<bool> release{false};
+-    auto decode = [&](const LogCache::Write & write) -> bool {
++    auto decode = [&](const LogCache::Write & write) -> LogCache::Decoded {
+         constexpr std::size_t piece = 1000;
+         for (std::size_t pos = 0; pos < text.size(); pos += piece) {
+             while (pos > 0 && !release) {
+                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
+             }
+             if (!write(std::string_view(text).substr(pos, piece))) {
+-                return true;
++                return LogCache::Decoded::ok;
+             }
+             progress = pos;
+         }
+-        return true;
++        return LogCache::Decoded::ok;
+     };
+     std::optional<LogCache::Reader> second;
+     {
+@@ -230,14 +230,14 @@ void theDecodeGoesOnWhileAnotherReaderRemains()
+     // With nobody left, it stops early and leaves the cache.
+     std::atomic<bool> begin{false};
+     std::atomic<bool> stopped{false};
+-    auto endless = [&](const LogCache::Write & write) -> bool {
++    auto endless = [&](const LogCache::Write & write) -> LogCache::Decoded {
+         while (!begin) {
+             std::this_thread::sleep_for(std::chrono::milliseconds(1));
+         }
+         while (write("more\n")) {
+         }
+         stopped = true;
+-        return true;
++        return LogCache::Decoded::ok;
+     };
+     {
+         auto only = cache.start("g@1", endless, slot(slots));
+@@ -258,6 +258,61 @@ void theDecodeGoesOnWhileAnotherReaderRemains()
+     assert(!cache.find("g@1"));
+ }
+ 
++// A source that has no such log: the entry says so and leaves the cache, so
++// the next call asks again.
++void aMissingLogIsNotKept()
++{
++    DecodeSlots slots(2, 1);
++    LogCache cache;
++    int asked = 0;
++    auto none = [&](const LogCache::Write &) -> LogCache::Decoded {
++        asked++;
++        return LogCache::Decoded::missing;
++    };
++    auto reader = cache.start("m@1", none, slot(slots));
++    assert(readAll(reader).empty());
++    assert(reader->state().missing && !reader->state().failed);
++    assert(!cache.find("m@1"));
++    auto again = cache.start("m@1", none, slot(slots));
++    (void) readAll(again);
++    assert(asked == 2);
++    // A source that stops partway failed, whatever it says.
++    auto partway = [](const LogCache::Write & write) -> LogCache::Decoded {
++        (void) write("some\n");
++        return LogCache::Decoded::missing;
++    };
++    auto cut = cache.start("n@1", partway, slot(slots));
++    assert(readAll(cut) == "some\n" && cut->state().failed);
++}
++
++// A source that cannot be read now: not a damaged log, and not kept, so the
++// next call asks again.
++void anUnreadableSourceIsNotKept()
++{
++    DecodeSlots slots(2, 1);
++    LogCache cache;
++    int asked = 0;
++    auto down = [&](const LogCache::Write &) -> LogCache::Decoded {
++        asked++;
++        return LogCache::Decoded::unavailable;
++    };
++    auto reader = cache.start("u@1", down, slot(slots));
++    assert(readAll(reader).empty());
++    auto const state = reader->state();
++    assert(state.unavailable && !state.failed && !state.missing && !state.complete);
++    assert(!cache.find("u@1"));
++    auto again = cache.start("u@1", down, slot(slots));
++    (void) readAll(again);
++    assert(asked == 2);
++    // One that breaks off partway says so too.
++    auto partway = [](const LogCache::Write & write) -> LogCache::Decoded {
++        (void) write("some\n");
++        return LogCache::Decoded::unavailable;
++    };
++    auto cut = cache.start("v@1", partway, slot(slots));
++    assert(readAll(cut) == "some\n" && cut->state().unavailable && !cut->state().failed);
++}
++
+ void oldEntriesGoFirst()
+ {
+     LogCache::Limits limits;
+@@ -323,6 +378,8 @@ auto main() -> int
+         tailStartsAtALineStartAndFirstLineIsExact();
+         anEntryOverTheSizeCapIsNotCached();
+         theDecodeGoesOnWhileAnotherReaderRemains();
++        aMissingLogIsNotKept();
++        anUnreadableSourceIsNotKept();
+         oldEntriesGoFirst();
+         slotsPerCallerAndInAll();
+     } catch (std::exception & err) {
+diff --git a/tests/nixos-test.nix b/tests/nixos-test.nix
+index 6bbfffd..f5670f1 100644
+--- a/tests/nixos-test.nix
++++ b/tests/nixos-test.nix
+@@ -46,30 +46,18 @@ let
+   signingSecretKey = "nix-grpc-test-1:1/icU6Hlts+rG2LxnM8NoIMcrLWAzdCgJEOLjewE8DxGQKUPC9+LF07Ci6sEjhQP2G50TfF9TkQFBwwVRW5FXw==";
+   signingPublicKey = "nix-grpc-test-1:RkClDwvfixdOwourBI4UD9hudE3xfU5EBQcMFUVuRV8=";
+   buildLog = import ./lib/build-log.nix { inherit pkgs; };
+-  # A binary cache store for build logs: serves and takes files under
+-  # /srv/logstore. An upload below /slow is answered after 20 s.
+-  logStoreServer = pkgs.writeText "log-store-server.py" ''
++  # Stands in for the farm's binary cache: serves /srv/cache, a file with
++  # .zst beside it with Content-Encoding: zstd, as niks3 serves logs. A path
++  # with "denied" in it gets 401, as with expired credentials, and one with
++  # "forbidden" 403, as S3 answers for a key it does not have. It also takes
++  # uploads, as a binary cache store for build logs, and answers one below
++  # /slow/ after 20 s.
++  cacheServer = pkgs.writeText "log-cache-server.py" ''
+     import http.server, os, time
+ 
+     class Handler(http.server.BaseHTTPRequestHandler):
+         def file(self):
+-            return os.path.join("/srv/logstore", self.path.split("?")[0].lstrip("/"))
+-
+-        def do_GET(self):
+-            if not os.path.isfile(self.file()):
+-                self.send_error(404)
+-                return
+-            with open(self.file(), "rb") as f:
+-                data = f.read()
+-            self.send_response(200)
+-            self.send_header("Content-Length", str(len(data)))
+-            self.end_headers()
+-            self.wfile.write(data)
+-
+-        def do_HEAD(self):
+-            self.send_response(200 if os.path.isfile(self.file()) else 404)
+-            self.send_header("Content-Length", "0")
+-            self.end_headers()
++            return os.path.join("/srv/cache", self.path.split("?")[0].lstrip("/"))
+ 
+         def do_PUT(self):
+             data = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+@@ -83,6 +71,32 @@ let
+             self.send_header("Content-Length", "0")
+             self.end_headers()
+ 
++        def do_HEAD(self):
++            self.send_response(200 if os.path.isfile(self.file()) else 404)
++            self.send_header("Content-Length", "0")
++            self.end_headers()
++
++        def do_GET(self):
++            if "denied" in self.path:
++                self.send_error(401)
++                return
++            if "forbidden" in self.path:
++                self.send_error(403)
++                return
++            path = self.file()
++            for name, encoding in ((path + ".zst", "zstd"), (path, None)):
++                if os.path.isfile(name):
++                    data = open(name, "rb").read()
++                    self.send_response(200)
++                    self.send_header("Content-Type", "text/plain; charset=utf-8")
++                    if encoding:
++                        self.send_header("Content-Encoding", encoding)
++                    self.send_header("Content-Length", str(len(data)))
++                    self.end_headers()
++                    self.wfile.write(data)
++                    return
++            self.send_error(404)
++
+     http.server.ThreadingHTTPServer(("127.0.0.1", 8090), Handler).serve_forever()
+   '';
+ in
+@@ -127,7 +141,7 @@ pkgs.testers.runNixOSTest {
+         logLevel = "debug";
+         idleTimeout = 3;
+         # Test VM disk is ~1 GiB.
+-        buildLogStore = "http://127.0.0.1:8090";
++        buildLogStore = "http://127.0.0.1:8090/logstore";
+         minFree = "0";
+         # Reuse the client bundle so the test doesn't compile the project twice.
+         package = config.programs.nix-grpc-store.package;
+@@ -142,6 +156,7 @@ pkgs.testers.runNixOSTest {
+         pkgs.perf
+         pkgs.curl
+         pkgs.openssl
++        pkgs.zstd
+         buildLog
+       ];
+       # Allow perf to resolve kernel symbols and record system-wide as root.
+@@ -239,21 +254,21 @@ pkgs.testers.runNixOSTest {
+         '';
+       };
+ 
+-      systemd.services.log-store = {
++      systemd.services.log-cache = {
+         wantedBy = [ "multi-user.target" ];
+         preStart = ''
+-          mkdir -p /srv/logstore/slow
+-          printf 'StoreDir: /nix/store\n' | tee /srv/logstore/nix-cache-info > /srv/logstore/slow/nix-cache-info
++          mkdir -p /srv/cache/logstore /srv/cache/slow
++          printf 'StoreDir: /nix/store\n' | tee /srv/cache/logstore/nix-cache-info > /srv/cache/slow/nix-cache-info
+         '';
+-        serviceConfig.ExecStart = "${pkgs.python3}/bin/python3 ${logStoreServer}";
++        serviceConfig.ExecStart = "${pkgs.python3}/bin/python3 ${cacheServer}";
+       };
+ 
+-      # Copies build logs to the slow part of the log store.
++      # Copies build logs to the slow log store.
+       systemd.services.nix-grpc-daemon-logstore = {
+         wantedBy = [ "multi-user.target" ];
+         after = [
+           "nix-daemon.socket"
+-          "log-store.service"
++          "log-cache.service"
+         ];
+         serviceConfig.ExecStart = ''
+           ${lib.getExe config.services.nix-grpc-daemon.package} --listen 127.0.0.1:50054 \
+@@ -264,6 +279,22 @@ pkgs.testers.runNixOSTest {
+         '';
+       };
+ 
++      # Its log store refuses every read; the binary cache above has logs.
++      systemd.services.nix-grpc-daemon-logstore-denied = {
++        wantedBy = [ "multi-user.target" ];
++        after = [
++          "nix-daemon.socket"
++          "log-cache.service"
++        ];
++        serviceConfig.ExecStart = ''
++          ${lib.getExe config.services.nix-grpc-daemon.package} --listen 127.0.0.1:50055 \
++            --proxy-socket /nix/var/nix/daemon-socket/socket \
++            --build-log-store http://127.0.0.1:8090/denied \
++            --niks3-cache-url http://127.0.0.1:8090 \
++            --trust-clients
++        '';
++      };
++
+       systemd.services.mock-oidc = {
+         wantedBy = [ "multi-user.target" ];
+         serviceConfig.ExecStart = "${lib.getExe mockOidc} -addr 127.0.0.1:8080";
+@@ -290,6 +321,7 @@ pkgs.testers.runNixOSTest {
+             --allow watcher=watch \
+             --allow follower=watch \
+             --allow-anonymous read-only \
++            --niks3-cache-url 'http://reader:hunter2@127.0.0.1:8090?priority=10' \
+             --metrics-listen 127.0.0.1:9464
+         '';
+       };
+-- 
+2.56.0
+

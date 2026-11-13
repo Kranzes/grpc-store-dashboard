@@ -1,0 +1,1650 @@
+From 9c0e4377b70688ce8d427b182c5572bcc34e89a0 Mon Sep 17 00:00:00 2001
+From: Ilan Joselevich <personal@ilanjoselevich.com>
+Date: Tue, 10 Nov 2026 19:22:56 +0100
+Subject: [PATCH 06/12] scheduler: count what happens, send totals once a
+ second, end expired streams
+
+A dashboard shows totals and rates: builds per minute, the cache hit
+rate, bytes published. Summing events cannot give them, because a
+watcher sees only what happened while it was connected. So the
+Dispatcher keeps counters for its current term as leader: new entries,
+cache hits and misses, assignments, outcomes, requeues, bytes
+published, and an estimate of the bytes fetched from the cache.
+
+The counters run whether anyone watches or not, so with nobody watching
+a cancel or a leaving client counts the entries it retired instead of
+the events it would have sent. The tests run the same farm watched and
+unwatched and compare the totals. dispatcher-bench firehose shows no
+measurable cost.
+
+Stats goes out once a second while anyone watches, with the totals and
+the per-system numbers of the nix_grpc_sched_system metric. It doubles
+as the heartbeat. Reset carries a sample of the counters for each of
+the last 60 minutes, so a client has "last N minutes" totals as soon as
+it connects. Counters and history start over when the node becomes the
+leader again, while instance and seq continue.
+
+A Watch stream can stay open for days, past its bearer token. A stream
+opened with one now ends with UNAUTHENTICATED ("bearer token expired")
+once the scheduler would refuse the token, a minute after its exp. The
+reactor checks with each event, and Stats makes that at most a second
+late. Streams of certificate callers do not end this way.
+
+events-grpc-test also covers viewers that a trusted proxy names in
+x-forwarded-client-cert: the access rules and the 8-stream cap apply to
+the forwarded name, the proxy's own certificate stands in for nobody,
+and two forwarded headers name nobody.
+---
+ meson.build                     |   3 +-
+ proto/events.proto              |  67 ++++++
+ src/daemon/auth.cc              |   6 +-
+ src/daemon/auth.hh              |   3 +
+ src/daemon/dispatcher-events.cc | 124 +++++++++-
+ src/daemon/dispatcher.cc        |  48 ++--
+ src/daemon/dispatcher.hh        |  24 +-
+ src/daemon/events.cc            |   6 +-
+ src/daemon/oidc.hh              |   8 +-
+ src/daemon/sched-reactor.hh     |  38 +++-
+ tests/events-grpc-test.cc       | 389 +++++++++++++++++++++++++++++++-
+ tests/events-test.cc            | 148 ++++++++++--
+ tests/oidc-test.cc              |  11 +
+ tests/xfcc-test.cc              |   3 +
+ 14 files changed, 820 insertions(+), 58 deletions(-)
+
+diff --git a/meson.build b/meson.build
+index f57f94c..4cae38c 100644
+--- a/meson.build
++++ b/meson.build
+@@ -313,12 +313,13 @@ if build_server
+   ), timeout : 120)
+ 
+   # Events.Watch over loopback gRPC, with the real service's auth checks.
++  # oidc-test.sh serves the JWKS for its bearer tokens.
+   events_grpc_test = executable('events-grpc-test',
+     sources : ['tests/events-grpc-test.cc', 'src/daemon/events.cc', 'src/daemon/auth.cc', events_gen[2], events_gen[3]],
+     dependencies : [dispatcher_dep, grpc_dep, nix_store_dep, curl_dep, json_dep, openssl_dep],
+     cpp_args : ['-UNDEBUG'],
+   )
+-  test('events-grpc', events_grpc_test, timeout : 60)
++  test('events-grpc', find_program('tests/oidc-test.sh'), args : [events_grpc_test], timeout : 60)
+ 
+   test('sbpl', executable('sbpl-test',
+     sources : ['tests/sbpl-test.cc', 'src/daemon/sbpl.cc'],
+diff --git a/proto/events.proto b/proto/events.proto
+index eeb0600..ac41a2b 100644
+--- a/proto/events.proto
++++ b/proto/events.proto
+@@ -19,6 +19,14 @@ package nix.remote;
+ // stream with a write still in flight is cancelled instead, so a client that
+ // stopped reading cannot hold it open.
+ //
++// A stream opened with a bearer token ends with UNAUTHENTICATED ("bearer
++// token expired") once the scheduler would refuse that token: one minute
++// after its exp, the clock skew the scheduler allows. The check runs with
++// each event, and Stats come once a second, so the end comes at most a
++// second later. The client renews the token and reconnects. A write still
++// in flight is cancelled here too. Streams of certificate callers do not
++// end this way.
++//
+ // Callers need the `watch` role or higher. For a bearer token that is an
+ // --oidc-config rule with scopes ["watch"], not an OAuth scope. Anonymous
+ // callers are refused even where the anonymous role would allow it, because
+@@ -53,6 +61,7 @@ message WatchEvent {
+     DrvState drv = 8;
+     DrvGone drv_gone = 9;
+     DrvCached cached = 10;
++    Stats stats = 11;
+   }
+ }
+ 
+@@ -60,12 +69,19 @@ message WatchEvent {
+ message Reset {
+   // Random per scheduler process. seq restarts with every new instance.
+   string instance = 1;
++  // When this process last became the active scheduler, Unix ms. Counters
++  // and history start here.
++  uint64 serving_since_ms = 2;
+   // nix-grpc-store version of the scheduler.
+   string version = 3;
+   // The system the scheduler assumes for derivations that name none.
+   string default_system = 4;
+   // niks3 server the scheduler asks for cache hits. Empty without a cache.
+   string cache_url = 5;
++  // Cumulative counters sampled once a minute, oldest first, newest last,
++  // for "last N minutes" totals right after connecting. The current
++  // values arrive with the next Stats.
++  repeated CounterSample history = 6;
+ }
+ 
+ message SnapshotDone {}
+@@ -206,3 +222,54 @@ message DrvCached {
+   string system = 2;
+   uint64 client_id = 3;
+ }
++
++// Once a second while anyone watches. Doubles as a heartbeat.
++message Stats {
++  Counters totals = 1;
++  // Per system and feature set, as in the nix_grpc_sched_system metric.
++  repeated SystemStats systems = 2;
++}
++
++// Monotonic since Reset.serving_since_ms. They restart from zero when this
++// process becomes the active scheduler again, while instance and seq carry
++// on.
++message Counters {
++  uint64 wanted = 1;     // new queue entries
++  uint64 cache_hits = 2; // Wants answered Cached, one DrvCached each
++  // Wants the cache was asked about and lacked. This counts every such Want,
++  // including a repeat Want for a drv already tracked and a Want refused
++  // for its system, which the events do not show one by one. Take miss
++  // rates from this counter.
++  uint64 cache_misses = 3;
++  uint64 assigned = 4;
++  uint64 built = 5;
++  uint64 failed = 6;
++  uint64 cancelled = 7;
++  uint64 dropped = 8;
++  uint64 requeued = 9;
++  // Sum of nar_size of BUILT outputs, i.e. bytes published to the cache.
++  uint64 published_bytes = 10;
++  // Sum of input_sources nar_bytes from workers other than the assigned
++  // one, at each assignment. An estimate of bytes fetched from the cache, not
++  // a bound either way: it leaves out inputs nobody here built, and counts an
++  // input again for every build that needs it, even once the worker has it.
++  uint64 fetched_bytes_estimate = 11;
++}
++
++message CounterSample {
++  uint64 time_ms = 1;
++  Counters counters = 2;
++}
++
++message SystemStats {
++  string system = 1;
++  // Sorted, comma-joined. Empty for none.
++  string features = 2;
++  // Keyed by what derivations require.
++  uint32 queued = 3;
++  uint32 unplaceable = 4;
++  // Keyed by what workers offer (their native system).
++  uint32 running = 5;
++  uint32 slots = 6;
++  uint32 free = 7;
++}
+diff --git a/src/daemon/auth.cc b/src/daemon/auth.cc
+index d3cb28e..045f382 100644
+--- a/src/daemon/auth.cc
++++ b/src/daemon/auth.cc
+@@ -44,7 +44,11 @@ auto Auth::identify(const grpc::ServerContextBase & context) const -> Caller
+             LogLevel::info, {{"event", "oidc_rejected"}, {"error", res.error}, {"peer", context.peer()}});
+         return {.kind = Caller::Kind::badToken};
+     }
+-    return {.name = res.identity->subject, .role = res.identity->role, .kind = Caller::Kind::named};
++    return {
++        .name = res.identity->subject,
++        .role = res.identity->role,
++        .kind = Caller::Kind::named,
++        .validUntil = res.identity->validUntil};
+ }
+ 
+ 
+diff --git a/src/daemon/auth.hh b/src/daemon/auth.hh
+index cb0a247..0f1740d 100644
+--- a/src/daemon/auth.hh
++++ b/src/daemon/auth.hh
+@@ -2,6 +2,7 @@
+ // Who is calling (client certificate, forwarded certificate or OIDC bearer
+ // token) and whether the ACL lets them call a given method.
+ 
++#include <chrono>
+ #include <cstdint>
+ #include <optional>
+ #include <string>
+@@ -24,6 +25,8 @@ struct Caller
+     std::string name = "-"; // cert CN or oidc:<provider>:<sub>, for logs and metrics
+     std::optional<Role> role;
+     Kind kind = Kind::anonymous;
++    // Until when a bearer token stays valid. nullopt for certificates.
++    std::optional<std::chrono::system_clock::time_point> validUntil = std::nullopt;
+ };
+ 
+ struct Auth
+diff --git a/src/daemon/dispatcher-events.cc b/src/daemon/dispatcher-events.cc
+index 458f82c..71356e5 100644
+--- a/src/daemon/dispatcher-events.cc
++++ b/src/daemon/dispatcher-events.cc
+@@ -1,5 +1,5 @@
+ // The Dispatcher's side of Events.Watch (proto/events.proto): the
+-// snapshot and one event per change. Everything here runs under
++// counters, the snapshot and one event per change. Everything here runs under
+ // Dispatcher::mutex. Events are built only while someone watches.
+ 
+ #include "dispatcher.hh"
+@@ -34,6 +34,10 @@ using nix::remote::WatchEvent;
+ 
+ namespace {
+ 
++constexpr double minuteMs = 60'000;
++// One sample a minute, and one older than an hour so "last 60 minutes" is whole.
++constexpr size_t historyLen = 61;
++
+ auto giveBackReason(const Done & done) -> std::string
+ {
+     if (done.outcome() == Done::NO_SHOW) {
+@@ -117,6 +121,7 @@ void Dispatcher::emitLocked(WatchEvent event)
+ // it is one higher.
+ auto Dispatcher::snapshotLocked(const WatchSend & send) -> bool
+ {
++    sampleLocked();
+     auto const seq = eventSeq;
+     auto const now = wallMs(nowMs());
+     auto const stamped = [&](WatchEvent event) -> bool {
+@@ -127,9 +132,13 @@ auto Dispatcher::snapshotLocked(const WatchSend & send) -> bool
+     WatchEvent reset;
+     auto & rst = *reset.mutable_reset();
+     rst.set_instance(instance);
++    rst.set_serving_since_ms(wallMs(servingSinceMs));
+     rst.set_version(config.version);
+     rst.set_default_system(config.defaultSystem);
+     rst.set_cache_url(config.cacheUrl);
++    for (const auto & sample : history) {
++        *rst.add_history() = sample;
++    }
+     if (!stamped(std::move(reset))) {
+         return false;
+     }
+@@ -177,6 +186,58 @@ void Dispatcher::endEventWatchersLocked()
+     }
+ }
+ 
++// Counters and history cover the current term as leader.
++void Dispatcher::startServingLocked()
++{
++    servingSinceMs = sampledAtMs = nowMs();
++    counters.Clear();
++    history.clear();
++}
++
++void Dispatcher::sampleLocked()
++{
++    if (history.empty()) {
++        // Everything is zero when serving starts.
++        auto & first = history.emplace_back();
++        first.set_time_ms(wallMs(servingSinceMs));
++        first.mutable_counters();
++    }
++    auto const now = nowMs();
++    if (now - sampledAtMs < minuteMs) {
++        return;
++    }
++    sampledAtMs = now;
++    auto & sample = history.emplace_back();
++    sample.set_time_ms(wallMs(now));
++    *sample.mutable_counters() = counters;
++    while (history.size() > historyLen) {
++        history.pop_front();
++    }
++}
++
++// Once a second from the stats thread, which computes `systems` once for this
++// and the gauges.
++void Dispatcher::statsEventLocked(const std::map<sched::Core::StatsKey, sched::Core::Stats> & systems)
++{
++    if (eventWatchers.empty()) {
++        return;
++    }
++    WatchEvent event;
++    auto & stats = *event.mutable_stats();
++    *stats.mutable_totals() = counters;
++    for (const auto & [key, sst] : systems) {
++        auto & sys = *stats.add_systems();
++        sys.set_system(key.system);
++        sys.set_features(key.features);
++        sys.set_queued(static_cast<uint32_t>(sst.queued));
++        sys.set_unplaceable(static_cast<uint32_t>(sst.unplaceable));
++        sys.set_running(static_cast<uint32_t>(sst.running));
++        sys.set_slots(static_cast<uint32_t>(sst.slots));
++        sys.set_free(static_cast<uint32_t>(sst.free));
++    }
++    emitLocked(std::move(event));
++}
++
+ auto Dispatcher::drvEventLocked(const sched::Entry & ent, DrvState::Cause cause, std::string reason) const
+     -> WatchEvent
+ {
+@@ -257,6 +318,25 @@ void Dispatcher::drvChangedLocked(sched::DrvId drv, DrvState::Cause cause, std::
+ 
+ void Dispatcher::drvGoneLocked(std::string drvPath, DrvGone::Outcome outcome, sched::WorkerId wid, const Done * done)
+ {
++    switch (outcome) {
++    case DrvGone::BUILT:
++        counters.set_built(counters.built() + 1);
++        break;
++    case DrvGone::FAILED:
++        counters.set_failed(counters.failed() + 1);
++        break;
++    case DrvGone::CANCELLED:
++        counters.set_cancelled(counters.cancelled() + 1);
++        break;
++    default:
++        counters.set_dropped(counters.dropped() + 1);
++    }
++    bool const built = outcome == DrvGone::BUILT && done != nullptr;
++    if (built) {
++        for (const auto & output : done->outputs()) {
++            counters.set_published_bytes(counters.published_bytes() + output.nar_size());
++        }
++    }
+     if (eventWatchers.empty()) {
+         return;
+     }
+@@ -267,7 +347,7 @@ void Dispatcher::drvGoneLocked(std::string drvPath, DrvGone::Outcome outcome, sc
+     if (wid != sched::noWorker) {
+         gone.set_worker_addr(core.worker(wid).addr);
+     }
+-    if (outcome == DrvGone::BUILT && done != nullptr) {
++    if (built) {
+         for (const auto & output : done->outputs()) {
+             auto & out = *gone.add_outputs();
+             out.set_path(output.path());
+@@ -302,11 +382,15 @@ void Dispatcher::clientLeftLocked(sched::ClientId cid)
+ 
+ void Dispatcher::wantedLocked(const sched::Core::WantResult & res)
+ {
++    if (res.fresh) {
++        counters.set_wanted(counters.wanted() + 1);
++    }
+     drvChangedLocked(res.drv, res.fresh ? DrvState::CAUSE_WANTED : DrvState::CAUSE_FOLLOWERS);
+ }
+ 
+ void Dispatcher::cachedLocked(const Client & client, const nix::remote::Want & want)
+ {
++    counters.set_cache_hits(counters.cache_hits() + 1);
+     if (eventWatchers.empty()) {
+         return;
+     }
+@@ -320,6 +404,23 @@ void Dispatcher::cachedLocked(const Client & client, const nix::remote::Want & w
+     emitLocked(std::move(event));
+ }
+ 
++void Dispatcher::assignedLocked(sched::DrvId drv)
++{
++    const auto & ent = core.entry(drv);
++    if (!ent) {
++        return;
++    }
++    uint64_t fetched = 0;
++    for (const auto & src : ent->sources) {
++        if (src.worker != ent->worker) {
++            fetched += src.narBytes;
++        }
++    }
++    counters.set_assigned(counters.assigned() + 1);
++    counters.set_fetched_bytes_estimate(counters.fetched_bytes_estimate() + fetched);
++    drvChangedLocked(drv, DrvState::CAUSE_ASSIGNED);
++}
++
+ auto Dispatcher::heldLocked(sched::WorkerId wid) const -> std::vector<Tracked>
+ {
+     std::vector<Tracked> held;
+@@ -356,6 +457,17 @@ auto Dispatcher::followedLocked(sched::ClientId cid, std::span<const sched::DrvI
+     return followed;
+ }
+ 
++// A client cancelled or left. Without watchers nothing was tracked, and only
++// drops count: these Core calls retire entries but create none.
++void Dispatcher::followersLeftLocked(const std::vector<Tracked> & tracked, size_t liveBefore)
++{
++    if (eventWatchers.empty()) {
++        counters.set_dropped(counters.dropped() + (liveBefore - core.liveEntries()));
++        return;
++    }
++    settledLocked(tracked, DrvState::CAUSE_FOLLOWERS, {});
++}
++
+ void Dispatcher::settledLocked(const std::vector<Tracked> & tracked, DrvState::Cause cause, const std::string & reason)
+ {
+     for (const auto & was : tracked) {
+@@ -368,8 +480,11 @@ void Dispatcher::settledLocked(const std::vector<Tracked> & tracked, DrvState::C
+             }
+             continue;
+         }
+-        if (cause == DrvState::CAUSE_REQUEUED && ent->worker != sched::noWorker) {
+-            continue; // reported again by the same Hello, adoptedLocked tells
++        if (cause == DrvState::CAUSE_REQUEUED) {
++            if (ent->worker != sched::noWorker) {
++                continue; // reported again by the same Hello, adoptedLocked tells
++            }
++            counters.set_requeued(counters.requeued() + 1);
+         }
+         drvChangedLocked(was.drv, cause, reason);
+     }
+@@ -412,6 +527,7 @@ void Dispatcher::doneLocked(sched::WorkerId wid, const Done & done, bool assigne
+     case Done::NO_SHOW:
+         // Back in the queue, or retired when no client follows it.
+         if (auto const drv = core.findDrv(done.drv_path())) {
++            counters.set_requeued(counters.requeued() + 1);
+             drvChangedLocked(*drv, DrvState::CAUSE_REQUEUED, giveBackReason(done));
+         } else {
+             drvGoneLocked(done.drv_path(), DrvGone::DROPPED, wid);
+diff --git a/src/daemon/dispatcher.cc b/src/daemon/dispatcher.cc
+index 4006b48..4754ce2 100644
+--- a/src/daemon/dispatcher.cc
++++ b/src/daemon/dispatcher.cc
+@@ -9,6 +9,7 @@
+ #include <functional>
+ #include <memory>
+ #include <initializer_list>
++#include <map>
+ #include <optional>
+ #include <ratio>
+ #include <span>
+@@ -103,8 +104,14 @@ void Dispatcher::tickLocked()
+         dispatchLocked();
+         metrics.schedRested(core.resting());
+     }
+-    if (statsPending) {
+-        exportStats(true);
++    sampleLocked();
++    if (statsPending || !eventWatchers.empty()) {
++        // One O(entries) pass serves the gauges and the Stats event.
++        auto const stats = core.stats();
++        if (statsPending) {
++            publishStats(stats);
++        }
++        statsEventLocked(stats);
+     }
+ }
+ 
+@@ -338,7 +345,7 @@ void Dispatcher::dispatchLocked()
+     // Each round with a drop has one worker fewer.
+     while (dispatchOnceLocked()) {
+     }
+-    exportStats(false);
++    exportStats();
+ }
+ 
+ auto Dispatcher::dispatchOnceLocked() -> bool
+@@ -370,7 +377,7 @@ auto Dispatcher::dispatchOnceLocked() -> bool
+         assignedCtr.Increment();
+         auto const now = nowMs();
+         core.markPlaced(asg.drv, now);
+-        drvChangedLocked(asg.drv, nix::remote::DrvState::CAUSE_ASSIGNED);
++        assignedLocked(asg.drv);
+         metrics.queueWait(ent->system, (now - ent->enqMs) / msPerSecond);
+         debugLog(
+             {{"event", "assigned"},
+@@ -381,18 +388,23 @@ auto Dispatcher::dispatchOnceLocked() -> bool
+     return dropped;
+ }
+ 
+-void Dispatcher::exportStats(bool force)
++void Dispatcher::exportStats()
+ {
+     auto now = nowMs();
+-    if (!force && statsAtMs && now - *statsAtMs < statsEveryMs) {
++    if (statsAtMs && now - *statsAtMs < statsEveryMs) {
+         statsPending = true;
+         return;
+     }
++    publishStats(core.stats());
++}
++
++void Dispatcher::publishStats(const std::map<sched::Core::StatsKey, sched::Core::Stats> & stats)
++{
+     statsPending = false;
+-    statsAtMs = now;
++    statsAtMs = nowMs();
+     auto previous = std::exchange(statGauges, {});
+     size_t queued = 0;
+-    for (const auto & [key, sst] : core.stats()) {
++    for (const auto & [key, sst] : stats) {
+         queued += sst.queued;
+         auto & live = statGauges[key];
+         live = {
+@@ -554,6 +566,9 @@ auto Dispatcher::connectClient(ClientSend send, std::function<void()> abort, std
+ void Dispatcher::serving()
+ {
+     const Lock lock(*this);
++    if (lettingGo) {
++        startServingLocked();
++    }
+     lettingGo = false;
+     metrics.schedLeader(true);
+ }
+@@ -637,6 +652,9 @@ void Dispatcher::onWant(Client & client, const nix::remote::Want & want, Lookup
+         cachedLocked(client, want);
+         return;
+     }
++    if (cache == Lookup::missing) {
++        counters.set_cache_misses(counters.cache_misses() + 1);
++    }
+     if (want.system().size() > maxSystemLen) {
+         reply.mutable_unplaceable()->set_drv_path(want.drv_path());
+         reply.mutable_unplaceable()->set_reason("bad system '" + want.system() + "'");
+@@ -685,7 +703,7 @@ void Dispatcher::onWant(Client & client, const nix::remote::Want & want, Lookup
+                 res.drv, nix::remote::DrvState::CAUSE_PLACEABILITY,
+                 std::move(*reply.mutable_unplaceable()->mutable_reason()));
+         }
+-        exportStats(false);
++        exportStats();
+     }
+ }
+ 
+@@ -696,11 +714,12 @@ void Dispatcher::onCancel(Client & client, const nix::remote::Cancel & cancel)
+     if (!drv) {
+         return;
+     }
++    auto const live = core.liveEntries();
+     auto const tracked = followedLocked(client.id, std::span(&*drv, 1));
+     if (auto wid = core.cancel(client.id, *drv)) {
+         revokeOn(*wid, cancel.drv_path());
+     }
+-    settledLocked(tracked, nix::remote::DrvState::CAUSE_FOLLOWERS, {});
++    followersLeftLocked(tracked, live);
+ }
+ 
+ void Dispatcher::clientGone(const ClientPtr & clientPtr)
+@@ -709,6 +728,7 @@ void Dispatcher::clientGone(const ClientPtr & clientPtr)
+     const Lock lock(*this);
+     client.gone = true;
+     clients.erase(client.id);
++    auto const live = core.liveEntries();
+     auto const tracked = followedLocked(client.id, core.wanted(client.id));
+     std::vector<std::pair<sched::DrvId, sched::WorkerId>> revokes;
+     core.clientGone(client.id, revokes);
+@@ -717,10 +737,10 @@ void Dispatcher::clientGone(const ClientPtr & clientPtr)
+             orphans.push_back({.drv = drv, .assignId = ent->assignId, .dueMs = nowMs() + orphanGraceMs});
+         }
+     }
+-    settledLocked(tracked, nix::remote::DrvState::CAUSE_FOLLOWERS, {});
++    followersLeftLocked(tracked, live);
+     clientLeftLocked(client.id);
+     metrics.schedClients(-1);
+-    exportStats(false);
++    exportStats();
+ }
+ 
+ // ------------------------------------------------------------------ workers
+@@ -740,7 +760,7 @@ void Dispatcher::workerMsgs(Worker & worker, const nix::remote::WorkerMsgs & msg
+     dispatchLocked();
+     metrics.schedWorkers(core.workersUp());
+     metrics.schedRested(core.resting());
+-    exportStats(false);
++    exportStats();
+ }
+ 
+ void Dispatcher::onHello(Worker & worker, const nix::remote::Hello & hel)
+@@ -869,7 +889,7 @@ void Dispatcher::workerGone(Worker & worker)
+     placeabilityChangedLocked();
+     metrics.schedWorkers(core.workersUp());
+     metrics.schedRested(core.resting());
+-    exportStats(false);
++    exportStats();
+     worker.id.reset();
+ }
+ 
+diff --git a/src/daemon/dispatcher.hh b/src/daemon/dispatcher.hh
+index 1f73bb7..f17a532 100644
+--- a/src/daemon/dispatcher.hh
++++ b/src/daemon/dispatcher.hh
+@@ -210,8 +210,8 @@ private:
+     bool statsStop ABSL_GUARDED_BY(mutex) = false;
+     std::thread statsThread;
+ 
+-    // Watchers of the event stream, see dispatcher-events.cc. Events are
+-    // only built while someone watches.
++    // Watchers of the event stream, see dispatcher-events.cc. Counters run
++    // whether anyone watches or not; events are only built for watchers.
+     struct Watcher
+     {
+         WatchSend send;
+@@ -224,6 +224,10 @@ private:
+     // Unix ms at `epoch`. Event times are this plus steady time, so they
+     // stay consistent within one process when the system clock moves.
+     const double wallEpochMs = unixMs();
++    double servingSinceMs ABSL_GUARDED_BY(mutex) = 0;
++    nix::remote::Counters counters ABSL_GUARDED_BY(mutex);
++    std::deque<nix::remote::CounterSample> history ABSL_GUARDED_BY(mutex);
++    double sampledAtMs ABSL_GUARDED_BY(mutex) = 0;
+ 
+     // A drv a Core call may change or retire, as it was before.
+     struct Tracked
+@@ -250,8 +254,10 @@ private:
+     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) auto dispatchOnceLocked() -> bool;
+     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void membershipChangedLocked();
+     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void wakeWatchersLocked();
+-    // Per-system gauges. O(entries), so at most once a second unless forced.
+-    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void exportStats(bool force);
++    // Per-system gauges. O(entries), so at most once a second.
++    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void exportStats();
++    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void publishStats(
++        const std::map<sched::Core::StatsKey, sched::Core::Stats> & stats);
+     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void revokeOn(sched::WorkerId wid, const std::string & drvPath);
+     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void revokeOrphans();
+     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void tickLocked();
+@@ -268,14 +274,18 @@ private:
+     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void onWant(Client & client, const nix::remote::Want & want, Lookup cache);
+     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void onCancel(Client & client, const nix::remote::Cancel & cancel);
+ 
+-    // The event stream, in dispatcher-events.cc. The *Locked hooks emit an
+-    // event if anyone watches.
++    // The event stream, in dispatcher-events.cc. The *Locked hooks keep the
++    // counters and emit an event if anyone watches.
+     [[nodiscard]] static auto newInstance() -> std::string;
+     [[nodiscard]] static auto unixMs() -> double;
+     [[nodiscard]] auto wallMs(double steadyMs) const -> uint64_t;
+     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void emitLocked(nix::remote::WatchEvent event);
+     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) auto snapshotLocked(const WatchSend & send) -> bool;
+     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void endEventWatchersLocked();
++    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void startServingLocked();
++    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void sampleLocked();
++    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void statsEventLocked(
++        const std::map<sched::Core::StatsKey, sched::Core::Stats> & stats);
+     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) auto drvEventLocked(
+         const sched::Entry & ent, nix::remote::DrvState::Cause cause, std::string reason = {}) const
+         -> nix::remote::WatchEvent;
+@@ -290,10 +300,12 @@ private:
+     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void clientLeftLocked(sched::ClientId cid);
+     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void wantedLocked(const sched::Core::WantResult & res);
+     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void cachedLocked(const Client & client, const nix::remote::Want & want);
++    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void assignedLocked(sched::DrvId drv);
+     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) auto heldLocked(sched::WorkerId wid) const -> std::vector<Tracked>;
+     // Of `drvs`, those `cid` follows. Empty unless someone watches.
+     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) auto followedLocked(sched::ClientId cid, std::span<const sched::DrvId> drvs) const
+         -> std::vector<Tracked>;
++    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void followersLeftLocked(const std::vector<Tracked> & tracked, size_t liveBefore);
+     // After the Core call: retired ones are DROPPED, the rest get `cause`.
+     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void settledLocked(
+         const std::vector<Tracked> & tracked, nix::remote::DrvState::Cause cause, const std::string & reason);
+diff --git a/src/daemon/events.cc b/src/daemon/events.cc
+index 1d5758a..56c518c 100644
+--- a/src/daemon/events.cc
++++ b/src/daemon/events.cc
+@@ -79,8 +79,12 @@ auto EventsService::Watch(grpc::CallbackServerContext * context, const nix::remo
+     auto peer = context->peer();
+     logLine(LogLevel::info, {{"event", "watch_stream_open"}, {"cn", caller.name}, {"peer", peer}});
+     return new WatchReactor( // NOLINT(cppcoreguidelines-owning-memory): deletes itself in OnDone
+-        context, *dispatcher, *idle, [this, name = caller.name, peer = std::move(peer)] -> void {
++        context, *dispatcher, *idle, caller.validUntil,
++        [this, name = caller.name, peer = std::move(peer)](bool expired) -> void {
+             streams.release(name);
++            if (expired) {
++                logLine(LogLevel::info, {{"event", "watch_stream_expired"}, {"cn", name}, {"peer", peer}});
++            }
+             logLine(LogLevel::info, {{"event", "watch_stream_closed"}, {"cn", name}, {"peer", peer}});
+         });
+ }
+diff --git a/src/daemon/oidc.hh b/src/daemon/oidc.hh
+index 792821c..295823e 100644
+--- a/src/daemon/oidc.hh
++++ b/src/daemon/oidc.hh
+@@ -64,6 +64,8 @@ struct Identity
+ {
+     std::string subject;      // "oidc:<provider>:<sub>"
+     std::optional<Role> role; // nullopt: verified but no rule matched
++    // exp plus the clock skew: the last moment verify() accepts the token.
++    std::chrono::system_clock::time_point validUntil;
+ };
+ 
+ constexpr size_t maxTokenBytes = 16UL * 1024;
+@@ -537,7 +539,11 @@ private:
+         }
+         auto const role = roleFor(provider, claims);
+         return {
+-            .identity = Identity{.subject = "oidc:" + provider.name + ":" + sub, .role = role},
++            .identity =
++                Identity{
++                    .subject = "oidc:" + provider.name + ":" + sub,
++                    .role = role,
++                    .validUntil = token.get_expires_at() + std::chrono::seconds(clockSkewSecs)},
+             .error = role ? "" : "no rule matched"};
+     }
+ 
+diff --git a/src/daemon/sched-reactor.hh b/src/daemon/sched-reactor.hh
+index 1635e0e..9766cd8 100644
+--- a/src/daemon/sched-reactor.hh
++++ b/src/daemon/sched-reactor.hh
+@@ -5,6 +5,7 @@
+ // peer that stops reading is cancelled once its queue is full.
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <cstddef>
+ #include <cstdint>
+ #include <deque>
+@@ -267,24 +268,33 @@ private:
+ };
+ 
+ // Events.Watch: the Dispatcher's snapshot, then its events. Ends when the
+-// client cancels, falls too far behind after the snapshot, or the node stops
+-// serving (UNAVAILABLE, so the client goes back through the balancer).
++// client cancels, falls too far behind after the snapshot, the node stops
++// serving (UNAVAILABLE, so the client goes back through the balancer), or
++// the caller's bearer token expires (UNAUTHENTICATED, so the client renews it).
+ class WatchReactor final : public grpc::ServerWriteReactor<nix::remote::WatchEvents>
+ {
+ public:
++    using Clock = std::chrono::system_clock;
++
+     struct Queue : SendQueue<nix::remote::WatchEvent, nix::remote::WatchEvents>
+     {
+         // Events queued after SnapshotDone. They sit behind the snapshot's.
+         size_t deltas ABSL_GUARDED_BY(mutex) = 0;
+     };
+ 
+-    // `done` runs last, in OnDone.
++    // `validUntil`: the stream ends after it, nullopt for certificate callers.
++    // `done` runs last, in OnDone, and learns whether that was the cause.
+     WatchReactor(
+-        grpc::CallbackServerContext * ctx, Dispatcher & disp, IdleTracker & idle, std::function<void()> done)
++        grpc::CallbackServerContext * ctx,
++        Dispatcher & disp,
++        IdleTracker & idle,
++        std::optional<Clock::time_point> validUntil,
++        std::function<void(bool expired)> done)
+         : active(idle)
+         , ctx(ctx)
+         , disp(disp)
+         , sendq(std::make_shared<Queue>())
++        , validUntil(validUntil)
+         , done(std::move(done))
+     {
+         watcher = disp.watch(sender(), ender());
+@@ -334,7 +344,12 @@ public:
+         if (watcher) {
+             disp.unwatch(*watcher);
+         }
+-        done();
++        bool cut = false;
++        {
++            const absl::MutexLock lock(sendq->mutex);
++            cut = status.error_code() == grpc::StatusCode::UNAUTHENTICATED;
++        }
++        done(cut);
+         delete this; // NOLINT(cppcoreguidelines-owning-memory): created by EventsService::Watch
+     }
+ 
+@@ -345,10 +360,18 @@ private:
+     // a system losing its last worker). So a client counts as stuck only when
+     // it is behind by `limit` events plus two per drv of the largest table it
+     // has seen.
++    //
++    // It also ends a token's stream once the scheduler would refuse that
++    // token. Stats come once a second, so that is at most a second late. Not
++    // inside the snapshot, which goes out right after the token was checked.
+     auto sender() -> Dispatcher::WatchSend
+     {
+         return [this, sendq = sendq](nix::remote::WatchEvent && event)
+                    ABSL_EXCLUSIVE_LOCKS_REQUIRED(disp.sendLock()) -> bool {
++            if (live && validUntil && Clock::now() > *validUntil) {
++                end({grpc::StatusCode::UNAUTHENTICATED, "bearer token expired"});
++                return false;
++            }
+             peak = std::max(peak, disp.trackedLocked());
+             bool kick = false;
+             bool fits = false;
+@@ -391,7 +414,7 @@ private:
+     // Ends the stream with `fin`. Claims the writer like a send, so Finish
+     // waits for the kick. A write still in flight is cancelled: a client
+     // that stopped reading must not keep the stream and its queue alive on
+-    // a node that no longer serves.
++    // a node that no longer serves, or past its token.
+     ABSL_EXCLUSIVE_LOCKS_REQUIRED(disp.sendLock()) void end(grpc::Status fin)
+     {
+         bool kick = false;
+@@ -451,7 +474,8 @@ private:
+     grpc::CallbackServerContext * ctx;
+     Dispatcher & disp;
+     std::shared_ptr<Queue> sendq;
+-    std::function<void()> done;
++    const std::optional<Clock::time_point> validUntil;
++    std::function<void(bool expired)> done;
+     std::optional<uint64_t> watcher;
+     nix::remote::WatchEvents out;
+     // Only the sender, under the Dispatcher mutex.
+diff --git a/tests/events-grpc-test.cc b/tests/events-grpc-test.cc
+index e21dd1b..8994ec1 100644
+--- a/tests/events-grpc-test.cc
++++ b/tests/events-grpc-test.cc
+@@ -1,12 +1,19 @@
+ // Events.Watch over a loopback gRPC server: WatchReactor delivers the
+-// snapshot and the events, keeps up with large tables, ends on cancel and on
+-// a leader change, and EventsService turns away passive nodes, anonymous
+-// callers and callers with too many streams.
+-
++// snapshot and the events, keeps up with large tables, ends on cancel, on a
++// leader change and when a bearer token expires, and EventsService turns
++// away passive nodes, anonymous callers and callers with too many streams.
++// A balancer can name a viewer that has no certificate, and the access
++// rules apply to that name. The JWKS for the bearer tokens is served from a
++// directory given on the command line (python http.server in
++// tests/oidc-test.sh).
++
++#include <algorithm>
+ #include <atomic>
+ #include <cassert>
+ #include <chrono>
+ #include <cstddef>
++#include <cstdint>
++#include <cstdio>
+ #include <cstdlib>
+ #include <exception>
+ #include <format>
+@@ -19,6 +26,9 @@
+ #include <utility>
+ #include <vector>
+ 
++#include <fcntl.h>
++#include <unistd.h>
++
+ #include <openssl/asn1.h>
+ #include <openssl/bio.h>
+ #include <openssl/ec.h>
+@@ -41,6 +51,14 @@
+ #include <grpcpp/support/server_callback.h>
+ #include <grpcpp/support/status.h>
+ #include <grpcpp/support/sync_stream.h>
++// Before jwt.h, which would pull in picojson without it.
++#include <jwt-cpp/traits/nlohmann-json/defaults.h>
++#include <jwt-cpp/base.h>
++#include <jwt-cpp/jwt.h>
++#include <nlohmann/json.hpp> // NOLINT(misc-include-cleaner): json_fwd.hpp only declares.
++#include <nlohmann/json_fwd.hpp>
++
++#include <nix/util/file-system.hh>
+ 
+ #include "acl.hh"
+ #include "auth.hh"
+@@ -72,19 +90,27 @@ struct Farm
+     }
+ };
+ 
+-// EventsService without auth, to reach the reactor.
++using Clock = WatchReactor::Clock;
++using Json = nlohmann::json;
++
++// EventsService without auth, to reach the reactor. `validUntil` stands
++// in for a bearer token's.
+ class Open final : public rpc::Events::CallbackService
+ {
+ public:
+-    explicit Open(Dispatcher & disp)
++    explicit Open(Dispatcher & disp, std::optional<Clock::time_point> validUntil = std::nullopt)
+         : disp(disp)
++        , validUntil(validUntil)
+     {
+     }
+ 
+     auto Watch(grpc::CallbackServerContext * ctx, const rpc::WatchRequest * /*request*/)
+         -> grpc::ServerWriteReactor<rpc::WatchEvents> * override
+     {
+-        return new WatchReactor(ctx, disp, idle, [this] -> void { done++; });
++        return new WatchReactor(ctx, disp, idle, validUntil, [this](bool expired) -> void {
++            cut += expired ? 1 : 0;
++            done++;
++        });
+     }
+ 
+     // Streams that reached OnDone.
+@@ -93,10 +119,18 @@ public:
+         return done;
+     }
+ 
++    // Of those, the ones that ended at validUntil.
++    [[nodiscard]] auto expired() const -> int
++    {
++        return cut;
++    }
++
+ private:
+     Dispatcher & disp;
++    std::optional<Clock::time_point> validUntil;
+     IdleTracker idle;
+     std::atomic<int> done{0};
++    std::atomic<int> cut{0};
+ };
+ 
+ // PEM text from an OpenSSL writer.
+@@ -152,6 +186,54 @@ struct Tls
+     }
+ };
+ 
++// Signs bearer tokens with an Ed25519 key and publishes the key in `dir`,
++// where the verifier fetches it from `base`.
++struct Issuer
++{
++    std::string base;
++    std::string key;
++
++    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters): directory, then URL.
++    Issuer(const std::string & dir, std::string url)
++        : base(std::move(url))
++    {
++        Key const pkey(EVP_PKEY_Q_keygen(nullptr, nullptr, "ED25519"), EVP_PKEY_free); // NOLINT(cppcoreguidelines-pro-type-vararg)
++        assert(pkey);
++        std::string pub(32, '\0');
++        size_t len = pub.size();
++        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast): OpenSSL takes unsigned char.
++        EVP_PKEY_get_raw_public_key(pkey.get(), reinterpret_cast<unsigned char *>(pub.data()), &len);
++        auto const xB64 = jwt::base::trim<jwt::alphabet::base64url>(jwt::base::encode<jwt::alphabet::base64url>(pub));
++        Json const jwk{{"kid", "ed-1"}, {"use", "sig"}, {"kty", "OKP"}, {"crv", "Ed25519"}, {"x", xB64}};
++        nix::writeFile(dir + "/jwks.json", Json{{"keys", Json::array({jwk})}}.dump());
++        nix::writeFile(
++            dir + "/oidc.json",
++            Json{
++                {"allow_insecure", true},
++                {"providers",
++                 {{"dash",
++                   {{"issuer", base},
++                    {"audience", "dashboard"},
++                    {"jwks_url", base + "/jwks.json"},
++                    {"scopes", {"watch"}}}}}}}
++                .dump());
++        key = privatePem(pkey.get());
++    }
++
++    [[nodiscard]] auto token(const std::string & sub, Clock::time_point exp) const -> std::string
++    {
++        return jwt::create()
++            .set_type("JWT")
++            .set_key_id("ed-1")
++            .set_issuer(base)
++            .set_audience("dashboard")
++            .set_subject(sub)
++            .set_issued_at(Clock::now())
++            .set_expires_at(exp)
++            .sign(jwt::algorithm::ed25519("", key));
++    }
++};
++
+ struct Server
+ {
+     std::unique_ptr<grpc::Server> server;
+@@ -198,12 +280,18 @@ struct Stream
+     std::unique_ptr<grpc::ClientReader<rpc::WatchEvents>> reader;
+     std::vector<rpc::WatchEvent> events;
+ 
+-    explicit Stream(rpc::Events::Stub & stub, const std::string & token = "")
++    explicit Stream(
++        rpc::Events::Stub & stub,
++        const std::string & token = "",
++        const std::vector<std::pair<std::string, std::string>> & metadata = {})
+     {
+         ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(20));
+         if (!token.empty()) {
+             ctx.AddMetadata("authorization", "Bearer " + token);
+         }
++        for (const auto & [key, value] : metadata) {
++            ctx.AddMetadata(key, value);
++        }
+         reader = stub.Watch(&ctx, rpc::WatchRequest{});
+     }
+ 
+@@ -358,6 +446,55 @@ void testStalledStepDown()
+     srv.server->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds(1));
+ }
+ 
++// Nor past its token: the cut cancels the write in flight, and the client
++// sees CANCELLED.
++void testStalledExpiry()
++{
++    Farm farm;
++    auto const big = wantMany(farm, 20'000);
++    Open open(farm.disp, Clock::now() + std::chrono::milliseconds(300));
++    Server srv(open);
++    Stream stalled(*srv.stub);
++    rpc::WatchEvents batch;
++    assert(stalled.reader->Read(&batch));
++    assert(wait([&] -> bool { return open.finished() == 1; }));
++    assert(open.expired() == 1);
++    stalled.ctx.TryCancel();
++    assert(stalled.reader->Finish().error_code() == grpc::StatusCode::CANCELLED);
++    srv.server->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds(1));
++}
++
++// A stream past its validUntil gets its whole snapshot, then ends with
++// UNAUTHENTICATED at the next Stats. If that Stats comes while the
++// snapshot's own write is still in flight, the cut cancels the write, as in
++// testStalledExpiry. That window is one write long, once a second, so the
++// test tries again when it hits it.
++void testExpiredAtOpen()
++{
++    Farm farm;
++    auto const client = farm.client("ci-1");
++    auto const synced = [](const rpc::WatchEvent & event) -> bool { return event.has_snapshot_done(); };
++    for (int attempt = 1;; attempt++) {
++        Open open(farm.disp, Clock::now() - std::chrono::seconds(1));
++        Server srv(open);
++        Stream stream(*srv.stub);
++        bool const gotSnapshot = stream.readUntil(synced);
++        if (gotSnapshot) {
++            assert(!stream.readUntil([](const rpc::WatchEvent &) -> bool { return false; }));
++        }
++        auto const status = stream.reader->Finish();
++        assert(wait([&] -> bool { return open.finished() == 1; }));
++        assert(open.expired() == 1);
++        srv.server->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds(1));
++        if (status.error_code() == grpc::StatusCode::CANCELLED && attempt < 3) {
++            continue;
++        }
++        assert(gotSnapshot && stream.events.front().has_reset() && stream.events.size() == 3); // reset, client, done
++        assert(status.error_code() == grpc::StatusCode::UNAUTHENTICATED && status.error_message() == "bearer token expired");
++        return;
++    }
++}
++
+ // One caller cannot take every stream.
+ void testLimit()
+ {
+@@ -421,17 +558,251 @@ void testService()
+     srv.server->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds(1));
+ }
+ 
++// What the daemon writes to stderr, its log, while this lives. The text
++// goes back to stderr at the end, so the test's own log keeps it.
++class CapturedLog
++{
++public:
++    explicit CapturedLog(std::string file)
++        : path(std::move(file))
++        , saved(dup(STDERR_FILENO))
++    {
++        static_cast<void>(std::fflush(stderr));
++        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg): open(2) is vararg.
++        auto const out = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
++        assert(out >= 0 && saved >= 0);
++        dup2(out, STDERR_FILENO);
++        close(out);
++    }
++
++    CapturedLog(const CapturedLog &) = delete;
++    CapturedLog(CapturedLog &&) = delete;
++    auto operator=(const CapturedLog &) -> CapturedLog & = delete;
++    auto operator=(CapturedLog &&) -> CapturedLog & = delete;
++
++    ~CapturedLog()
++    {
++        auto const captured = text();
++        dup2(saved, STDERR_FILENO);
++        close(saved);
++        std::cerr << captured;
++    }
++
++    [[nodiscard]] auto text() const -> std::string
++    {
++        static_cast<void>(std::fflush(stderr));
++        return nix::readFile(path);
++    }
++
++private:
++    std::string path;
++    int saved;
++};
++
++// A balancer (here `lb-1`, a trusted proxy) uses x-forwarded-client-cert
++// to name a viewer that has no certificate of its own, as a web
++// dashboard's proxy does for its anonymous viewers. The access rules then
++// apply to that name, and the stream cap counts per forwarded name. The
++// balancer's own certificate stands in for nobody, and a peer that is not
++// a proxy cannot forward a name.
++void testForwardedViewer(const std::string & dir)
++{
++    Farm farm;
++    std::optional<oidc::Verifier> verifier;
++    auto const synced = [](const rpc::WatchEvent & event) -> bool { return event.has_snapshot_done(); };
++    auto const any = [](const rpc::WatchEvent &) -> bool { return true; };
++    auto const forwarded = [](const std::string & name) -> std::vector<std::pair<std::string, std::string>> {
++        return {{"x-forwarded-client-cert", R"(Subject="CN=)" + name + R"(")"}};
++    };
++    auto const viewer = forwarded("dashboard-anon-10.0.0.7");
++    {
++        Tls const tls("lb-1");
++        Auth auth{.oidc = &verifier};
++        auth.proxies.add("lb-*");
++        auth.acl.addRule("dashboard-*=watch");
++        auth.acl.addRule("lb-*=trusted");
++        IdleTracker idle;
++        EventsService service(farm.disp, auth, idle);
++        Server srv(service, tls);
++
++        std::vector<std::unique_ptr<Stream>> streams;
++        for (unsigned idx = 0; idx < EventsService::maxStreamsPerCaller; idx++) {
++            streams.push_back(std::make_unique<Stream>(*srv.certStub, "", viewer));
++            assert(streams.back()->readUntil(synced));
++        }
++        {
++            Stream ninth(*srv.certStub, "", viewer);
++            assert(!ninth.readUntil(any));
++            assert(ninth.reader->Finish().error_code() == grpc::StatusCode::RESOURCE_EXHAUSTED);
++        }
++        // Another address is another caller with its own share.
++        streams.push_back(std::make_unique<Stream>(*srv.certStub, "", forwarded("dashboard-anon-10.0.0.8")));
++        assert(streams.back()->readUntil(synced));
++        {
++            Stream nobody(*srv.certStub);
++            assert(!nobody.readUntil(any));
++            assert(nobody.reader->Finish().error_code() == grpc::StatusCode::UNAUTHENTICATED);
++        }
++        {
++            // Two headers: the scheduler cannot tell which hop is right.
++            auto twice = viewer;
++            twice.emplace_back("x-forwarded-client-cert", R"(Subject="CN=dashboard-anon-10.0.0.9")");
++            Stream ambiguous(*srv.certStub, "", twice);
++            assert(!ambiguous.readUntil(any));
++            assert(ambiguous.reader->Finish().error_code() == grpc::StatusCode::UNAUTHENTICATED);
++        }
++        for (auto & stream : streams) {
++            stream->ctx.TryCancel();
++            assert(!stream->reader->Finish().ok());
++        }
++        srv.server->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds(1));
++    }
++    {
++        // Not a proxy: the header is ignored and the peer is its own certificate.
++        Tls const tls("dash-viewer");
++        Auth auth{.oidc = &verifier};
++        auth.proxies.add("lb-*");
++        auth.acl.addRule("dash-viewer=watch");
++        IdleTracker idle;
++        EventsService service(farm.disp, auth, idle);
++        Server srv(service, tls);
++        std::string log;
++        {
++            CapturedLog const captured(dir + "/forwarded-viewer.log");
++            Stream stream(*srv.certStub, "", forwarded("lb-1"));
++            assert(stream.readUntil(synced));
++            log = captured.text();
++            stream.ctx.TryCancel();
++            assert(!stream.reader->Finish().ok());
++        }
++        assert(log.contains("event=watch_stream_open cn=dash-viewer "));
++        assert(!log.contains("cn=lb-1"));
++        srv.server->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds(1));
++    }
++    {
++        // Without a rule for the forwarded name, the proxy's own rule does not apply.
++        Tls const tls("lb-1");
++        Auth auth{.oidc = &verifier};
++        auth.proxies.add("lb-*");
++        auth.acl.addRule("lb-*=trusted");
++        IdleTracker idle;
++        EventsService service(farm.disp, auth, idle);
++        Server srv(service, tls);
++        Stream stream(*srv.certStub, "", viewer);
++        assert(!stream.readUntil(any));
++        auto const status = stream.reader->Finish();
++        assert(status.error_code() == grpc::StatusCode::PERMISSION_DENIED);
++        assert(status.error_message() == "no access rule matches 'dashboard-anon-10.0.0.7'");
++        srv.server->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds(1));
++    }
++}
++
++// Through EventsService: a stream on a bearer token ends with
++// UNAUTHENTICATED once the scheduler would refuse that token, whether its
++// client has read the snapshot or not, and gives its slot back. A
++// certificate caller's stream on the same scheduler goes on.
++void testTokenExpiry(const std::string & dir, const std::string & base)
++{
++    using std::chrono::seconds;
++    Farm farm;
++    Issuer const issuer(dir, base);
++    std::optional<oidc::Verifier> verifier(oidc::loadConfig(dir + "/oidc.json"));
++    Tls const tls("dash-viewer");
++    Auth auth{.oidc = &verifier};
++    auth.acl.addRule(tls.name + "=watch");
++    IdleTracker idle;
++    EventsService service(farm.disp, auth, idle);
++    Server srv(service, tls);
++    auto const any = [](const rpc::WatchEvent &) -> bool { return true; };
++    auto const never = [](const rpc::WatchEvent &) -> bool { return false; };
++    auto const synced = [](const rpc::WatchEvent & event) -> bool { return event.has_snapshot_done(); };
++
++    // Already past exp plus the leeway: refused when the stream opens.
++    {
++        Stream late(*srv.stub, issuer.token("alice", Clock::now() - seconds(61)));
++        assert(!late.readUntil(any));
++        assert(late.reader->Finish().error_code() == grpc::StatusCode::UNAUTHENTICATED);
++    }
++
++    // Two to three seconds left. Alice opens all her streams with it.
++    auto const exp = Clock::now() - seconds(57);
++    auto const until = std::chrono::floor<seconds>(exp) + seconds(oidc::clockSkewSecs);
++    auto const token = issuer.token("alice", exp);
++    std::vector<std::unique_ptr<Stream>> alice;
++    alice.reserve(EventsService::maxStreamsPerCaller);
++    for (unsigned idx = 0; idx < EventsService::maxStreamsPerCaller; idx++) {
++        alice.push_back(std::make_unique<Stream>(*srv.stub, token));
++    }
++    Stream cert(*srv.certStub);
++    assert(cert.readUntil(synced));
++    // All but the first read their snapshot now. The first reads nothing
++    // before the cut, so for its client the cut falls inside the snapshot.
++    for (size_t idx = 1; idx < alice.size(); idx++) {
++        assert(alice.at(idx)->readUntil(synced));
++    }
++    for (auto & stream : alice) {
++        assert(!stream->readUntil(never));
++        auto const status = stream->reader->Finish();
++        assert(status.error_code() == grpc::StatusCode::UNAUTHENTICATED);
++        assert(status.error_message() == "bearer token expired");
++        // Not before the scheduler would refuse the token, and soon after.
++        auto const now = Clock::now();
++        assert(now > until && now < until + seconds(5));
++    }
++    const auto & first = alice.front()->events;
++    assert(first.front().has_reset() && std::ranges::any_of(first, synced));
++
++    // The certificate caller's stream outlives the cut.
++    auto const cutMs = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count();
++    assert(cert.readUntil([&](const rpc::WatchEvent & event) -> bool {
++        return event.has_stats() && event.time_ms() > static_cast<uint64_t>(cutMs);
++    }));
++
++    // Every slot came back: alice can open all her streams again, and no more.
++    // A slot frees in OnDone, which may run just after the client saw the status.
++    auto const fresh = issuer.token("alice", Clock::now() + std::chrono::minutes(5));
++    std::vector<std::unique_ptr<Stream>> again;
++    assert(wait([&] -> bool {
++        auto stream = std::make_unique<Stream>(*srv.stub, fresh);
++        if (stream->readUntil(synced)) {
++            again.push_back(std::move(stream));
++        } else {
++            assert(stream->reader->Finish().error_code() == grpc::StatusCode::RESOURCE_EXHAUSTED);
++        }
++        return again.size() == EventsService::maxStreamsPerCaller;
++    }));
++    Stream extra(*srv.stub, fresh);
++    assert(!extra.readUntil(any));
++    assert(extra.reader->Finish().error_code() == grpc::StatusCode::RESOURCE_EXHAUSTED);
++    for (auto & stream : again) {
++        stream->ctx.TryCancel();
++        assert(!stream->reader->Finish().ok());
++    }
++    cert.ctx.TryCancel();
++    assert(!cert.reader->Finish().ok());
++    srv.server->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds(1));
++}
++
+ 
+ } // namespace
+ // NOLINTEND(*-magic-numbers, bugprone-unchecked-optional-access, cppcoreguidelines-owning-memory, misc-use-internal-linkage)
+ 
+-auto main() -> int
++auto main(int argc, char ** argv) -> int
+ try {
++    if (argc != 3) {
++        std::cerr << "usage: events-grpc-test JWKS-DIR BASE-URL\n";
++        return 2;
++    }
++    std::vector<std::string> const args(argv, argv + argc); // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+     testStream();
+     testBacklog();
+     testStalledStepDown();
++    testStalledExpiry();
++    testExpiredAtOpen();
+     testLimit();
+     testService();
++    testForwardedViewer(args.at(1));
++    testTokenExpiry(args.at(1), args.at(2));
+     // gRPC frees TLS endpoints on EventEngine threads that can outlive the
+     // servers and channels, which races OpenSSL's atexit cleanup (see
+     // retainGrpcRuntime in src/client/channel.hh). Every test passed, so
+diff --git a/tests/events-test.cc b/tests/events-test.cc
+index 56c1371..e00a87a 100644
+--- a/tests/events-test.cc
++++ b/tests/events-test.cc
+@@ -7,6 +7,7 @@
+ #include <algorithm>
+ #include <array>
+ #include <cassert>
++#include <chrono>
+ #include <cstddef>
+ #include <cstdint>
+ #include <exception>
+@@ -22,6 +23,7 @@
+ #include <set>
+ #include <string>
+ #include <string_view>
++#include <thread>
+ #include <unordered_set>
+ #include <utility>
+ #include <vector>
+@@ -68,6 +70,13 @@ struct Sink
+     }
+ };
+ 
++// Counter fields the events account for, summed over every delta seen.
++struct Tally
++{
++    uint64_t wanted = 0, cacheHits = 0, assigned = 0, built = 0, failed = 0, cancelled = 0, dropped = 0,
++             requeued = 0, published = 0, fetched = 0;
++};
++
+ // A watcher's state, rebuilt from the stream.
+ struct Model
+ {
+@@ -82,7 +91,7 @@ struct Model
+ // Which kinds of event the random runs produced, to know they covered all.
+ std::map<std::string, size_t> seen; // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+ 
+-void count(const rpc::WatchEvent & event)
++void count(Tally & tally, const rpc::WatchEvent & event)
+ {
+     if (event.has_drv()) {
+         const auto & drv = event.drv();
+@@ -93,10 +102,40 @@ void count(const rpc::WatchEvent & event)
+         if (drv.reason() == "the worker's stream broke") {
+             seen["undeliverable"]++;
+         }
++        if (drv.cause() == rpc::DrvState::CAUSE_WANTED) {
++            tally.wanted++;
++        } else if (drv.cause() == rpc::DrvState::CAUSE_REQUEUED) {
++            tally.requeued++;
++        } else if (drv.cause() == rpc::DrvState::CAUSE_ASSIGNED) {
++            tally.assigned++;
++            for (const auto & src : drv.input_sources()) {
++                if (src.worker_addr() != drv.worker_addr()) {
++                    tally.fetched += src.nar_bytes();
++                }
++            }
++        }
+     } else if (event.has_drv_gone()) {
+-        seen[rpc::DrvGone::Outcome_Name(event.drv_gone().outcome())]++;
++        const auto & gone = event.drv_gone();
++        seen[rpc::DrvGone::Outcome_Name(gone.outcome())]++;
++        switch (gone.outcome()) {
++        case rpc::DrvGone::BUILT:
++            tally.built++;
++            for (const auto & out : gone.outputs()) {
++                tally.published += out.nar_size();
++            }
++            break;
++        case rpc::DrvGone::FAILED:
++            tally.failed++;
++            break;
++        case rpc::DrvGone::CANCELLED:
++            tally.cancelled++;
++            break;
++        default:
++            tally.dropped++;
++        }
+     } else {
+         seen[std::to_string(event.event_case())]++;
++        tally.cacheHits += event.has_cached() ? 1 : 0;
+     }
+ }
+ 
+@@ -115,6 +154,33 @@ auto label(const rpc::WatchEvent & event) -> std::string
+     return event.has_client() ? "client" : "other";
+ }
+ 
++// Polls `cond` every 50 ms, for at most 5 s.
++auto waitFor(const std::function<bool()> & cond) -> bool
++{
++    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
++    while (std::chrono::steady_clock::now() < deadline) {
++        std::this_thread::sleep_for(std::chrono::milliseconds(50));
++        if (cond()) {
++            return true;
++        }
++    }
++    return false;
++}
++
++void checkTotals(const rpc::Counters & totals, const Tally & tally)
++{
++    assert(totals.wanted() == tally.wanted);
++    assert(totals.cache_hits() == tally.cacheHits);
++    assert(totals.assigned() == tally.assigned);
++    assert(totals.built() == tally.built);
++    assert(totals.failed() == tally.failed);
++    assert(totals.cancelled() == tally.cancelled);
++    assert(totals.dropped() == tally.dropped);
++    assert(totals.requeued() == tally.requeued);
++    assert(totals.published_bytes() == tally.published);
++    assert(totals.fetched_bytes_estimate() == tally.fetched);
++}
++
+ // Applies one event as a client must: seq checks, then upserts and removals.
+ void apply(Model & model, const rpc::WatchEvent & event)
+ {
+@@ -160,6 +226,7 @@ void apply(Model & model, const rpc::WatchEvent & event)
+         assert(model.drvs.erase(event.drv_gone().drv_path()) == 1);
+         break;
+     case rpc::WatchEvent::kCached:
++    case rpc::WatchEvent::kStats:
+         assert(model.live);
+         break;
+     default:
+@@ -204,6 +271,9 @@ auto snapshot(Dispatcher & disp) -> Model
+     disp.unwatch(*watcher);
+     Model model;
+     for (const auto & event : sink.take()) {
++        if (model.live) {
++            break; // a Stats from the stats thread
++        }
+         apply(model, event);
+     }
+     assert(model.live);
+@@ -314,8 +384,7 @@ struct SimWorker
+ class Sim
+ {
+ public:
+-    // Unwatched, the same steps run blind and only the late watcher's
+-    // snapshot is checked.
++    // Unwatched, the same steps run blind and only the counters are checked.
+     Sim(unsigned seed, bool watched)
+         : watched(watched)
+         , rng(seed)
+@@ -353,24 +422,36 @@ public:
+         }
+     }
+ 
+-    void run(size_t steps)
++    // The totals after the last step.
++    auto run(size_t steps) -> rpc::Counters
+     {
+         for (size_t step = 0; step < steps; step++) {
+             before = model;
++            missesBefore = misses;
+             randomStep();
+             if (settle()) {
+                 assertSame(model, snapshot(disp));
+             }
+         }
+         if (!watched) {
+-            watched = true;
++            blind = watched = true;
+             watchA();
+         }
++        // At least one Stats after the last step: the totals cover all of it.
++        size_t const stats = statsSeen;
++        assert(waitFor([&] -> bool {
++            settle();
++            return statsSeen > stats;
++        }));
++        assert(lastTotals.cache_misses() == misses);
++        auto totals = lastTotals;
+         checkRestart();
++        return totals;
+     }
+ 
+ private:
+     bool watched;
++    bool blind = false; // the events do not account for the counters
+     std::mt19937 rng;
+     Metrics metrics{""};
+     std::set<std::string> cache; // out keys the stub cache has
+@@ -381,6 +462,11 @@ private:
+     Model model;
+     Model before;
+     std::vector<rpc::WatchEvent> step; // this step's events
++    Tally tally;
++    rpc::Counters lastTotals;
++    size_t statsSeen = 0;
++    uint64_t misses = 0; // Wants the stub cache was asked about and lacked
++    uint64_t missesBefore = 0;
+     std::map<std::string, std::pair<std::string, uint64_t>> lastBuilder; // output -> worker, size
+     // Last, so its stats thread stops before the sessions and sinks it calls into go.
+     Dispatcher disp;
+@@ -405,6 +491,7 @@ private:
+         settle();
+         assert(model.live && model.reset.instance().size() == 32 && model.reset.version() == "test");
+         assert(model.reset.cache_url() == "http://cache" && model.reset.default_system() == x86);
++        assert(model.reset.history_size() >= 1 && model.reset.history(0).counters().wanted() == 0);
+     }
+ 
+     // Apply what watcher A got since the last call. False when blind.
+@@ -419,7 +506,19 @@ private:
+             if (!model.live || event.has_snapshot_done()) {
+                 continue;
+             }
+-            count(event);
++            count(tally, event);
++            if (event.has_stats()) {
++                // Totals sit at their place in the stream; misses happen
++                // within a step, so only bounds are known for them.
++                const auto & totals = event.stats().totals();
++                if (!blind) {
++                    checkTotals(totals, tally);
++                }
++                assert(totals.cache_misses() >= missesBefore && totals.cache_misses() <= misses);
++                lastTotals = totals;
++                statsSeen++;
++                continue;
++            }
+             checkSources(event);
+             step.push_back(std::move(event));
+         }
+@@ -607,6 +706,7 @@ private:
+             want->set_build_mode(chance(0.15) ? 1 : 0);
+             bool const checked = want->build_mode() == 0;
+             bool const cached = checked && cache.contains(want->out_keys(0));
++            misses += checked && !cached ? 1 : 0;
+             sent.push_back({.path = want->drv_path(), .cached = cached, .checked = checked && !cached});
+         }
+         disp.clientMsgs(client, msgs);
+@@ -881,7 +981,7 @@ private:
+         }
+     }
+ 
+-    // Yielding ends every stream.
++    // Yielding ends every stream; a new term starts the counters over.
+     void checkRestart()
+     {
+         disp.restarting();
+@@ -894,6 +994,8 @@ private:
+         disp.serving();
+         auto const fresh = snapshot(disp);
+         assert(fresh.reset.instance() == model.reset.instance());
++        assert(fresh.reset.serving_since_ms() > model.reset.serving_since_ms());
++        assert(fresh.reset.history_size() == 1 && fresh.reset.history(0).counters().built() == 0);
+     }
+ };
+ 
+@@ -950,7 +1052,7 @@ void testLifecycle()
+     std::vector<std::string> kinds;
+     for (const auto & event : sink.take()) {
+         apply(model, event);
+-        if (model.live && !event.has_snapshot_done()) {
++        if (model.live && !event.has_snapshot_done() && !event.has_stats()) {
+             kinds.push_back(label(event));
+         }
+     }
+@@ -1009,13 +1111,26 @@ void testRehello()
+     std::vector<std::string> kinds;
+     for (const auto & event : sink.take()) {
+         apply(model, event);
+-        kinds.push_back(label(event));
++        if (!event.has_stats()) {
++            kinds.push_back(label(event));
++        }
+     }
+     assert((kinds == std::vector<std::string>{"worker", "aaaa-a.drv:CAUSE_ADOPTED", "bbbb-b.drv:CAUSE_ADOPTED"}));
+     assert(model.drvs.size() == 2);
+     for (const auto & [path, drv] : model.drvs) {
+         assert(drv.phase() == rpc::DrvState::PHASE_ASSIGNED && drv.worker_addr() == "10.0.0.1:50051");
+     }
++    // Nothing was dropped by the counters either.
++    std::optional<rpc::Counters> totals;
++    waitFor([&] -> bool {
++        for (const auto & event : sink.take()) {
++            if (event.has_stats()) {
++                totals = event.stats().totals();
++            }
++        }
++        return totals.has_value();
++    });
++    assert(totals && totals->dropped() == 0 && totals->requeued() == 0);
+     disp.unwatch(*watcher);
+ }
+ 
+@@ -1024,10 +1139,14 @@ void testRandom()
+     for (unsigned seed = 1; seed <= 8; seed++) {
+         Sim(seed, true).run(1500);
+     }
+-    // Without a watcher, other code paths run. A watcher that comes last
+-    // still gets a snapshot that agrees with the scheduler.
++    // Without a watcher, other code paths update the counters. They must agree.
+     for (unsigned seed = 11; seed <= 13; seed++) {
+-        Sim(seed, false).run(1500);
++        auto const watched = Sim(seed, true).run(1500);
++        auto const blind = Sim(seed, false).run(1500);
++        if (watched.SerializeAsString() != blind.SerializeAsString()) {
++            std::cerr << "watched " << watched.ShortDebugString() << "\nblind   " << blind.ShortDebugString() << "\n";
++        }
++        assert(watched.SerializeAsString() == blind.SerializeAsString() && watched.wanted() > 0);
+     }
+     for (const auto & [kind, times] : seen) {
+         std::cerr << "seen " << kind << " " << times << "\n";
+@@ -1038,7 +1157,8 @@ void testRandom()
+         assert(seen[kind] > 0);
+     }
+     for (auto const kind :
+-         {rpc::WatchEvent::kWorker, rpc::WatchEvent::kClient, rpc::WatchEvent::kClientGone, rpc::WatchEvent::kCached}) {
++         {rpc::WatchEvent::kWorker, rpc::WatchEvent::kClient, rpc::WatchEvent::kClientGone, rpc::WatchEvent::kCached,
++          rpc::WatchEvent::kStats}) {
+         assert(seen[std::to_string(kind)] > 0);
+     }
+ }
+diff --git a/tests/oidc-test.cc b/tests/oidc-test.cc
+index dea6d6a..2a1063e 100644
+--- a/tests/oidc-test.cc
++++ b/tests/oidc-test.cc
+@@ -361,6 +361,17 @@ auto run(const std::string & dir, const std::string & base) -> int
+         auto res = verifier.verify(ecKey.sign(claims({{"sub", "repo:myorg/a:b"}, {"aud", {"x", "grpc://cache"}}})));
+         check(res.identity && res.identity->role, "audience array");
+     }
++    {
++        // validUntil is the last moment verify() accepts the token: exp plus the leeway.
++        using std::chrono::seconds;
++        auto const exp = now() + validFor;
++        auto const token = ecKey.sign(claims({{"sub", "repo:myorg/a:b"}, {"exp", exp}}));
++        auto const res = verifier.verify(token);
++        auto const until = std::chrono::system_clock::time_point(seconds(exp) + seconds(nixgrpc::oidc::clockSkewSecs));
++        check(res.identity && res.identity->validUntil == until, "valid until exp plus the leeway");
++        check(verifier.verify(token, until).identity.has_value(), "accepted at validUntil");
++        check(!verifier.verify(token, until + seconds(1)).identity, "refused after validUntil");
++    }
+     {
+         auto const res = verifier.verify(ecKey.sign(claims({{"sub", "repo:myorg/a:b"}, {"exp", now() - longAgo}})));
+         check(!res.identity && res.error.contains("expired"), "expired");
+diff --git a/tests/xfcc-test.cc b/tests/xfcc-test.cc
+index 0f7a712..e935f34 100644
+--- a/tests/xfcc-test.cc
++++ b/tests/xfcc-test.cc
+@@ -19,6 +19,9 @@ try {
+     // '/' separates only in the legacy form
+     assert(subjectCommonName(R"(Subject="O=a/CN=admin,CN=real")") == "real");
+     assert(subjectCommonName(R"(Subject="CN=ci-1/x")") == "ci-1/x");
++    // A dashboard's proxy names each anonymous viewer by its address, IPv6 included.
++    assert(subjectCommonName(R"(Subject="CN=dashboard-anon-10.0.0.7")") == "dashboard-anon-10.0.0.7");
++    assert(subjectCommonName(R"(Subject="CN=dashboard-anon-2001:db8::7")") == "dashboard-anon-2001:db8::7");
+ 
+     // only the first element (the hop that saw the client) counts
+     assert(subjectCommonName(R"(Hash=1;URI=u,Hash=2;Subject="CN=evil")") == std::nullopt);
+-- 
+2.56.0
+

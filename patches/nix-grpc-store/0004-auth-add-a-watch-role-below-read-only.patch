@@ -1,0 +1,230 @@
+From 0b9593f45346f1ec387eb8f62e0842f827a8c7e6 Mon Sep 17 00:00:00 2001
+From: Ilan Joselevich <personal@ilanjoselevich.com>
+Date: Tue, 10 Nov 2026 19:16:44 +0100
+Subject: [PATCH 04/12] auth: add a watch role below read-only
+
+A dashboard, or anything else that follows the scheduler's events,
+needs no NAR downloads or path queries, which read-only allows. watch
+sits below read-only. Every existing RPC needs read-only or higher, so a
+caller with only watch can do nothing else, and every higher role can
+watch.
+
+OIDC rules gain the scope "watch". A rule's role now starts from watch,
+so [watch] stays at watch and [watch, read] gives read-only. niks3 does
+not know the scope, so a provider block that uses it cannot be shared
+with niks3.
+
+The daemon refuses --allow-anonymous watch at startup, since the event
+stream never serves anonymous callers. The error says how to let a
+network watch without signing in: a --trusted-proxy names its callers,
+and an --allow rule gives that name the watch role.
+---
+ nixos/common.nix   | 11 +++++++----
+ src/daemon/acl.hh  | 14 +++++++++++---
+ src/daemon/oidc.hh | 13 +++++++++----
+ tests/acl-test.cc  | 14 ++++++++++++++
+ tests/oidc-test.cc | 13 ++++++++++++-
+ 5 files changed, 53 insertions(+), 12 deletions(-)
+
+diff --git a/nixos/common.nix b/nixos/common.nix
+index a65a88c..3a2e669 100644
+--- a/nixos/common.nix
++++ b/nixos/common.nix
+@@ -122,11 +122,13 @@ in
+             };
+             role = lib.mkOption {
+               type = lib.types.enum [
++                "watch"
+                 "read-only"
+                 "write"
+                 "trusted"
+               ];
+               description = ''
++                `watch` allows only the scheduler's event stream.
+                 `read-only` allows path queries and NAR downloads.
+                 `write` additionally allows signed imports (signature
+                 checking is enforced) and server-side builds. `trusted`
+@@ -213,10 +215,11 @@ in
+       description = ''
+         Accept OIDC bearer tokens (`authorization: Bearer …`) besides client
+         certificates. Same schema as niks3's `--oidc-config`, so one attrset
+-        can serve both. Scopes map to roles: `read` → read-only, `write` →
+-        write, `admin` → trusted. Providers may share an issuer if their
+-        audiences differ. A client certificate, when presented,
+-        takes precedence. Clients set `token-file` or `$NIX_GRPC_TOKEN_FILE`.
++        can serve both. Scopes map to roles: `watch` → watch (daemon only,
++        niks3 refuses it), `read` → read-only, `write` → write, `admin` →
++        trusted. Providers may share an issuer if their audiences differ. A
++        client certificate, when presented, takes precedence. Clients set
++        `token-file` or `$NIX_GRPC_TOKEN_FILE`.
+       '';
+     };
+ 
+diff --git a/src/daemon/acl.hh b/src/daemon/acl.hh
+index 0293b52..d8544d3 100644
+--- a/src/daemon/acl.hh
++++ b/src/daemon/acl.hh
+@@ -21,13 +21,14 @@ namespace nixgrpc {
+ // Capabilities are strictly nested, so the order is significant: an RPC is
+ // allowed iff the client's role >= the RPC's minimum role.
+ enum class Role : std::uint8_t {
++    watch,    // the scheduler's event stream (Events.Watch) only
+     readOnly, // path queries and NAR downloads
+     write,    // + signed imports and builds
+     trusted,  // + worker-protocol tunnel and unsigned imports
+ };
+ 
+-constexpr std::array<std::pair<std::string_view, Role>, 3> roleNames{
+-    {{"read-only", Role::readOnly}, {"write", Role::write}, {"trusted", Role::trusted}}};
++constexpr std::array<std::pair<std::string_view, Role>, 4> roleNames{
++    {{"watch", Role::watch}, {"read-only", Role::readOnly}, {"write", Role::write}, {"trusted", Role::trusted}}};
+ 
+ inline auto roleName(Role role) -> std::string_view
+ {
+@@ -46,7 +47,7 @@ inline auto parseRole(std::string_view name) -> Role
+             return role;
+         }
+     }
+-    throw nix::Error("unknown role '%s' (expected read-only, write or trusted)", std::string(name));
++    throw nix::Error("unknown role '%s' (expected watch, read-only, write or trusted)", std::string(name));
+ }
+ 
+ class Acl
+@@ -86,6 +87,13 @@ public:
+ 
+     void allowAnonymous(Role role)
+     {
++        // Only Events.Watch allows watch, and it never serves anonymous callers.
++        if (role == Role::watch) {
++            throw nix::Error(
++                "--allow-anonymous watch grants nothing: anonymous callers can never watch. To let a network "
++                "watch without signing in, have a --trusted-proxy name its callers and give that name the "
++                "watch role with --allow");
++        }
+         anonRole = role;
+     }
+ 
+diff --git a/src/daemon/oidc.hh b/src/daemon/oidc.hh
+index 551998f..792821c 100644
+--- a/src/daemon/oidc.hh
++++ b/src/daemon/oidc.hh
+@@ -38,7 +38,9 @@ using Json = nlohmann::json;
+ struct Rule
+ {
+     std::map<std::string, std::vector<std::string>> boundClaims; // bound_subject lands under "sub"
+-    Role role = Role::readOnly;
++    // The lowest role. ruleFrom raises it to the highest scope, so a rule
++    // with only `watch` stays at watch.
++    Role role = Role::watch;
+ };
+ 
+ struct Provider
+@@ -79,9 +81,13 @@ inline auto parseToken(const std::string & token) -> std::optional<Decoded>
+     }
+ }
+ 
+-// niks3 scopes. The highest one a rule grants becomes the role.
++// niks3 scopes, plus `watch` for the event stream. The highest one a rule
++// grants becomes the role.
+ inline auto scopeRole(std::string_view scope) -> Role
+ {
++    if (scope == "watch") {
++        return Role::watch;
++    }
+     if (scope == "read") {
+         return Role::readOnly;
+     }
+@@ -91,7 +97,7 @@ inline auto scopeRole(std::string_view scope) -> Role
+     if (scope == "admin") {
+         return Role::trusted;
+     }
+-    throw nix::Error("unknown OIDC scope '%s' (want read, write or admin)", std::string(scope));
++    throw nix::Error("unknown OIDC scope '%s' (want watch, read, write or admin)", std::string(scope));
+ }
+ 
+ // Without scopes a rule grants write, as in niks3.
+@@ -105,7 +111,6 @@ inline auto ruleFrom(const Json & json) -> Rule
+     if (scopes.empty()) {
+         throw nix::Error("OIDC rule: scopes must not be empty");
+     }
+-    rule.role = Role::readOnly;
+     for (const auto & scope : scopes) {
+         rule.role = std::max(rule.role, scopeRole(scope));
+     }
+diff --git a/tests/acl-test.cc b/tests/acl-test.cc
+index 7144fa2..7e1bc4a 100644
+--- a/tests/acl-test.cc
++++ b/tests/acl-test.cc
+@@ -7,6 +7,8 @@
+ #include <optional>
+ #include <string>
+ 
++#include <nix/util/error.hh>
++
+ #include "acl.hh"
+ 
+ namespace {
+@@ -63,10 +65,22 @@ void run()
+     {.cfg = {.authenticates = true, .rule = "ci-*=trusted"}, .cn = "ci-1", .role = Role::trusted},
+     {.cfg = {.authenticates = true, .rule = "ci-*=trusted"}, .cn = "dev", .role = std::nullopt},
+     {.cfg = {.authenticates = true, .rule = "*=read-only"}, .cn = std::nullopt, .role = std::nullopt},
++    {.cfg = {.authenticates = true, .rule = "dash-*=watch"}, .cn = "dash-1", .role = Role::watch},
+     });
+     for (const auto & row : rows) {
+         assert(acl(row.cfg).roleFor(row.cn) == row.role);
+     }
++    // watch is below read-only, so every existing RPC refuses it.
++    assert(nixgrpc::parseRole("watch") == Role::watch && nixgrpc::roleName(Role::watch) == "watch");
++    assert(Role::watch < Role::readOnly);
++    // Anonymous callers can never watch, so that role would grant nothing.
++    bool refused = false;
++    try {
++        Acl().allowAnonymous(Role::watch);
++    } catch (nix::Error &) {
++        refused = true;
++    }
++    assert(refused);
+ }
+ 
+ } // namespace
+diff --git a/tests/oidc-test.cc b/tests/oidc-test.cc
+index 2dd4101..dea6d6a 100644
+--- a/tests/oidc-test.cc
++++ b/tests/oidc-test.cc
+@@ -231,7 +231,8 @@ auto writeConfig(const std::string & dir, const std::string & base) -> void
+                  {{{"bound_subject", {"repo:myorg/*"}}, {"scopes", {"write"}}},
+                   {{"bound_claims", {{"repository_owner", {"myorg"}}, {"ref", {"refs/heads/main"}}}},
+                    {"scopes", {"admin"}}},
+-                  {{"bound_claims", {{"groups", {"readers"}}}}, {"scopes", {"read"}}}}}}},
++                  {{"bound_claims", {{"groups", {"readers"}}}}, {"scopes", {"read"}}},
++                  {{"bound_claims", {{"groups", {"watchers"}}}}, {"scopes", {"watch"}}}}}}},
+               // The same issuer, for clients that ask for another audience.
+               {"mirror",
+                {{"issuer", base},
+@@ -259,6 +260,10 @@ auto run(const std::string & dir, const std::string & base) -> int
+     nix::writeFile(dir + "/sa-token", ecKey.sign({{"iss", "https://kubernetes.default.svc"}, {"sub", "x"}}));
+     writeConfig(dir, base);
+ 
++    // A rule's role is the highest of its scopes, starting from watch.
++    check(nixgrpc::oidc::ruleFrom(Json{{"scopes", {"watch"}}}).role == Role::watch, "scopes [watch] -> watch");
++    check(nixgrpc::oidc::ruleFrom(Json{{"scopes", {"watch", "read"}}}).role == Role::readOnly, "[watch, read] -> read-only");
++
+     // Issuer serves nothing yet: config loads, verifier constructs, tokens are refused.
+     auto const cfg = loadConfig(dir + "/oidc.json");
+     check(cfg.providers.size() == 3, "three providers, two of one issuer");
+@@ -325,6 +330,12 @@ auto run(const std::string & dir, const std::string & base) -> int
+         auto res = verifier.verify(pssKey.sign(claims({{"sub", "someone"}, {"groups", {"other", "readers"}}})));
+         check(res.identity && res.identity->role == Role::readOnly, "PS256 array claim -> read-only");
+     }
++    {
++        auto res = verifier.verify(ecKey.sign(claims({{"sub", "someone"}, {"groups", {"watchers"}}})));
++        check(res.identity && res.identity->role == Role::watch, "watch scope -> watch");
++        res = verifier.verify(ecKey.sign(claims({{"sub", "someone"}, {"groups", {"watchers", "readers"}}})));
++        check(res.identity && res.identity->role == Role::readOnly, "watch and read rules -> read-only");
++    }
+     {
+         auto res = verifier.verify(edKey.sign(good));
+         check(res.identity && res.identity->role == Role::write, "EdDSA");
+-- 
+2.56.0
+

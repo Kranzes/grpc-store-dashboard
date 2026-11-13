@@ -1,0 +1,4815 @@
+From 2004da5e742863fc462205ff90f346b62d1ddd70 Mon Sep 17 00:00:00 2001
+From: Ilan Joselevich <personal@ilanjoselevich.com>
+Date: Tue, 10 Nov 2026 19:27:05 +0100
+Subject: [PATCH 09/12] daemon: follow running builds' logs and resume
+ GetBuildLog at an offset
+
+GetBuildLog answered only with the file Nix kept after a build, from its
+first byte. A dashboard needs the log of a build while it runs, a way to
+resume a call that broke, the end of a large log without its middle,
+and a way to tell one build's log from a retry's.
+
+The request gains offset, follow, assign_id, limit and tail, and the
+answer an info message first and an ended flag last. A node answers
+from the build's spill while it runs here (LIVE), else from Nix's kept
+file (KEPT), else NOT_FOUND. LIVE renders the spill as Nix keeps the
+log, so a line number taken while a build runs is the same line after
+it ends. The daemon's own messages become notes, which BuildDerivation
+clients still see but the build log leaves out. The spill keeps an
+index entry per 64 KiB, so a reader starts near any offset.
+
+A follow call waits on the build's condition variable and sends what
+arrived about ten times a second, with an empty message every 30 s on a
+quiet build. It ends with ended when the build finishes, is revoked or
+given back, and with UNAUTHENTICATED when a bearer token expires.
+
+With assign_id set, LIVE answers only for that assignment, and the node
+skips KEPT once another build of the derivation started here, since Nix
+truncated that file. The answer is then NOT_FOUND with the newer build
+in x-nix-rebuilding. Every answer carries x-nix-node, so a caller
+behind the balancer can tell who answered.
+
+The node decodes a .bz2 kept log once into an unlinked temp file that
+every call for it reads (log-cache.hh), at most 8 logs and 2 GiB. A
+node serves 32 calls at once, 8 per caller, and decodes 2 logs at once.
+GetBuildLog moves to build-log-service, and the log store's uploader
+reads kept logs through its readKeptLog.
+
+The call needs only the watch role, because build logs are for anyone
+who can watch the farm. New metrics count calls by source and code,
+bytes, and open follow calls. nix_grpc_rpcs_total counts a caller
+that an access rule lets only watch under the rule's pattern, such as
+cn="dashboard-*", so viewers that a proxy names one by one add no series
+each. Every other caller keeps its own name.
+---
+ deploy/helm/nix-grpc-farm/values.yaml |   5 +-
+ meson.build                           |  27 +-
+ nix/packages/nix-grpc-store.nix       |   4 +-
+ nixos/common.nix                      |   2 +-
+ proto/nix_remote.proto                |  82 ++-
+ src/build-log.hh                      |  10 +-
+ src/daemon/acl.hh                     |  49 +-
+ src/daemon/auth.cc                    |   3 +-
+ src/daemon/auth.hh                    |   3 +
+ src/daemon/build-log-service.cc       | 774 ++++++++++++++++++++++++++
+ src/daemon/build-log-service.hh       | 114 ++++
+ src/daemon/builder.cc                 |  91 ++-
+ src/daemon/builder.hh                 |  23 +
+ src/daemon/log-cache.hh               | 607 ++++++++++++++++++++
+ src/daemon/log-spill.hh               | 284 ++++++++--
+ src/daemon/main.cc                    | 215 ++-----
+ src/daemon/metrics.hh                 |  36 ++
+ tests/acl-test.cc                     |  24 +-
+ tests/build-log-test.cc               |  25 +
+ tests/builder-log-test.cc             | 235 ++++++++
+ tests/e2e/transfer.rs                 | 445 ++++++++++++++-
+ tests/farm.nix                        | 136 +++++
+ tests/lib/build-log.nix               |   9 +
+ tests/lib/build-log.py                | 248 +++++++++
+ tests/log-cache-test.cc               | 333 +++++++++++
+ tests/log-spill-test.cc               | 192 +++++++
+ tests/nixos-test.nix                  |   8 +-
+ 27 files changed, 3684 insertions(+), 300 deletions(-)
+ create mode 100644 src/daemon/build-log-service.cc
+ create mode 100644 src/daemon/build-log-service.hh
+ create mode 100644 src/daemon/log-cache.hh
+ create mode 100644 tests/builder-log-test.cc
+ create mode 100644 tests/lib/build-log.nix
+ create mode 100644 tests/lib/build-log.py
+ create mode 100644 tests/log-cache-test.cc
+
+diff --git a/deploy/helm/nix-grpc-farm/values.yaml b/deploy/helm/nix-grpc-farm/values.yaml
+index dd8979b..952634e 100644
+--- a/deploy/helm/nix-grpc-farm/values.yaml
++++ b/deploy/helm/nix-grpc-farm/values.yaml
+@@ -109,7 +109,10 @@ workerDefaults:
+   store:
+     sizeLimit: null # emptyDir sizeLimit for /nix
+   spool:
+-    sizeLimit: null # emptyDir sizeLimit for uploads waiting to be imported
++    # emptyDir sizeLimit for the daemon's TMPDIR: uploads waiting to be
++    # imported, running builds' logs, and up to 2 GiB of decoded build logs
++    # that viewers read. Going over it evicts the pod.
++    sizeLimit: null
+   buildDir:
+     medium: "" # "Memory" for tmpfs builds
+     sizeLimit: null
+diff --git a/meson.build b/meson.build
+index c659bf5..792d9eb 100644
+--- a/meson.build
++++ b/meson.build
+@@ -219,6 +219,7 @@ if build_server
+     'src/daemon/elector.cc',
+     'src/daemon/auth.cc',
+     'src/daemon/backend.cc',
++    'src/daemon/build-log-service.cc',
+     'src/daemon/coordinator.cc',
+     'src/daemon/eds.cc',
+     'src/daemon/events.cc',
+@@ -369,10 +370,10 @@ if build_server
+   ))
+ 
+   test('build-log', executable('build-log-test',
+-    sources : ['tests/build-log-test.cc'],
+-    include_directories : [src_inc],
++    sources : ['tests/build-log-test.cc', gen[0], gen[1]],
++    include_directories : [gen_inc, src_inc, include_directories('src/daemon')],
+     cpp_args : nix_compat_args + ['-UNDEBUG'],
+-    dependencies : [nix_util_dep, nix_store_dep],
++    dependencies : [nix_util_dep, nix_store_dep, protobuf_dep],
+   ))
+ 
+   test('xfcc', executable('xfcc-test',
+@@ -403,6 +404,13 @@ if build_server
+     cpp_args : ['-UNDEBUG'],
+   ))
+ 
++  test('log-cache', executable('log-cache-test',
++    sources : ['tests/log-cache-test.cc'],
++    include_directories : [src_inc, include_directories('src/daemon')],
++    dependencies : [threads_dep],
++    cpp_args : ['-UNDEBUG'],
++  ))
++
+   test('log-uploader', executable('log-uploader-test',
+     sources : ['tests/log-uploader-test.cc'],
+     include_directories : [src_inc, include_directories('src/daemon')],
+@@ -410,6 +418,19 @@ if build_server
+     cpp_args : ['-UNDEBUG'],
+   ))
+ 
++  # The builder's Expect table as the build log service sees it.
++  test('builder-log', executable('builder-log-test',
++    sources : [
++      'tests/builder-log-test.cc', 'src/daemon/coordinator.cc', 'src/daemon/eds.cc', 'src/daemon/events.cc',
++      'src/daemon/elector.cc', 'src/daemon/auth.cc', 'src/daemon/options.cc', 'src/client/channel.cc',
++      'src/daemon/build-log-service.cc',
++      gen, eds_gen, events_gen,
++    ],
++    include_directories : [gen_inc, src_inc],
++    cpp_args : nix_compat_args + ['-UNDEBUG', '-DNIX_GRPC_VERSION="' + meson.project_version() + '"'],
++    dependencies : common_deps + prometheus_dep + [dispatcher_dep, nix_util_dep, nix_store_dep, curl_dep, json_dep, openssl_dep, bz2_dep],
++  ), timeout : 60)
++
+   test('upload-spool', executable('upload-spool-test',
+     sources : ['tests/upload-spool-test.cc'],
+     include_directories : [src_inc, include_directories('src/daemon')],
+diff --git a/nix/packages/nix-grpc-store.nix b/nix/packages/nix-grpc-store.nix
+index ffc9864..3f29a5c 100644
+--- a/nix/packages/nix-grpc-store.nix
++++ b/nix/packages/nix-grpc-store.nix
+@@ -73,9 +73,11 @@ stdenv.mkDerivation {
+         ../../tests/sandbox-test.cc
+         ../../tests/log-spill-test.cc
+         ../../tests/daemon-probe-test.cc
++        ../../tests/log-cache-test.cc
++        ../../tests/log-uploader-test.cc
+         ../../tests/builder-test.cc
+         ../../tests/local-store-test.cc
+-        ../../tests/log-uploader-test.cc
++        ../../tests/builder-log-test.cc
+         ../../tests/plugin-loader-test.cc
+         ../../tests/upload-claims-test.cc
+         ../../tests/top-down-test.cc
+diff --git a/nixos/common.nix b/nixos/common.nix
+index 3a2e669..694a3a2 100644
+--- a/nixos/common.nix
++++ b/nixos/common.nix
+@@ -128,7 +128,7 @@ in
+                 "trusted"
+               ];
+               description = ''
+-                `watch` allows only the scheduler's event stream.
++                `watch` allows only the scheduler's event stream and build logs.
+                 `read-only` allows path queries and NAR downloads.
+                 `write` additionally allows signed imports (signature
+                 checking is enforced) and server-side builds. `trusted`
+diff --git a/proto/nix_remote.proto b/proto/nix_remote.proto
+index fe16149..060d346 100644
+--- a/proto/nix_remote.proto
++++ b/proto/nix_remote.proto
+@@ -119,16 +119,86 @@ message NarFrame {
+   bool eof = 3;
+ }
+ 
+-// Build log of a derivation built on the server. `drv_path` is a store path
+-// base name. Errors: NOT_FOUND (no log), UNIMPLEMENTED (the store keeps no
+-// logs), DATA_LOSS (a corrupt .bz2 log).
++// The build log of a derivation on this node: while it builds here, as it
++// builds; afterwards, as `nix log` reads it here. `drv_path` is a store path
++// base name. In a farm only the builder that built a derivation holds its log:
++// name it with x-nix-worker, and one of its systems with x-nix-system, as for
++// BuildDerivation. A node without the log may answer from the farm's log store
++// or binary cache (BuildLogInfo.source).
++//
++// INVALID_ARGUMENT: a bad path, or tail or limit with follow. NOT_FOUND: no
++// log of it here or in a store this node reads. UNIMPLEMENTED: this node keeps
++// no logs. DATA_LOSS: a .bz2 log does not decompress. OUT_OF_RANGE: offset
++// past the end of a finished log. RESOURCE_EXHAUSTED: too many log calls on
++// this node or from this caller, or no decode slot within 10 s.
++// UNAUTHENTICATED "bearer token expired": a follow call outlived its bearer
++// token by a minute, as Events.Watch does.
++//
++// Every response, errors included, carries this node's --advertise address
++// as x-nix-node in its initial metadata (when it sends any) and its trailing
++// metadata. A NOT_FOUND while another build of the derivation runs here also
++// carries that build's assignment as x-nix-rebuilding.
+ message GetBuildLogRequest {
+   string drv_path = 1;
+-}
+-
+-// The `data` fields of all chunks together form one zstd stream.
++  // Start at this byte of the decoded log. Equal to the end: nothing, or with
++  // follow on a running build, wait for more.
++  uint64 offset = 2;
++  // While the derivation builds here, keep sending as the log grows, until
++  // the build ends. Also waits for a build assigned here that has not started.
++  // Without a running build here it is ignored.
++  bool follow = 3;
++  // The assignment whose log the caller wants (DrvState.assign_id). 0: any.
++  // When set, LIVE answers only for that assignment, and KEPT is skipped
++  // once another assignment of the derivation has started here, since Nix
++  // truncates the kept file when a build starts. Before that start, a call
++  // for any log that does not follow gets KEPT.
++  uint64 assign_id = 4;
++  // Send at most this many decoded bytes. 0: to the end.
++  uint64 limit = 5;
++  // Finished logs only: start at the first line that begins at or after
++  // max(offset, size - tail) instead of at offset. 0: start at offset.
++  uint64 tail = 6;
++}
++
++// The concatenation of all `data` fields in one call is a single zstd stream
++// of the log from `info.offset`. In a follow call the server flushes the
++// stream at the end of every message, so all data sent up to then decodes.
+ message GetBuildLogChunk {
+   bytes data = 1;
++  // First message only, from servers that know these fields. It may carry no
++  // data. A server that sends no info ignored every field but drv_path.
++  BuildLogInfo info = 2;
++  // Last message of a follow call: the build ended, or left this node.
++  bool ended = 3;
++}
++
++message BuildLogInfo {
++  enum Source {
++    SOURCE_UNSPECIFIED = 0;
++    SOURCE_LIVE = 1;   // the build runs here; the log up to now
++    SOURCE_KEPT = 2;   // the file this node's nix-daemon kept
++    SOURCE_STORE = 3;  // the farm's log store (--build-log-store)
++    SOURCE_CACHE = 4;  // the farm's binary cache (--niks3-cache-url)
++  }
++  Source source = 1;
++  // Decoded size in bytes: up to now for LIVE; the whole log otherwise, once
++  // this node knows it. 0 when unknown (a .bz2, STORE or CACHE log not yet
++  // in the decode cache).
++  uint64 size = 2;
++  // The byte of the decoded log this call starts at: offset, or the line
++  // start that tail picked.
++  uint64 offset = 3;
++  // The number of newlines before `offset`, so the first line sent is line
++  // first_line + 1. Always exact.
++  uint64 first_line = 4;
++  // LIVE: the assignment running here. KEPT: the assignment whose build
++  // wrote this file, if it ran after this daemon started; 0 when unknown.
++  uint64 assign_id = 5;
++  // LIVE: when the build started here (0: not yet).
++  uint64 started_ms = 6;
++  // KEPT: the file's mtime; CACHE: Last-Modified. 0 when unknown. A later
++  // build of the same derivation replaces the log on the node and in stores.
++  uint64 modified_ms = 7;
+ }
+ 
+ // Bidirectional tunnel that carries the same byte stream `nix-daemon --stdio`
+diff --git a/src/build-log.hh b/src/build-log.hh
+index 2211be9..7b00dd5 100644
+--- a/src/build-log.hh
++++ b/src/build-log.hh
+@@ -99,21 +99,23 @@ inline auto readLogFields(nix::Source & source) -> std::vector<ActivityField>
+ 
+ struct BuildEvent
+ {
+-    enum class Kind : std::uint8_t { line, phase } kind = Kind::line;
++    // A note is the daemon's own message (STDERR_NEXT), not build output.
++    // BuildDerivation sends it like a line; the build log leaves it out.
++    enum class Kind : std::uint8_t { line, phase, note } kind = Kind::line;
+     std::string text;
+ };
+ 
+ using BuildEventSink = std::function<void(BuildEvent)>;
+ 
+-// Consumes the stream up to STDERR_LAST, forwarding build log lines and phase
+-// changes, and activity frames to `activity` when set. Throws BackendError on
++// Consumes the stream up to STDERR_LAST. Build log lines, phase changes and
++// notes go to `send`, activity frames to `activity` when set. Throws BackendError on
+ // STDERR_ERROR.
+ inline void relayBuildLog(nix::Source & source, const BuildEventSink & send, const ActivitySink & activity = {})
+ {
+     while (true) {
+         auto msg = nix::readNum<uint64_t>(source);
+         if (msg == STDERR_NEXT) {
+-            send({.text = nix::chomp(detail::readLogString(source))});
++            send({.kind = BuildEvent::Kind::note, .text = nix::chomp(detail::readLogString(source))});
+         } else if (msg == STDERR_START_ACTIVITY) {
+             ActivityEvent event{.kind = ActivityEvent::Kind::start};
+             event.id = nix::readNum<uint64_t>(source);
+diff --git a/src/daemon/acl.hh b/src/daemon/acl.hh
+index d8544d3..ee8afc8 100644
+--- a/src/daemon/acl.hh
++++ b/src/daemon/acl.hh
+@@ -21,7 +21,7 @@ namespace nixgrpc {
+ // Capabilities are strictly nested, so the order is significant: an RPC is
+ // allowed iff the client's role >= the RPC's minimum role.
+ enum class Role : std::uint8_t {
+-    watch,    // the scheduler's event stream (Events.Watch) only
++    watch,    // the scheduler's events (Events.Watch) and build logs (GetBuildLog)
+     readOnly, // path queries and NAR downloads
+     write,    // + signed imports and builds
+     trusted,  // + worker-protocol tunnel and unsigned imports
+@@ -70,6 +70,21 @@ class Acl
+         return clientsTrusted ? role : std::min(role, Role::write);
+     }
+ 
++    // The first rule that matches commonName. fnmatch truncates at NUL; a CN
++    // like "ci-1\0evil" must not match "ci-*".
++    [[nodiscard]] auto match(const std::string & commonName) const -> const Rule *
++    {
++        if (commonName.contains('\0')) {
++            return nullptr;
++        }
++        for (const auto & rule : rules) {
++            if (fnmatch(rule.pattern.c_str(), commonName.c_str(), 0) == 0) {
++                return &rule;
++            }
++        }
++        return nullptr;
++    }
++
+ public:
+     [[nodiscard]] auto active() const -> bool
+     {
+@@ -87,12 +102,13 @@ public:
+ 
+     void allowAnonymous(Role role)
+     {
+-        // Only Events.Watch allows watch, and it never serves anonymous callers.
++        // Events.Watch never serves anonymous callers, so watch would give
++        // them build logs only.
+         if (role == Role::watch) {
+             throw nix::Error(
+-                "--allow-anonymous watch grants nothing: anonymous callers can never watch. To let a network "
+-                "watch without signing in, have a --trusted-proxy name its callers and give that name the "
+-                "watch role with --allow");
++                "--allow-anonymous watch grants only build logs; use read-only to give anonymous callers logs, as "
++                "nix log needs. To let a network watch without signing in, have a --trusted-proxy name its "
++                "callers and give that name the watch role with --allow");
+         }
+         anonRole = role;
+     }
+@@ -127,17 +143,18 @@ public:
+         if (rules.empty()) {
+             return capped(Role::trusted);
+         }
+-        // fnmatch truncates at NUL; a CN like "ci-1\0evil" must not match
+-        // "ci-*".
+-        if (commonName->contains('\0')) {
+-            return std::nullopt;
+-        }
+-        for (const auto & rule : rules) {
+-            if (fnmatch(rule.pattern.c_str(), commonName->c_str(), 0) == 0) {
+-                return rule.role;
+-            }
+-        }
+-        return std::nullopt;
++        auto const * rule = match(*commonName);
++        return rule != nullptr ? std::optional(rule->role) : std::nullopt;
++    }
++
++    // The pattern of the rule that lets commonName watch and nothing more.
++    // nix_grpc_rpcs_total counts such callers under it, so a proxy that
++    // names its viewers one by one adds no series per viewer.
++    [[nodiscard]] auto watchPattern(const std::optional<std::string> & commonName) const
++        -> std::optional<std::string>
++    {
++        auto const * rule = commonName ? match(*commonName) : nullptr;
++        return rule != nullptr && rule->role == Role::watch ? std::optional(rule->pattern) : std::nullopt;
+     }
+ };
+ 
+diff --git a/src/daemon/auth.cc b/src/daemon/auth.cc
+index 045f382..1232355 100644
+--- a/src/daemon/auth.cc
++++ b/src/daemon/auth.cc
+@@ -35,7 +35,8 @@ auto Auth::identify(const grpc::ServerContextBase & context) const -> Caller
+         return {
+             .name = cert.value_or("-"),
+             .role = acl.roleFor(cert),
+-            .kind = cert ? Caller::Kind::named : Caller::Kind::anonymous};
++            .kind = cert ? Caller::Kind::named : Caller::Kind::anonymous,
++            .watchRule = acl.watchPattern(cert)};
+     }
+     auto res = (*oidc)->verify(*token);
+     if (!res.identity) {
+diff --git a/src/daemon/auth.hh b/src/daemon/auth.hh
+index 0f1740d..54fc409 100644
+--- a/src/daemon/auth.hh
++++ b/src/daemon/auth.hh
+@@ -27,6 +27,9 @@ struct Caller
+     Kind kind = Kind::anonymous;
+     // Until when a bearer token stays valid. nullopt for certificates.
+     std::optional<std::chrono::system_clock::time_point> validUntil = std::nullopt;
++    // The pattern of the access rule that lets this caller only watch, which
++    // metrics count it under. nullopt for bearer tokens.
++    std::optional<std::string> watchRule = std::nullopt;
+ };
+ 
+ struct Auth
+diff --git a/src/daemon/build-log-service.cc b/src/daemon/build-log-service.cc
+new file mode 100644
+index 0000000..d9bf6a0
+--- /dev/null
++++ b/src/daemon/build-log-service.cc
+@@ -0,0 +1,774 @@
++#include "build-log-service.hh"
++
++#include <algorithm>
++#include <array>
++#include <cerrno>
++#include <chrono>
++#include <cstddef>
++#include <cstdint>
++#include <expected>
++#include <filesystem>
++#include <functional>
++#include <limits>
++#include <memory>
++#include <mutex>
++#include <optional>
++#include <span>
++#include <string>
++#include <string_view>
++#include <system_error>
++#include <utility>
++#include <vector>
++
++#include <bzlib.h>
++#include <fcntl.h>
++#include <sys/stat.h>
++#include <sys/types.h>
++#include <unistd.h>
++
++#include <zstd.h>
++
++#include <grpcpp/server_context.h>
++#include <grpcpp/support/status.h>
++
++#include <nix/store/local-fs-store.hh>
++#include <nix/store/path.hh>
++#include <nix/util/error.hh>
++#include <nix/util/finally.hh>
++
++#include "auth.hh"
++#include "backend.hh"
++#include "builder.hh"
++#include "log-cache.hh"
++#include "log-spill.hh"
++#include "metrics.hh"
++#include "nix-compat.hh"
++#include "nix_remote.pb.h"
++#include "pump.hh"
++#include "push.hh"
++
++namespace nixgrpc {
++
++// Nix 2.36 moved Finally into namespace nix.
++#if NIX_COMPAT_AT_LEAST(2, 36)
++using nix::Finally;
++#endif
++
++using nix::remote::BuildLogInfo;
++using nix::remote::GetBuildLogChunk;
++
++namespace {
++
++constexpr size_t readSize = size_t{64} << 10U;
++constexpr uint64_t nsPerMs = 1'000'000;
++constexpr uint64_t nsPerSec = 1'000'000'000;
++
++// When the file last changed, in ns since the epoch.
++auto mtimeNs(const struct stat & info) -> uint64_t
++{
++#ifdef __APPLE__
++    const auto & time = info.st_mtimespec;
++#else
++    const auto & time = info.st_mtim;
++#endif
++    return (static_cast<uint64_t>(time.tv_sec) * nsPerSec) + static_cast<uint64_t>(time.tv_nsec);
++}
++
++// Gives `strm` more input once it used what it had. What read() returned,
++// or 1 when there was input left.
++auto refill(int file, std::string & input, bz_stream & strm) -> ssize_t
++{
++    if (strm.avail_in != 0) {
++        return 1;
++    }
++    auto const got = ::read(file, input.data(), input.size());
++    if (got > 0) {
++        strm.next_in = input.data();
++        strm.avail_in = static_cast<unsigned>(got);
++    }
++    return got;
++}
++
++// The start a tail asks for, before moving to a line start.
++auto tailStart(uint64_t offset, uint64_t size, uint64_t tail) -> uint64_t
++{
++    return std::max(offset, size > tail ? size - tail : 0);
++}
++
++// Reads `size` bytes of `file` from `from`, in pieces, into `out`. False
++// when a read fails.
++// NOLINTNEXTLINE(bugprone-easily-swappable-parameters): an offset, then a length, as pread.
++auto readRange(int file, uint64_t from, uint64_t size, const std::function<bool(std::string_view)> & out) -> bool
++{
++    std::vector<char> buf(readSize);
++    while (size > 0) {
++        auto const want = static_cast<size_t>(std::min<uint64_t>(buf.size(), size));
++        auto const count = preadUpTo(file, std::as_writable_bytes(std::span(buf).first(want)), from);
++        if (count == 0) {
++            return false;
++        }
++        if (!out({buf.data(), count})) {
++            return true;
++        }
++        from += count;
++        size -= count;
++    }
++    return true;
++}
++
++auto countNewlines(std::string_view data) -> uint64_t
++{
++    return static_cast<uint64_t>(std::ranges::count(data, '\n'));
++}
++
++auto clientGone() -> grpc::Status
++{
++    return {grpc::StatusCode::CANCELLED, "the client went away"};
++}
++
++auto pastTheEnd() -> grpc::Status
++{
++    return {grpc::StatusCode::OUT_OF_RANGE, "offset past the end of the log"};
++}
++
++auto tooManyReaders(const std::string & node) -> grpc::Status
++{
++    return {grpc::StatusCode::RESOURCE_EXHAUSTED, "too many build log readers on " + node};
++}
++
++// Where `nix log` looks for the log Nix kept of `drv` (a base name), in
++// order. Either may also be compressed, with .bz2 appended.
++auto keptLogPaths(const std::filesystem::path & logDir, const std::string & drv) -> std::array<std::filesystem::path, 2>
++{
++    auto const drvs = logDir / nix::LocalFSStore::drvsLogDir;
++    return {drvs / drv.substr(0, 2) / drv.substr(2), drvs / drv};
++}
++
++// Decompresses the bzip2 streams in `logFd`, one after another, into `out`,
++// 64 KiB at a time. As libarchive does for nix, it reads an empty file as an
++// empty log and ignores bytes after a stream that fail within 14 bytes to
++// start another. `out` returns false to stop early. False when the file does
++// not decompress.
++auto bunzip2(int logFd, const std::function<bool(std::string_view)> & out) -> bool
++{
++    static constexpr unsigned bidBytes = 14; // libarchive's bzip2 bid
++    std::string input(readSize, '\0');
++    std::string output(readSize, '\0');
++    bz_stream strm{};
++    std::unique_ptr<bz_stream, decltype(&BZ2_bzDecompressEnd)> open(nullptr, &BZ2_bzDecompressEnd);
++    bool ended = false;
++    auto const ignored = [&] -> bool { return ended && strm.total_in_hi32 == 0 && strm.total_in_lo32 < bidBytes; };
++    for (;;) {
++        if (auto const got = refill(logFd, input, strm); got <= 0) {
++            return got == 0 && (!open || ignored());
++        }
++        if (!open) {
++            if (BZ2_bzDecompressInit(&strm, 0, 0) != BZ_OK) {
++                throw nix::Error("BZ2_bzDecompressInit failed");
++            }
++            open.reset(&strm);
++        }
++        strm.next_out = output.data();
++        strm.avail_out = static_cast<unsigned>(output.size());
++        auto const ret = BZ2_bzDecompress(&strm);
++        if (ret != BZ_OK && ret != BZ_STREAM_END) {
++            return ignored();
++        }
++        if (!out({output.data(), output.size() - strm.avail_out})) {
++            return true;
++        }
++        if (ret == BZ_STREAM_END) {
++            open.reset();
++            ended = true;
++        }
++    }
++}
++
++} // namespace
++
++auto readKeptLog(const std::filesystem::path & logDir, const std::string & drvPath, uint64_t limit)
++    -> std::optional<std::string>
++{
++    std::string log;
++    auto const take = [&](std::string_view data) -> bool {
++        log.append(data.substr(0, static_cast<size_t>(std::min<uint64_t>(data.size(), limit + 1 - log.size()))));
++        return log.size() <= limit;
++    };
++    for (auto const & plainPath : keptLogPaths(logDir, drvPath)) {
++        auto bz2 = plainPath;
++        bz2 += ".bz2";
++        if (UniqueFd const file(::open(plainPath.c_str(), O_RDONLY | O_CLOEXEC)); file) { // NOLINT(cppcoreguidelines-pro-type-vararg)
++            struct stat info{};
++            if (::fstat(file.get(), &info) != 0 || !readRange(file.get(), 0, static_cast<uint64_t>(info.st_size), take)) {
++                throw nix::Error("cannot read %s", plainPath.string());
++            }
++            return log;
++        }
++        if (errno != ENOENT) {
++            throw nix::Error("cannot open %s: %s", plainPath.string(), std::system_category().message(errno));
++        }
++        if (UniqueFd const file(::open(bz2.c_str(), O_RDONLY | O_CLOEXEC)); file) { // NOLINT(cppcoreguidelines-pro-type-vararg)
++            if (!bunzip2(file.get(), take)) {
++                throw nix::Error("%s does not decompress", bz2.string());
++            }
++            return log;
++        }
++        if (errno != ENOENT) {
++            throw nix::Error("cannot open %s: %s", bz2.string(), std::system_category().message(errno));
++        }
++    }
++    return std::nullopt;
++}
++
++// One call's zstd stream of GetBuildLogChunks. The first message carries
++// `info`, and the call's initial metadata goes with it.
++class BuildLogService::Stream
++{
++public:
++    Stream(grpc::ServerContext & context, BuildLogStream & writer, const std::string & node)
++        : context(context)
++        , writer(writer)
++        , node(node)
++    {
++        ZSTD_CCtx_setParameter(cctx.get(), ZSTD_c_compressionLevel, 1);
++    }
++    Stream(const Stream &) = delete;
++    Stream(Stream &&) = delete;
++    auto operator=(const Stream &) -> Stream & = delete;
++    auto operator=(Stream &&) -> Stream & = delete;
++    ~Stream() = default;
++
++    void setInfo(BuildLogInfo value)
++    {
++        info = std::move(value);
++    }
++
++    // Decoded bytes of the log, compressed into the pending message.
++    void add(std::string_view data)
++    {
++        bytes += data.size();
++        compress({.src = data.data(), .size = data.size(), .pos = 0}, ZSTD_e_continue);
++    }
++
++    // Sends everything added so far in one message that decodes on its own,
++    // and `info` if it is still pending, even with no data.
++    void flush()
++    {
++        compress({.src = nullptr, .size = 0, .pos = 0}, ZSTD_e_flush);
++        if (!msg.data().empty() || info) {
++            send();
++        }
++    }
++
++    // An empty message, so proxies see traffic on a quiet log.
++    void ping()
++    {
++        send();
++    }
++
++    // Ends the zstd stream, with `ended` for a follow call.
++    void finish(bool ended)
++    {
++        compress({.src = nullptr, .size = 0, .pos = 0}, ZSTD_e_end);
++        msg.set_ended(ended);
++        send();
++    }
++
++    [[nodiscard]] auto sent() const -> uint64_t
++    {
++        return bytes;
++    }
++
++    [[nodiscard]] auto lastSend() const -> std::chrono::steady_clock::time_point
++    {
++        return lastWrite;
++    }
++
++private:
++    void compress(ZSTD_inBuffer input, ZSTD_EndDirective directive)
++    {
++        zstdCompressInto(*cctx, *msg.mutable_data(), input, directive, [this] -> void { send(); });
++    }
++
++    void send()
++    {
++        if (!started) {
++            context.AddInitialMetadata("x-nix-node", node);
++            started = true;
++        }
++        if (info) {
++            *msg.mutable_info() = std::move(*info);
++            info.reset();
++        }
++        if (!writer.Write(msg)) {
++            throw StreamClosed("the client went away");
++        }
++        msg.Clear();
++        lastWrite = std::chrono::steady_clock::now();
++    }
++
++    grpc::ServerContext & context;
++    BuildLogStream & writer;
++    const std::string & node;
++    std::unique_ptr<ZSTD_CCtx, decltype(&ZSTD_freeCCtx)> cctx{ZSTD_createCCtx(), ZSTD_freeCCtx};
++    GetBuildLogChunk msg;
++    std::optional<BuildLogInfo> info;
++    bool started = false;
++    uint64_t bytes = 0;
++    std::chrono::steady_clock::time_point lastWrite = std::chrono::steady_clock::now();
++};
++
++struct BuildLogService::Call
++{
++    Call(grpc::ServerContext & context, const Caller & caller, const nix::remote::GetBuildLogRequest & request, Stream & stream)
++        : context(context)
++        , caller(caller)
++        , request(request)
++        , stream(stream)
++    {
++    }
++    Call(const Call &) = delete;
++    Call(Call &&) = delete;
++    auto operator=(const Call &) -> Call & = delete;
++    auto operator=(Call &&) -> Call & = delete;
++    ~Call() = default;
++
++    grpc::ServerContext & context;
++    const Caller & caller;
++    const nix::remote::GetBuildLogRequest & request;
++    Stream & stream;
++    std::string_view source = "none";
++    uint64_t offset = 0;
++
++    [[nodiscard]] auto cancelled() const -> bool
++    {
++        return context.IsCancelled() || stopSignal >= kCancelBuilds;
++    }
++
++    [[nodiscard]] auto expired() const -> bool
++    {
++        return caller.validUntil && std::chrono::system_clock::now() > *caller.validUntil;
++    }
++
++    [[nodiscard]] auto limit() const -> uint64_t
++    {
++        return request.limit() == 0 ? std::numeric_limits<uint64_t>::max() : request.limit();
++    }
++};
++
++BuildLogService::BuildLogService(Config config, Metrics & metrics, const Builder * builder)
++    : config(std::move(config))
++    , metrics(metrics)
++    , builder(builder)
++    , cache(this->config.cache)
++{
++}
++
++auto BuildLogService::serve(
++    grpc::ServerContext & context,
++    const Caller & caller,
++    const nix::remote::GetBuildLogRequest & request,
++    BuildLogStream & writer,
++    const std::optional<std::filesystem::path> & logDir) -> Served
++{
++    Served served;
++    context.AddTrailingMetadata("x-nix-node", config.advertise);
++    auto const finish = [&](grpc::Status status) -> Served {
++        served.status = std::move(status);
++        metrics.buildLogCall(served.source, served.status.error_code());
++        return served;
++    };
++    try {
++        nix::StorePath const path(request.drv_path());
++    } catch (nix::BadStorePath & err) {
++        return finish({grpc::StatusCode::INVALID_ARGUMENT, err.what()});
++    }
++    if (request.follow() && (request.limit() != 0 || request.tail() != 0)) {
++        return finish({grpc::StatusCode::INVALID_ARGUMENT, "follow takes no limit or tail"});
++    }
++    if (!calls.acquire(caller.name)) {
++        return finish(tooManyReaders(config.advertise));
++    }
++    Finally const release([&] -> void { calls.release(caller.name); });
++
++    Stream stream(context, writer, config.advertise);
++    Call call(context, caller, request, stream);
++    auto const done = [&](grpc::Status status) -> Served {
++        served.source = call.source;
++        served.offset = call.offset;
++        served.bytes = stream.sent();
++        metrics.buildLogBytes(served.source, served.bytes);
++        return finish(std::move(status));
++    };
++    try {
++        uint64_t rebuilding = 0;
++        if (builder != nullptr) {
++            if (auto run = builder->running(request.drv_path())) {
++                // Nix truncates the kept file when the build starts. Until
++                // then the kept log is the last build's. A call for another
++                // assignment gets it, and so does a call for any log that
++                // does not follow.
++                bool const started = run->shared->startedMs != 0;
++                if (request.assign_id() == run->assignId
++                    || (request.assign_id() == 0 && (started || request.follow()))) {
++                    return done(live(call, *run));
++                }
++                if (started) {
++                    rebuilding = run->assignId;
++                }
++            }
++        }
++        if (rebuilding != 0) {
++            context.AddTrailingMetadata("x-nix-rebuilding", std::to_string(rebuilding));
++            return done(
++                {grpc::StatusCode::NOT_FOUND,
++                 "no build log of " + request.drv_path() + " on " + config.advertise
++                     + ": another build of it runs here and replaced the log"});
++        }
++        if (!logDir) {
++            return done({grpc::StatusCode::UNIMPLEMENTED, config.advertise + " keeps no build logs"});
++        }
++        bool found = false;
++        auto status = kept(call, *logDir, found);
++        if (found) {
++            return done(std::move(status));
++        }
++        return done({grpc::StatusCode::NOT_FOUND, "no build log of " + request.drv_path() + " on " + config.advertise});
++    } catch (StreamClosed &) {
++        return done(clientGone());
++    }
++}
++
++auto BuildLogService::live(Call & call, const Builder::Running & run) -> grpc::Status
++{
++    auto & shared = *run.shared;
++    const auto & spill = shared.spill;
++    const auto & request = call.request;
++    call.source = "live";
++    auto const size = spill.renderedSize();
++    auto start = request.offset();
++    if (request.tail() != 0) {
++        start = spill.lineStartAtOrAfter(tailStart(start, size, request.tail()));
++    } else if (!request.follow() && start > size) {
++        return pastTheEnd();
++    }
++    call.offset = start;
++    BuildLogInfo info;
++    info.set_source(BuildLogInfo::SOURCE_LIVE);
++    info.set_size(size);
++    info.set_offset(start);
++    info.set_first_line(spill.linesBefore(start));
++    info.set_assign_id(run.assignId);
++    info.set_started_ms(shared.startedMs);
++    call.stream.setInfo(std::move(info));
++    auto const add = [&](std::string_view data) -> void { call.stream.add(data); };
++    if (!request.follow()) {
++        (void) spill.drainRendered(start, call.limit(), add);
++        call.stream.finish(false);
++        return grpc::Status::OK;
++    }
++
++    auto const open = metrics.buildLogStream();
++    auto pos = spill.drainRendered(start, std::numeric_limits<size_t>::max(), add);
++    call.stream.flush();
++    while (true) {
++        bool ended = shared.revoked;
++        {
++            // Also when the Expect left without finishing: a revoke before
++            // the start, or a give-back.
++            const std::scoped_lock lock(shared.mutex);
++            ended = ended || shared.finished || shared.left;
++        }
++        auto const before = pos;
++        pos = spill.drainRendered(pos, std::numeric_limits<size_t>::max(), add);
++        if (ended && pos >= spill.renderedSize()) {
++            call.stream.finish(true);
++            return grpc::Status::OK;
++        }
++        if (pos != before) {
++            call.stream.flush();
++        }
++        if (call.cancelled()) {
++            return clientGone();
++        }
++        if (call.expired()) {
++            return {grpc::StatusCode::UNAUTHENTICATED, "bearer token expired"};
++        }
++        if (std::chrono::steady_clock::now() - call.stream.lastSend() >= keepalive) {
++            call.stream.ping();
++        }
++        std::unique_lock lock(shared.mutex);
++        auto const done = [&] -> bool { return shared.finished || shared.left; };
++        auto const grown = [&] -> bool { return done() || spill.renderedSize() > pos; };
++        if (!shared.cv.wait_for(lock, cancelPoll, grown) || done()) {
++            continue;
++        }
++        // Gather a little more, so a chatty build costs a few messages a second.
++        shared.cv.wait_for(lock, batchWait, [&] -> bool { return done() || spill.renderedSize() - pos >= batchBytes; });
++    }
++}
++
++auto BuildLogService::kept(Call & call, const std::filesystem::path & logDir, bool & found) -> grpc::Status
++{
++    for (auto const & plainPath : keptLogPaths(logDir, call.request.drv_path())) {
++        auto bz2 = plainPath;
++        bz2 += ".bz2";
++        struct stat info{};
++        if (::stat(plainPath.c_str(), &info) == 0 || ::lstat(plainPath.c_str(), &info) == 0) {
++            found = true;
++            call.source = "kept";
++            UniqueFd const file(::open(plainPath.c_str(), O_RDONLY | O_CLOEXEC)); // NOLINT(cppcoreguidelines-pro-type-vararg)
++            if (!file || ::fstat(file.get(), &info) != 0) {
++                auto const err = errno;
++                return {grpc::StatusCode::INTERNAL, "cannot open " + plainPath.string() + ": " + std::system_category().message(err)};
++            }
++            return plain(call, file.get(), info);
++        }
++        if (::stat(bz2.c_str(), &info) == 0) {
++            found = true;
++            call.source = "kept";
++            return decoded(call, bz2, mtimeNs(info));
++        }
++    }
++    return grpc::Status::OK;
++}
++
++auto BuildLogService::plain(Call & call, int file, const struct stat & stat) -> grpc::Status
++{
++    const auto & request = call.request;
++    auto const size = static_cast<uint64_t>(stat.st_size);
++    auto start = request.offset();
++    if (request.tail() == 0 && start > size) {
++        return pastTheEnd();
++    }
++    uint64_t lines = 0;
++    if (request.tail() != 0) {
++        // The first line start at or after the tail's start, counting the
++        // newlines before it on the way.
++        auto const want = tailStart(start, size, request.tail());
++        start = want == 0 ? 0 : size;
++        uint64_t base = 0;
++        if (want > 0) {
++            (void) readRange(file, 0, size, [&](std::string_view data) -> bool {
++                for (auto pos = data.find('\n'); pos != std::string_view::npos; pos = data.find('\n', pos + 1)) {
++                    lines++;
++                    if (base + pos + 1 >= want) {
++                        start = base + pos + 1;
++                        return false;
++                    }
++                }
++                base += data.size();
++                return true;
++            });
++        }
++    } else {
++        (void) readRange(file, 0, start, [&](std::string_view data) -> bool {
++            lines += countNewlines(data);
++            return true;
++        });
++    }
++    call.offset = start;
++    call.stream.setInfo(info(call, BuildLogInfo::SOURCE_KEPT, mtimeNs(stat) / nsPerMs, start, size, lines));
++    auto left = call.limit();
++    if (!readRange(file, start, size - start, [&](std::string_view data) -> bool {
++            data = data.substr(0, static_cast<size_t>(std::min<uint64_t>(left, data.size())));
++            call.stream.add(data);
++            left -= data.size();
++            return left > 0;
++        })) {
++        return {grpc::StatusCode::INTERNAL, "cannot read the log"};
++    }
++    call.stream.finish(false);
++    return grpc::Status::OK;
++}
++
++auto BuildLogService::entry(Call & call, const std::filesystem::path & bz2, uint64_t mtime)
++    -> std::expected<LogCache::Reader, grpc::Status>
++{
++    auto const key = bz2.string() + "@" + std::to_string(mtime);
++    if (auto reader = cache.find(key)) {
++        return std::move(*reader);
++    }
++    auto slot = decodeSlot(call);
++    if (!slot) {
++        return std::unexpected(slot.error());
++    }
++    auto decode = [bz2](const LogCache::Write & write) -> bool {
++        UniqueFd const file(::open(bz2.c_str(), O_RDONLY | O_CLOEXEC)); // NOLINT(cppcoreguidelines-pro-type-vararg)
++        return file && bunzip2(file.get(), write);
++    };
++    return cache.start(key, std::move(decode), std::move(*slot));
++}
++
++// Where a call on a cached decode starts, once the entry holds it: the
++// whole log for a tail, else the bytes up to the offset. The status when
++// it cannot start there.
++auto BuildLogService::startIn(Call & call, const LogCache::Reader & entry, LogCache::State & state)
++    -> std::expected<uint64_t, grpc::Status>
++{
++    const auto & request = call.request;
++    auto const start = request.offset();
++    state = entry->state();
++    while (!state.ended() && (request.tail() != 0 || state.written < start)) {
++        if (call.cancelled()) {
++            return std::unexpected(clientGone());
++        }
++        state = entry->waitPast(state.written, cancelPoll);
++    }
++    if (state.failed && state.written < start) {
++        return std::unexpected(grpc::Status{grpc::StatusCode::DATA_LOSS, "the log does not decompress"});
++    }
++    if (request.tail() != 0 && state.complete) {
++        return entry->lineStartAtOrAfter(tailStart(start, state.written, request.tail()));
++    }
++    if (state.complete && start > state.written) {
++        return std::unexpected(pastTheEnd());
++    }
++    return start;
++}
++
++auto BuildLogService::info(
++    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters): as BuildLogInfo orders them.
++    const Call & call, BuildLogInfo::Source source, uint64_t modifiedMs, uint64_t start, uint64_t size, uint64_t lines)
++    -> BuildLogInfo
++{
++    BuildLogInfo out;
++    out.set_source(source);
++    out.set_size(size);
++    out.set_offset(start);
++    out.set_first_line(lines);
++    if (source == BuildLogInfo::SOURCE_KEPT && builder != nullptr) {
++        out.set_assign_id(builder->keptBy(call.request.drv_path()));
++    }
++    out.set_modified_ms(modifiedMs);
++    return out;
++}
++
++auto BuildLogService::decoded(Call & call, const std::filesystem::path & bz2, uint64_t mtime) -> grpc::Status
++{
++    auto opened = entry(call, bz2, mtime);
++    if (!opened) {
++        return opened.error();
++    }
++    // Let go before a decode of this call's own, so the temp file of an
++    // entry that did not fit goes now and not after that decode.
++    std::optional<LogCache::Reader> held(std::move(*opened));
++    auto const & entry = *held;
++    auto const damaged = [&] -> grpc::Status { return {grpc::StatusCode::DATA_LOSS, bz2.string() + " does not decompress"}; };
++    LogCache::State state;
++    auto const start = startIn(call, entry, state);
++    if (!start) {
++        return start.error().error_code() == grpc::StatusCode::DATA_LOSS ? damaged() : start.error();
++    }
++    if (state.uncached && state.written <= *start) {
++        held.reset();
++        return direct(call, bz2, *start, false);
++    }
++    call.offset = *start;
++    call.stream.setInfo(info(
++        call, BuildLogInfo::SOURCE_KEPT, mtime / nsPerMs, *start, state.complete ? state.written : 0,
++        entry->linesBefore(*start)));
++
++    auto left = call.limit();
++    auto pos = *start;
++    std::vector<char> buf(readSize);
++    while (left > 0) {
++        auto const want = static_cast<size_t>(std::min<uint64_t>(buf.size(), left));
++        if (auto const got = entry->read(pos, std::span(buf).first(want)); got > 0) {
++            call.stream.add({buf.data(), got});
++            pos += got;
++            left -= got;
++            continue;
++        }
++        state = entry->state();
++        if (pos < state.written) {
++            continue;
++        }
++        if (state.complete) {
++            break;
++        }
++        if (state.failed) {
++            call.stream.flush();
++            return damaged();
++        }
++        if (state.uncached) {
++            held.reset();
++            return direct(call, bz2, pos, true);
++        }
++        if (call.cancelled()) {
++            return clientGone();
++        }
++        (void) entry->waitPast(pos, cancelPoll);
++    }
++    call.stream.finish(false);
++    return grpc::Status::OK;
++}
++
++auto BuildLogService::decodeSlot(Call & call) -> std::expected<DecodeSlots::Slot, grpc::Status>
++{
++    auto slot = slots.acquire(call.caller.name, decodeWait, [&] -> bool { return call.cancelled(); });
++    if (!slot) {
++        return std::unexpected(tooManyReaders(config.advertise));
++    }
++    return std::move(*slot);
++}
++
++// A log the cache does not hold: decoded again for this call alone, from
++// the start, skipping what comes before `from`.
++auto BuildLogService::direct(Call & call, const std::filesystem::path & bz2, uint64_t from, bool infoSent) -> grpc::Status
++{
++    auto const slot = decodeSlot(call);
++    if (!slot) {
++        return slot.error();
++    }
++    UniqueFd const file(::open(bz2.c_str(), O_RDONLY | O_CLOEXEC)); // NOLINT(cppcoreguidelines-pro-type-vararg)
++    if (!file) {
++        auto const err = errno;
++        return {grpc::StatusCode::INTERNAL, "cannot open " + bz2.string() + ": " + std::system_category().message(err)};
++    }
++    uint64_t pos = 0;
++    uint64_t lines = 0;
++    auto left = call.limit();
++    bool const decodes = bunzip2(file.get(), [&](std::string_view data) -> bool {
++        if (pos + data.size() <= from) {
++            lines += countNewlines(data);
++            pos += data.size();
++            return !call.cancelled();
++        }
++        if (pos < from) {
++            auto const skip = static_cast<size_t>(from - pos);
++            lines += countNewlines(data.substr(0, skip));
++            data.remove_prefix(skip);
++            pos = from;
++        }
++        if (!infoSent) {
++            infoSent = true;
++            call.offset = from;
++            call.stream.setInfo(info(call, BuildLogInfo::SOURCE_KEPT, 0, from, 0, lines));
++        }
++        data = data.substr(0, static_cast<size_t>(std::min<uint64_t>(left, data.size())));
++        call.stream.add(data);
++        left -= data.size();
++        pos += data.size();
++        return left > 0 && !call.cancelled();
++    });
++    if (call.cancelled()) {
++        return clientGone();
++    }
++    if (!decodes) {
++        call.stream.flush();
++        return {grpc::StatusCode::DATA_LOSS, bz2.string() + " does not decompress"};
++    }
++    if (!infoSent && pos < from) {
++        return pastTheEnd();
++    }
++    if (!infoSent) {
++        // An offset at the very end: no bytes, but the info all the same.
++        call.offset = from;
++        call.stream.setInfo(info(call, BuildLogInfo::SOURCE_KEPT, 0, from, pos, lines));
++    }
++    call.stream.finish(false);
++    return grpc::Status::OK;
++}
++
++} // namespace nixgrpc
+diff --git a/src/daemon/build-log-service.hh b/src/daemon/build-log-service.hh
+new file mode 100644
+index 0000000..e74aa40
+--- /dev/null
++++ b/src/daemon/build-log-service.hh
+@@ -0,0 +1,114 @@
++#pragma once
++// GetBuildLog (proto/nix_remote.proto): a derivation's build log, from the
++// spill while it builds here (LIVE), else from the file Nix kept (KEPT).
++// A .bz2 kept log is decoded once into the decode cache (log-cache.hh), so
++// offsets and tails work on it and N viewers cost one decode.
++
++#include <chrono>
++#include <cstdint>
++#include <expected>
++#include <filesystem>
++#include <functional>
++#include <optional>
++#include <string>
++#include <string_view>
++
++#include <sys/stat.h>
++
++#include <grpcpp/server_context.h>
++#include <grpcpp/support/status.h>
++#include <grpcpp/support/sync_stream.h>
++
++#include "auth.hh"
++#include "coordinator.hh"
++#include "events.hh"
++#include "log-cache.hh"
++#include "metrics.hh"
++#include "nix_remote.pb.h"
++
++namespace nixgrpc {
++
++using BuildLogStream = grpc::ServerWriterInterface<nix::remote::GetBuildLogChunk>;
++
++// The log Nix kept here for `drvPath` (a base name), decoded, as `nix log`
++// finds it. Reading stops after `limit` bytes plus one, so a caller can
++// tell a larger log. nullopt: there is none. Throws for a log that cannot
++// be read or does not decompress.
++auto readKeptLog(const std::filesystem::path & logDir, const std::string & drvPath, uint64_t limit)
++    -> std::optional<std::string>;
++
++class BuildLogService
++{
++public:
++    // Per node and per caller name.
++    static constexpr unsigned maxCalls = 32;
++    static constexpr unsigned maxCallsPerCaller = 8;
++    static constexpr unsigned maxDecodes = 2;
++    static constexpr unsigned maxDecodesPerCaller = 1;
++    static constexpr std::chrono::seconds decodeWait{10};
++    // A follow call sends at most one message per wake after this, or once
++    // this much is pending.
++    static constexpr std::chrono::milliseconds batchWait{100};
++    static constexpr size_t batchBytes = size_t{64} << 10U;
++    static constexpr std::chrono::seconds keepalive{30};
++
++    struct Config
++    {
++        std::string advertise;
++        LogCache::Limits cache;
++    };
++
++    // `builder` may be null: a node that only schedules.
++    BuildLogService(Config config, Metrics & metrics, const Builder * builder);
++
++    // What the call served, for its log line.
++    struct Served
++    {
++        grpc::Status status;
++        std::string_view source = "none";
++        uint64_t offset = 0;
++        uint64_t bytes = 0;
++    };
++
++    // `logDir`: where the store keeps logs, nullopt when it keeps none.
++    auto serve(
++        grpc::ServerContext & context,
++        const Caller & caller,
++        const nix::remote::GetBuildLogRequest & request,
++        BuildLogStream & writer,
++        const std::optional<std::filesystem::path> & logDir) -> Served;
++
++private:
++    class Stream;
++    struct Call;
++
++    auto live(Call & call, const Builder::Running & run) -> grpc::Status;
++    auto kept(Call & call, const std::filesystem::path & logDir, bool & found) -> grpc::Status;
++    auto plain(Call & call, int file, const struct stat & stat) -> grpc::Status;
++    // `mtime`: of the .bz2, in ns since the epoch, which keys the cache.
++    auto decoded(Call & call, const std::filesystem::path & bz2, uint64_t mtime) -> grpc::Status;
++    auto entry(Call & call, const std::filesystem::path & bz2, uint64_t mtime)
++        -> std::expected<LogCache::Reader, grpc::Status>;
++    static auto startIn(Call & call, const LogCache::Reader & entry, LogCache::State & state)
++        -> std::expected<uint64_t, grpc::Status>;
++    // A decode slot, waited for as long as decodeWait.
++    auto decodeSlot(Call & call) -> std::expected<DecodeSlots::Slot, grpc::Status>;
++    auto direct(Call & call, const std::filesystem::path & bz2, uint64_t from, bool infoSent) -> grpc::Status;
++    // The info message of a log that is not live.
++    auto info(
++        const Call & call,
++        nix::remote::BuildLogInfo::Source source,
++        uint64_t modifiedMs,
++        uint64_t start,
++        uint64_t size,
++        uint64_t lines) -> nix::remote::BuildLogInfo;
++
++    const Config config;
++    Metrics & metrics;
++    const Builder * builder;
++    StreamLimit calls{maxCalls, maxCallsPerCaller};
++    DecodeSlots slots{maxDecodes, maxDecodesPerCaller};
++    LogCache cache;
++};
++
++} // namespace nixgrpc
+diff --git a/src/daemon/builder.cc b/src/daemon/builder.cc
+index 92fd062..930a338 100644
+--- a/src/daemon/builder.cc
++++ b/src/daemon/builder.cc
+@@ -10,6 +10,7 @@
+ #include <mutex>
+ #include <optional>
+ #include <string>
++#include <string_view>
+ #include <utility>
+ #include <vector>
+ 
+@@ -94,6 +95,7 @@ void Builder::giveBack(const std::vector<std::pair<std::string, uint64_t>> & drv
+ void Builder::onRevoke(const nix::remote::Revoke & rev)
+ {
+     uint64_t assignId = 0;
++    std::shared_ptr<Expected::Shared> shared;
+     {
+         auto lck = state.lock();
+         auto const found = lck->expected.find(rev.drv_path());
+@@ -107,11 +109,37 @@ void Builder::onRevoke(const nix::remote::Revoke & rev)
+             return;
+         }
+         assignId = found->second.assignId;
++        shared = found->second.shared;
+         lck->expected.erase(found);
+     }
++    wake(*shared);
+     sendDone(rev.drv_path(), assignId, nix::remote::Done::CANCELLED, {});
+ }
+ 
++void Builder::wake(Expected::Shared & shared)
++{
++    const std::scoped_lock lock(shared.mutex);
++    shared.left = true;
++    shared.cv.notify_all();
++}
++
++auto Builder::running(std::string_view drvPath) const -> std::optional<Running>
++{
++    auto lck = state.lock();
++    auto const found = lck->expected.find(std::string(drvPath));
++    if (found == lck->expected.end()) {
++        return std::nullopt;
++    }
++    return Running{.shared = found->second.shared, .assignId = found->second.assignId};
++}
++
++auto Builder::keptBy(std::string_view drvPath) const -> uint64_t
++{
++    auto lck = state.lock();
++    auto const found = lck->kept.find(std::string(drvPath));
++    return found == lck->kept.end() ? 0 : found->second;
++}
++
+ auto Builder::admit(const std::string & drvPath) -> std::optional<Admission>
+ {
+     auto lck = state.lock();
+@@ -143,6 +171,18 @@ void Builder::finished(
+             assignId = found->second.assignId;
+             shared = found->second.shared;
+             lck->expected.erase(found);
++            // Nix rewrote the kept log for every build that started.
++            if (shared->startedMs != 0) {
++                lck->kept.insert_or_assign(drvPath, assignId);
++                lck->keptOrder.emplace_back(drvPath, assignId);
++                while (lck->keptOrder.size() > maxKept) {
++                    auto const & [oldest, oldId] = lck->keptOrder.front();
++                    if (auto const old = lck->kept.find(oldest); old != lck->kept.end() && old->second == oldId) {
++                        lck->kept.erase(old);
++                    }
++                    lck->keptOrder.pop_front();
++                }
++            }
+         }
+     }
+     if (shared) {
+@@ -207,15 +247,27 @@ auto Builder::hello() -> WorkerMsg
+     }
+     hel->set_version(config.version);
+     hel->set_min_free_bytes(config.minFree);
+-    auto lck = state.lock();
+-    lck->newestExpect = 0; // a new session, maybe of a new scheduler, counts anew
+-    // A slot nobody claimed is dropped, not reported: the scheduler would
+-    // take it for a build and revoke the one its client started elsewhere.
+-    std::erase_if(lck->expected, [](const auto & item) -> bool { return !item.second.claimed; });
+-    for (const auto & [drv, ent] : lck->expected) {
+-        auto * run = hel->add_running();
+-        run->set_drv_path(drv);
+-        run->set_assign_id(ent.assignId);
++    std::vector<std::shared_ptr<Expected::Shared>> dropped;
++    {
++        auto lck = state.lock();
++        lck->newestExpect = 0; // a new session, maybe of a new scheduler, counts anew
++        // A slot nobody claimed is dropped, not reported: the scheduler would
++        // take it for a build and revoke the one its client started elsewhere.
++        std::erase_if(lck->expected, [&](const auto & item) -> bool {
++            if (item.second.claimed) {
++                return false;
++            }
++            dropped.push_back(item.second.shared);
++            return true;
++        });
++        for (const auto & [drv, ent] : lck->expected) {
++            auto * run = hel->add_running();
++            run->set_drv_path(drv);
++            run->set_assign_id(ent.assignId);
++        }
++    }
++    for (const auto & shared : dropped) {
++        wake(*shared);
+     }
+     return msg;
+ }
+@@ -282,15 +334,22 @@ auto Builder::takeUnclaimed(const std::function<bool(const Expected &)> & pred)
+     -> std::vector<std::pair<std::string, uint64_t>>
+ {
+     std::vector<std::pair<std::string, uint64_t>> taken;
+-    auto lck = state.lock();
+-    for (auto iter = lck->expected.begin(); iter != lck->expected.end();) {
+-        if (!iter->second.claimed && pred(iter->second)) {
+-            taken.emplace_back(iter->first, iter->second.assignId);
+-            iter = lck->expected.erase(iter);
+-        } else {
+-            ++iter;
++    std::vector<std::shared_ptr<Expected::Shared>> woken;
++    {
++        auto lck = state.lock();
++        for (auto iter = lck->expected.begin(); iter != lck->expected.end();) {
++            if (!iter->second.claimed && pred(iter->second)) {
++                taken.emplace_back(iter->first, iter->second.assignId);
++                woken.push_back(iter->second.shared);
++                iter = lck->expected.erase(iter);
++            } else {
++                ++iter;
++            }
+         }
+     }
++    for (const auto & shared : woken) {
++        wake(*shared);
++    }
+     return taken;
+ }
+ 
+diff --git a/src/daemon/builder.hh b/src/daemon/builder.hh
+index f956102..ad3cb97 100644
+--- a/src/daemon/builder.hh
++++ b/src/daemon/builder.hh
+@@ -9,6 +9,7 @@
+ #include <condition_variable>
+ #include <cstddef>
+ #include <cstdint>
++#include <deque>
+ #include <functional>
+ #include <memory>
+ #include <mutex>
+@@ -49,10 +50,13 @@ struct Expected
+         std::atomic<bool> revoked{false}; // scheduler moved the drv to a worker further along
+         std::atomic<unsigned> attached{0};  // callers waiting in attach(); the build outlives its first caller for them
+         bool finished = false;
++        bool left = false;      // the Expect left the table without finishing
+         std::string resultWire; // BuildDerivationDone serialised
+         // Written before `finished`.
+         std::array<uint64_t, 3> settings{};
+         LogSpill spill; // the owner's build log, replayed to whoever attaches
++        // Unix ms when the owner handed the build to the nix-daemon, 0 before.
++        std::atomic<uint64_t> startedMs{0};
+ 
+         // Owner only. Waking under the lock keeps an attacher that just
+         // checked `written()` from sleeping through this record.
+@@ -124,6 +128,18 @@ public:
+         const DoneInfo & info = {});
+     [[nodiscard]] auto holding() const -> size_t;
+ 
++    // A derivation assigned here, started or not. The pointer keeps its log
++    // readable after finished() erases the entry.
++    struct Running
++    {
++        std::shared_ptr<Expected::Shared> shared;
++        uint64_t assignId = 0;
++    };
++    [[nodiscard]] auto running(std::string_view drvPath) const -> std::optional<Running>;
++    // The assignment whose build last ran here for `drvPath`, so the one
++    // that wrote Nix's kept log of it. 0 when this process does not know.
++    [[nodiscard]] auto keptBy(std::string_view drvPath) const -> uint64_t;
++
+     // Sent on every (re)connect. Reports the builds a client came for and
+     // forgets the Expects nobody claimed.
+     auto hello() -> nix::remote::WorkerMsg;
+@@ -179,7 +195,11 @@ private:
+     {
+         std::unordered_map<std::string, Expected> expected;
+         uint64_t newestExpect = 0; // highest assign_id read in this session
++        // Builds that started here, newest last, at most maxKept.
++        std::unordered_map<std::string, uint64_t> kept;
++        std::deque<std::pair<std::string, uint64_t>> keptOrder;
+     };
++    static constexpr size_t maxKept = 4096;
+ 
+     mutable nix::Sync<State> state;
+     SchedulerLink link;
+@@ -205,6 +225,9 @@ private:
+         const DoneInfo & info = {});
+     // Under unavailableMutex. False if the write failed.
+     auto sendLoad() -> bool;
++    // An Expect left the table without finishing: mark it, and wake whoever
++    // follows its log.
++    static void wake(Expected::Shared & shared);
+     void giveBack(const std::vector<std::pair<std::string, uint64_t>> & drvs, nix::remote::Done::Reason reason);
+     auto takeUnclaimed(const std::function<bool(const Expected &)> & pred) -> std::vector<std::pair<std::string, uint64_t>>;
+ };
+diff --git a/src/daemon/log-cache.hh b/src/daemon/log-cache.hh
+new file mode 100644
+index 0000000..5ebbd8e
+--- /dev/null
++++ b/src/daemon/log-cache.hh
+@@ -0,0 +1,607 @@
++#pragma once
++// The decode cache for GetBuildLog. A build log that must be decoded before
++// it can be served from an offset (a .bz2 kept log, or one from a store) is
++// decoded once into an unlinked temp file under TMPDIR, as log spills are.
++// Every call for the same log reads that file, also while the decode still
++// runs, so N viewers and every resume cost one decode, and a complete entry
++// has an exact size and seeks for offsets and tails.
++//
++// Decodes take slots: a few per node and fewer per caller, so one caller
++// cannot hold them all. A call that joins an entry needs no slot.
++
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <condition_variable>
++#include <cstddef>
++#include <cstdint>
++#include <iterator>
++#include <functional>
++#include <list>
++#include <map>
++#include <memory>
++#include <mutex>
++#include <optional>
++#include <span>
++#include <string>
++#include <string_view>
++#include <thread>
++#include <utility>
++#include <vector>
++
++#include "log-spill.hh"
++
++namespace nixgrpc {
++
++// At most `total` decodes at once, `perCaller` of them for one caller.
++class DecodeSlots
++{
++public:
++    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters): in all, then per caller.
++    DecodeSlots(unsigned total, unsigned perCaller)
++        : total(total)
++        , perCaller(perCaller)
++    {
++    }
++
++    class Slot
++    {
++    public:
++        Slot() = default;
++        Slot(DecodeSlots & slots, std::string caller)
++            : slots(&slots)
++            , caller(std::move(caller))
++        {
++        }
++        Slot(Slot && other) noexcept
++            : slots(std::exchange(other.slots, nullptr))
++            , caller(std::move(other.caller))
++        {
++        }
++        auto operator=(Slot && other) noexcept -> Slot &
++        {
++            if (this != &other) {
++                release();
++                slots = std::exchange(other.slots, nullptr);
++                caller = std::move(other.caller);
++            }
++            return *this;
++        }
++        Slot(const Slot &) = delete;
++        auto operator=(const Slot &) -> Slot & = delete;
++        ~Slot()
++        {
++            release();
++        }
++
++        void release()
++        {
++            if (auto * const owner = std::exchange(slots, nullptr)) {
++                owner->release(caller);
++            }
++        }
++
++    private:
++        DecodeSlots * slots = nullptr;
++        std::string caller;
++    };
++
++    // Waits up to `wait` for a slot, and gives up early once `cancelled()`.
++    auto acquire(const std::string & caller, std::chrono::milliseconds wait, const std::function<bool()> & cancelled)
++        -> std::optional<Slot>
++    {
++        static constexpr std::chrono::milliseconds poll{100};
++        auto const deadline = std::chrono::steady_clock::now() + wait;
++        std::unique_lock lock(mutex);
++        while (true) {
++            auto & mine = byCaller[caller];
++            if (open < total && mine < perCaller) {
++                open++;
++                mine++;
++                return Slot(*this, caller);
++            }
++            if (mine == 0) {
++                byCaller.erase(caller);
++            }
++            auto const now = std::chrono::steady_clock::now();
++            if (now >= deadline || (cancelled && cancelled())) {
++                return std::nullopt;
++            }
++            freed.wait_for(lock, std::min<std::chrono::steady_clock::duration>(poll, deadline - now));
++        }
++    }
++
++    [[nodiscard]] auto inUse() const -> unsigned
++    {
++        const std::scoped_lock lock(mutex);
++        return open;
++    }
++
++private:
++    void release(const std::string & caller)
++    {
++        {
++            const std::scoped_lock lock(mutex);
++            open--;
++            if (auto const iter = byCaller.find(caller); iter != byCaller.end() && --iter->second == 0) {
++                byCaller.erase(iter);
++            }
++        }
++        freed.notify_all();
++    }
++
++    const unsigned total;
++    const unsigned perCaller;
++    mutable std::mutex mutex;
++    std::condition_variable freed;
++    unsigned open = 0;
++    std::map<std::string, unsigned> byCaller;
++};
++
++class LogCache
++{
++public:
++    static constexpr size_t defaultEntries = 8;
++    static constexpr uint64_t defaultBytes = uint64_t{2} << 30U;
++    static constexpr std::chrono::minutes defaultKeep{5};
++    static constexpr uint64_t defaultStride = uint64_t{1} << 20U;
++    static constexpr std::chrono::hours defaultTooBigFor{1};
++    static constexpr size_t maxTooBig = 64;
++
++    struct Limits
++    {
++        size_t entries = defaultEntries;
++        uint64_t bytes = defaultBytes;
++        // How long an entry stays after its last reader left.
++        std::chrono::milliseconds keep = defaultKeep;
++        // One index entry {offset, lines} per this many bytes.
++        uint64_t stride = defaultStride;
++        // How long the cache remembers a log that did not fit, so that
++        // later calls for it decode on their own at once instead of
++        // evicting the other entries and filling the cache again.
++        std::chrono::milliseconds tooBigFor = defaultTooBigFor;
++    };
++
++    // Writes the decoded log through `write`, which returns false when the
++    // decode should stop: nobody reads it any more, or it does not fit.
++    // Returns false when the log does not decode.
++    using Write = std::function<bool(std::string_view)>;
++    using Decode = std::function<bool(const Write & write)>;
++
++    // What an entry holds at one moment.
++    struct State
++    {
++        uint64_t written = 0;
++        bool complete = false; // the whole log is here: written is its size
++        bool failed = false;   // it did not decode; written is what came before
++        // The cache dropped it: too big for the cache (this time, or lately),
++        // or no temp file. The bytes written stay readable; the rest needs a
++        // decode of its own.
++        bool uncached = false;
++
++        [[nodiscard]] auto ended() const -> bool
++        {
++            return complete || failed || uncached;
++        }
++    };
++
++    class Entry
++    {
++    public:
++        explicit Entry(std::string key)
++            : key(std::move(key))
++        {
++        }
++
++        [[nodiscard]] auto state() const -> State
++        {
++            const std::scoped_lock lock(mutex);
++            return current;
++        }
++
++        // Until more than `offset` bytes are here or the decode ended, for
++        // at most `poll`.
++        auto waitPast(uint64_t offset, std::chrono::milliseconds poll) const -> State
++        {
++            std::unique_lock lock(mutex);
++            grown.wait_for(lock, poll, [&] -> bool { return current.written > offset || current.ended(); });
++            return current;
++        }
++
++        // Reads what is there at `offset`, at most out.size() bytes.
++        [[nodiscard]] auto read(uint64_t offset, std::span<char> out) const -> size_t
++        {
++            auto const have = state().written;
++            if (offset >= have || !file) {
++                return 0;
++            }
++            auto const want = static_cast<size_t>(std::min<uint64_t>(out.size(), have - offset));
++            return preadUpTo(file.get(), std::as_writable_bytes(out.first(want)), offset);
++        }
++
++        // Newlines before `offset`, which must be written already.
++        [[nodiscard]] auto linesBefore(uint64_t offset) const -> uint64_t
++        {
++            uint64_t from = 0;
++            uint64_t lines = 0;
++            {
++                const std::scoped_lock lock(mutex);
++                if (!index.empty() && stride > 0) {
++                    auto const slot = std::min<size_t>(offset / stride, index.size() - 1);
++                    from = slot * stride;
++                    lines = index.at(slot);
++                }
++            }
++            return lines + countNewlines(from, offset);
++        }
++
++        // The first line start at or after `offset` in a complete entry, or
++        // its size when no line starts there.
++        [[nodiscard]] auto lineStartAtOrAfter(uint64_t offset) const -> uint64_t
++        {
++            auto const size = state().written;
++            if (offset == 0 || offset >= size) {
++                return std::min(offset, size);
++            }
++            std::array<char, 1> before{};
++            if (read(offset - 1, before) == 1 && before.front() == '\n') {
++                return offset;
++            }
++            std::vector<char> buf(kReadSize);
++            for (auto pos = offset; pos < size;) {
++                auto const got = read(pos, buf);
++                if (got == 0) {
++                    break;
++                }
++                auto const piece = std::span(buf).first(got);
++                if (auto const newline = std::ranges::find(piece, '\n'); newline != piece.end()) {
++                    return pos + static_cast<uint64_t>(std::distance(piece.begin(), newline)) + 1;
++                }
++                pos += got;
++            }
++            return size;
++        }
++
++        [[nodiscard]] auto readers() const -> unsigned
++        {
++            return readerCount.load();
++        }
++
++    private:
++        friend class LogCache;
++        static constexpr size_t kReadSize = size_t{64} << 10U;
++
++        [[nodiscard]] auto countNewlines(uint64_t from, uint64_t end) const -> uint64_t
++        {
++            uint64_t lines = 0;
++            std::vector<char> buf(kReadSize);
++            while (from < end) {
++                auto const got = read(from, std::span(buf).first(static_cast<size_t>(std::min<uint64_t>(buf.size(), end - from))));
++                if (got == 0) {
++                    break;
++                }
++                lines += static_cast<uint64_t>(std::count(buf.begin(), std::next(buf.begin(), static_cast<std::ptrdiff_t>(got)), '\n'));
++                from += got;
++            }
++            return lines;
++        }
++
++        const std::string key;
++        UniqueFd file;
++        uint64_t stride = 0;
++        mutable std::mutex mutex;
++        mutable std::condition_variable grown;
++        State current;
++        std::vector<uint64_t> index; // newlines before k * stride
++        uint64_t lines = 0;          // decode thread only, as is marks
++        uint64_t marks = 0;          // index entries written
++        std::atomic<unsigned> readerCount{0};
++        std::atomic<std::chrono::steady_clock::rep> lastRead{0};
++    };
++
++    // Counts as a reader of its entry while it lives: the decode goes on
++    // while one remains, and the entry stays `keep` after the last.
++    class Reader
++    {
++    public:
++        explicit Reader(std::shared_ptr<Entry> entry)
++            : entry(std::move(entry))
++        {
++            this->entry->readerCount++;
++        }
++        Reader(Reader && other) noexcept = default;
++        auto operator=(Reader && other) noexcept -> Reader & = delete;
++        Reader(const Reader &) = delete;
++        auto operator=(const Reader &) -> Reader & = delete;
++        ~Reader()
++        {
++            if (entry) {
++                entry->lastRead = std::chrono::steady_clock::now().time_since_epoch().count();
++                entry->readerCount--;
++            }
++        }
++
++        auto operator->() const -> const Entry *
++        {
++            return entry.get();
++        }
++
++    private:
++        std::shared_ptr<Entry> entry;
++    };
++
++    LogCache()
++        : LogCache(Limits{})
++    {
++    }
++    explicit LogCache(Limits limits)
++        : limits(limits)
++    {
++    }
++
++    LogCache(const LogCache &) = delete;
++    auto operator=(const LogCache &) -> LogCache & = delete;
++    LogCache(LogCache &&) = delete;
++    auto operator=(LogCache &&) -> LogCache & = delete;
++
++    ~LogCache()
++    {
++        {
++            const std::scoped_lock lock(mutex);
++            stopping = true;
++        }
++        threads.clear(); // joins
++    }
++
++    // A reader of the entry for `key`, decoding or complete, or nullopt:
++    // then the caller takes a slot and calls start(). For a log that did
++    // not fit, an empty uncached reader: the caller decodes it itself.
++    auto find(const std::string & key) -> std::optional<Reader>
++    {
++        const std::scoped_lock lock(mutex);
++        return joinLocked(key);
++    }
++
++    // Decodes `key` on a thread of the cache, holding `slot` until it ends.
++    // When another call started the same key meanwhile, joins that one and
++    // gives the slot back.
++    auto start(const std::string & key, Decode decode, DecodeSlots::Slot slot) -> Reader
++    {
++        const std::scoped_lock lock(mutex);
++        if (auto joined = joinLocked(key)) {
++            return std::move(*joined);
++        }
++        auto entry = std::make_shared<Entry>(key);
++        entry->stride = limits.stride;
++        Reader reader(entry);
++        if (auto opened = openTempFile()) {
++            entry->file = std::move(*opened);
++        } else {
++            entry->current.uncached = true; // the caller decodes it itself
++            return reader;
++        }
++        entries.emplace(key, entry);
++        evictLocked(nullptr, 0);
++        std::erase_if(threads, [](const Worker & worker) -> bool { return worker.done->load(); });
++        auto const done = std::make_shared<std::atomic<bool>>(false);
++        threads.push_back(
++            {.done = done,
++             .thread = std::jthread([this, entry, decode = std::move(decode), slot = std::move(slot), done] mutable -> void {
++                 run(*entry, decode);
++                 slot.release();
++                 *done = true;
++             })});
++        return reader;
++    }
++
++    [[nodiscard]] auto size() const -> size_t
++    {
++        const std::scoped_lock lock(mutex);
++        return entries.size();
++    }
++
++    [[nodiscard]] auto bytes() const -> uint64_t
++    {
++        const std::scoped_lock lock(mutex);
++        return totalBytes;
++    }
++
++private:
++    struct Worker
++    {
++        std::shared_ptr<std::atomic<bool>> done;
++        std::jthread thread;
++    };
++
++    void run(Entry & entry, const Decode & decode)
++    {
++        bool fits = true;
++        bool tooBig = false;
++        bool read = true;
++        auto const decoded = decode([&](std::string_view data) -> bool {
++            if (data.empty()) {
++                return true;
++            }
++            if (entry.readerCount == 0) {
++                read = false;
++                return false;
++            }
++            if (!reserve(entry, data.size())) {
++                fits = false;
++                tooBig = true;
++                return false;
++            }
++            if (!append(entry, data)) {
++                fits = false;
++                return false;
++            }
++            return true;
++        });
++        const std::scoped_lock lock(mutex);
++        {
++            const std::scoped_lock entryLock(entry.mutex);
++            // Too big, or nobody is left to see it.
++            if (!fits || stopping || !read) {
++                entry.current.uncached = true;
++            } else if (decoded) {
++                entry.current.complete = true;
++            } else {
++                entry.current.failed = true;
++            }
++        }
++        entry.grown.notify_all();
++        if (!entry.current.complete) {
++            dropLocked(entry);
++        }
++        if (tooBig && !stopping) {
++            rememberTooBigLocked(entry.key);
++        }
++    }
++
++    // As find() says, under the lock.
++    auto joinLocked(const std::string & key) -> std::optional<Reader>
++    {
++        sweepLocked();
++        if (auto const found = entries.find(key); found != entries.end()) {
++            return Reader(found->second);
++        }
++        if (tooBigLocked(key)) {
++            return uncachedReader(key);
++        }
++        return std::nullopt;
++    }
++
++    // An entry for one call, with nothing in it and no file.
++    static auto uncachedReader(const std::string & key) -> Reader
++    {
++        auto entry = std::make_shared<Entry>(key);
++        entry->current.uncached = true;
++        return Reader(std::move(entry));
++    }
++
++    // Whether `key` did not fit within the last `limits.tooBigFor`.
++    auto tooBigLocked(const std::string & key) -> bool
++    {
++        auto const now = std::chrono::steady_clock::now();
++        std::erase_if(tooBig, [&](const auto & item) -> bool { return now - item.second >= limits.tooBigFor; });
++        return tooBig.contains(key);
++    }
++
++    // At most `maxTooBig` keys; the oldest goes first.
++    void rememberTooBigLocked(const std::string & key)
++    {
++        tooBig.insert_or_assign(key, std::chrono::steady_clock::now());
++        while (tooBig.size() > maxTooBig) {
++            tooBig.erase(std::ranges::min_element(tooBig, {}, [](const auto & item) -> auto { return item.second; }));
++        }
++    }
++
++    // Makes room for `size` more bytes of `entry`. False: even without the
++    // unread entries they would pass the byte limit.
++    auto reserve(Entry & entry, size_t size) -> bool
++    {
++        const std::scoped_lock lock(mutex);
++        if (stopping) {
++            return false;
++        }
++        if (totalBytes + size > limits.bytes) {
++            evictLocked(&entry, size);
++        }
++        if (totalBytes + size > limits.bytes) {
++            return false;
++        }
++        totalBytes += size;
++        return true;
++    }
++
++    static auto append(Entry & entry, std::string_view data) -> bool
++    {
++        auto const start = entry.state().written;
++        if (!pwriteAll(entry.file.get(), std::as_bytes(std::span(data)), start)) {
++            return false;
++        }
++        // The index: newlines before each stride mark this piece reaches.
++        std::vector<uint64_t> marks;
++        if (entry.marks == 0) {
++            marks.push_back(0);
++            entry.marks = 1;
++        }
++        auto pos = start;
++        auto rest = data;
++        while (!rest.empty()) {
++            auto const nextMark = entry.marks * entry.stride;
++            auto const take = static_cast<size_t>(std::min<uint64_t>(rest.size(), nextMark - pos));
++            entry.lines += static_cast<uint64_t>(std::ranges::count(rest.substr(0, take), '\n'));
++            pos += take;
++            rest.remove_prefix(take);
++            if (pos == nextMark) {
++                marks.push_back(entry.lines);
++                entry.marks++;
++            }
++        }
++        {
++            const std::scoped_lock lock(entry.mutex);
++            entry.index.insert(entry.index.end(), marks.begin(), marks.end());
++            entry.current.written = start + data.size();
++        }
++        entry.grown.notify_all();
++        return true;
++    }
++
++    void dropLocked(const Entry & entry)
++    {
++        if (auto const found = entries.find(entry.key); found != entries.end() && found->second.get() == &entry) {
++            totalBytes -= std::min(totalBytes, found->second->state().written);
++            entries.erase(found);
++        }
++    }
++
++    // Unread entries go, oldest read first, until there are at most
++    // `limits.entries` and `extra` more bytes of `growing` fit.
++    void evictLocked(const Entry * growing, size_t extra)
++    {
++        while (entries.size() > limits.entries || (growing != nullptr && totalBytes + extra > limits.bytes)) {
++            auto oldest = entries.end();
++            for (auto iter = entries.begin(); iter != entries.end(); ++iter) {
++                auto const & ent = *iter->second;
++                if (&ent == growing || ent.readers() > 0) {
++                    continue;
++                }
++                if (oldest == entries.end() || ent.lastRead < oldest->second->lastRead) {
++                    oldest = iter;
++                }
++            }
++            if (oldest == entries.end()) {
++                return;
++            }
++            totalBytes -= std::min(totalBytes, oldest->second->state().written);
++            entries.erase(oldest);
++        }
++    }
++
++    // Complete entries nobody read for `keep` go.
++    void sweepLocked()
++    {
++        auto const now = std::chrono::steady_clock::now().time_since_epoch().count();
++        auto const keep = std::chrono::duration_cast<std::chrono::steady_clock::duration>(limits.keep).count();
++        std::erase_if(entries, [&](const auto & item) -> bool {
++            auto const & ent = *item.second;
++            if (ent.readers() > 0 || !ent.state().complete || now - ent.lastRead < keep) {
++                return false;
++            }
++            totalBytes -= std::min(totalBytes, ent.state().written);
++            return true;
++        });
++    }
++
++    const Limits limits;
++    mutable std::mutex mutex;
++    std::map<std::string, std::shared_ptr<Entry>> entries;
++    // Keys whose decode passed `limits.bytes`, and when.
++    std::map<std::string, std::chrono::steady_clock::time_point> tooBig;
++    uint64_t totalBytes = 0;
++    bool stopping = false;
++    std::list<Worker> threads;
++};
++
++} // namespace nixgrpc
+diff --git a/src/daemon/log-spill.hh b/src/daemon/log-spill.hh
+index b28c0a6..e60c666 100644
+--- a/src/daemon/log-spill.hh
++++ b/src/daemon/log-spill.hh
+@@ -16,7 +16,9 @@
+ #include <cstdint>
+ #include <expected>
+ #include <filesystem>
++#include <memory>
+ #include <mutex>
++#include <optional>
+ #include <span>
+ #include <string>
+ #include <string_view>
+@@ -30,7 +32,9 @@
+ namespace nixgrpc {
+ 
+ // Same values as BuildEvent::Kind (build-log.hh), which main.cc asserts.
+-enum class SpillKind : std::uint8_t { line, phase };
++// A note is the daemon's own message, not build output: callers that attach
++// to a build see it, but it is not part of the build log.
++enum class SpillKind : std::uint8_t { line, phase, note };
+ 
+ class UniqueFd
+ {
+@@ -65,6 +69,42 @@ private:
+     int fd_ = -1;
+ };
+ 
++// Reads from `offset` until `out` is full, the file ends or a read fails.
++// Returns the bytes read.
++inline auto preadUpTo(int file, std::span<std::byte> out, std::size_t offset) -> std::size_t
++{
++    std::size_t done = 0;
++    while (done < out.size()) {
++        auto const rest = out.subspan(done);
++        auto const count = ::pread(file, rest.data(), rest.size(), static_cast<off_t>(offset + done));
++        if (count < 0 && errno == EINTR) {
++            continue;
++        }
++        if (count <= 0) {
++            break;
++        }
++        done += static_cast<std::size_t>(count);
++    }
++    return done;
++}
++
++// Writes all of `data` at `offset`. False when a write fails.
++inline auto pwriteAll(int file, std::span<const std::byte> data, std::size_t offset) -> bool
++{
++    while (!data.empty()) {
++        auto const count = ::pwrite(file, data.data(), data.size(), static_cast<off_t>(offset));
++        if (count < 0 && errno == EINTR) {
++            continue;
++        }
++        if (count <= 0) {
++            return false;
++        }
++        data = data.subspan(static_cast<std::size_t>(count));
++        offset += static_cast<std::size_t>(count);
++    }
++    return true;
++}
++
+ // The directory follows TMPDIR: /tmp is a size-limited tmpfs on NixOS.
+ // O_TMPFILE is Linux-only, and not every Linux filesystem has it, so fall
+ // back to create-then-unlink.
+@@ -91,17 +131,38 @@ inline auto openTempFile() -> std::expected<UniqueFd, std::error_code>
+     return {std::move(file)};
+ }
+ 
++// The records also have a rendering: the build log as Nix keeps it. A line
++// renders as its text and a newline, a phase as the line stdenv prints for
++// it, and a note as nothing. Rendered offsets index that text.
+ class LogSpill
+ {
+ public:
+-    // Past this the log stops growing and ends in a "truncated" record. The
+-    // record itself may overshoot by its own few bytes.
++    // Past this, in file bytes or in rendered bytes, the log stops growing
++    // and ends in a "truncated" record. The record itself may overshoot by
++    // its own few bytes.
+     static constexpr std::size_t kDefaultCap = std::size_t{64} << 20;
+     static constexpr std::size_t kMaxText = std::size_t{1} << 20;
+     static constexpr std::string_view kTruncated = "[log truncated by the worker]";
++    // stdenv's showPhaseHeader writes this to NIX_LOG_FD, and Nix keeps it.
++    static constexpr std::string_view kPhasePrefix = R"(@nix { "action": "setPhase", "phase": ")";
++    static constexpr std::string_view kPhaseSuffix = "\" }\n";
++    // One index entry per this many rendered bytes.
++    static constexpr std::size_t kStride = std::size_t{64} << 10U;
+ 
+     explicit LogSpill(std::size_t cap = kDefaultCap) noexcept : cap_(cap) {}
+ 
++    [[nodiscard]] static constexpr auto renderedLength(SpillKind kind, std::size_t textSize) noexcept -> std::size_t
++    {
++        switch (kind) {
++        case SpillKind::line:
++            return textSize + 1;
++        case SpillKind::phase:
++            return kPhasePrefix.size() + textSize + kPhaseSuffix.size();
++        default:
++            return 0;
++        }
++    }
++
+     // Owner only.
+     void append(SpillKind kind, std::string_view text)
+     {
+@@ -110,7 +171,8 @@ public:
+         }
+         text = text.substr(0, kMaxText);
+         auto const tail = written_.load(std::memory_order_relaxed);
+-        if (tail + kHeader + text.size() > cap_) {
++        auto const rendered = rendered_.load(std::memory_order_relaxed);
++        if (tail + kHeader + text.size() > cap_ || rendered + renderedLength(kind, text.size()) > cap_) {
+             ended_ = true; // the marker is the last record
+             kind = SpillKind::line;
+             text = kTruncated;
+@@ -122,6 +184,7 @@ public:
+                 return;
+             }
+             fd_ = std::move(*opened);
++            index_ = std::make_unique<std::array<IndexEntry, kIndexSize>>();
+         }
+         auto const len = std::bit_cast<std::array<std::byte, sizeof(std::uint32_t)>>(static_cast<std::uint32_t>(text.size()));
+         std::array<std::byte, kHeader> header{};
+@@ -131,13 +194,96 @@ public:
+             ended_ = true;
+             return;
+         }
+-        // Publishes fd_ and the bytes to readers.
++        // The first record at or after each stride mark. Both caps keep the
++        // count within the array.
++        if (rendered >= nextMark_ && indexed_ < kIndexSize) {
++            index_->at(indexed_) = {.file = tail, .rendered = rendered, .lines = lines_};
++            indexed_++;
++            indexedPublished_.store(indexed_, std::memory_order_relaxed);
++            nextMark_ = ((rendered / kStride) + 1) * kStride;
++        }
++        lines_ += kind == SpillKind::note ? 0 : 1;
++        rendered_.store(rendered + renderedLength(kind, text.size()), std::memory_order_release);
++        // Publishes fd_, the bytes and the index to readers.
+         written_.store(tail + kHeader + text.size(), std::memory_order_release);
+     }
+ 
+     // Bytes readable so far. A reader that has drained up to here is caught up.
+     [[nodiscard]] auto written() const noexcept -> std::size_t { return written_.load(std::memory_order_acquire); }
+ 
++    // Rendered bytes of what is readable so far.
++    [[nodiscard]] auto renderedSize() const noexcept -> std::size_t
++    {
++        return rendered_.load(std::memory_order_acquire);
++    }
++
++    // Feeds the rendering from rendered offset `from` to emit(string_view),
++    // at most `limit` bytes, in pieces. Returns the rendered offset reached.
++    // It starts from the index, so it reads at most one stride and one
++    // record before `from`.
++    template<typename Emit>
++    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters): an offset, then a length, as pread.
++    [[nodiscard]] auto drainRendered(std::size_t from, std::size_t limit, const Emit & emit) const -> std::size_t
++    {
++        std::size_t left = limit;
++        auto reached = from;
++        if (left == 0) {
++            return reached;
++        }
++        // Records come in order from one at or before `from`, so `pos` never
++        // passes `reached`.
++        (void) walk(from, [&](SpillKind kind, std::string_view text, std::size_t start) -> bool {
++            auto pos = start;
++            for (auto piece : render(kind, text)) {
++                auto const end = pos + piece.size();
++                if (end > reached) {
++                    piece.remove_prefix(reached - pos);
++                    piece = piece.substr(0, left);
++                    emit(piece);
++                    left -= piece.size();
++                    reached += piece.size();
++                    if (left == 0) {
++                        return false;
++                    }
++                }
++                pos = end;
++            }
++            return true;
++        });
++        return reached;
++    }
++
++    // Newlines in the rendering before rendered offset `from`.
++    [[nodiscard]] auto linesBefore(std::size_t from) const -> std::size_t
++    {
++        std::size_t lines = 0;
++        auto const counted = walk(from, [&](SpillKind kind, std::string_view text, std::size_t start) -> bool {
++            auto const end = start + renderedLength(kind, text.size());
++            if (end > from) {
++                return false; // its newline is its last byte, at or after `from`
++            }
++            lines += kind == SpillKind::note ? 0 : 1;
++            return true;
++        });
++        return counted + lines;
++    }
++
++    // The first line start at or after rendered offset `from`: every record
++    // renders whole lines, so that is the first record that starts there.
++    // renderedSize() when none does.
++    [[nodiscard]] auto lineStartAtOrAfter(std::size_t from) const -> std::size_t
++    {
++        std::optional<std::size_t> found;
++        (void) walk(from, [&](SpillKind kind, std::string_view text, std::size_t start) -> bool {
++            if (start >= from && renderedLength(kind, text.size()) > 0) {
++                found = start;
++                return false;
++            }
++            return true;
++        });
++        return found.value_or(renderedSize());
++    }
++
+     // Feeds every complete record at or after `offset` to emit(SpillKind,
+     // string_view) and returns the offset to resume from. A record that cannot
+     // be read is skipped along with everything after it.
+@@ -147,68 +293,122 @@ public:
+         auto const end = written();
+         std::string text;
+         while (offset < end) {
+-            std::array<std::byte, kHeader> header{};
+-            if (!readAt(header, offset)) {
+-                return end;
+-            }
+-            std::array<std::byte, sizeof(std::uint32_t)> raw{};
+-            std::ranges::copy(std::span(header).subspan<1>(), raw.begin());
+-            auto const len = std::bit_cast<std::uint32_t>(raw);
+-            auto const kind = std::to_integer<std::uint8_t>(header.front());
+-            if (len > kMaxText || kind > static_cast<std::uint8_t>(SpillKind::phase)) {
++            auto const kind = readRecord(offset, text);
++            if (!kind) {
+                 return end;
+             }
+-            text.resize(len);
+-            if (!readAt(std::as_writable_bytes(std::span(text)), offset + kHeader)) {
+-                return end;
+-            }
+-            emit(static_cast<SpillKind>(kind), std::string_view(text));
+-            offset += kHeader + len;
++            emit(*kind, std::string_view(text));
++            offset += kHeader + text.size();
+         }
+         return offset;
+     }
+ 
+ private:
+     static constexpr std::size_t kHeader = 1 + sizeof(std::uint32_t);
++    // Rendered bytes stay within the cap plus the marker, so this covers
++    // every stride mark up to 64 MiB.
++    static constexpr std::size_t kIndexSize = (kDefaultCap / kStride) + 1;
++
++    struct IndexEntry
++    {
++        std::size_t file = 0;
++        std::size_t rendered = 0;
++        std::size_t lines = 0;
++    };
+ 
+     using Opened = std::expected<UniqueFd, std::error_code>;
+ 
+-    [[nodiscard]] auto writeAt(std::span<const std::byte> data, std::size_t offset) const -> bool
++    // The pieces a record renders as. Views into `text` and constants.
++    static auto render(SpillKind kind, std::string_view text) -> std::array<std::string_view, 3>
+     {
+-        while (!data.empty()) {
+-            auto const count = ::pwrite(fd_.get(), data.data(), data.size(), static_cast<off_t>(offset));
+-            if (count < 0 && errno == EINTR) {
+-                continue;
+-            }
+-            if (count <= 0) {
+-                return false;
+-            }
+-            data = data.subspan(static_cast<std::size_t>(count));
+-            offset += static_cast<std::size_t>(count);
++        switch (kind) {
++        case SpillKind::line:
++            return {text, "\n", {}};
++        case SpillKind::phase:
++            return {kPhasePrefix, text, kPhaseSuffix};
++        default:
++            return {};
+         }
+-        return true;
+     }
+ 
+-    [[nodiscard]] auto readAt(std::span<std::byte> out, std::size_t offset) const -> bool
++    // Calls visit(kind, text, renderedStart) for each readable record from
++    // the last index entry at or before rendered offset `from`, until it
++    // returns false. Returns the newlines before the first record visited.
++    template<typename Visit>
++    [[nodiscard]] auto walk(std::size_t from, const Visit & visit) const -> std::size_t
+     {
+-        while (!out.empty()) {
+-            auto const count = ::pread(fd_.get(), out.data(), out.size(), static_cast<off_t>(offset));
+-            if (count < 0 && errno == EINTR) {
+-                continue;
++        auto const end = written();
++        IndexEntry start;
++        if (end == 0) {
++            return 0; // nothing published yet, nor the index with it
++        }
++        auto const count = std::min(indexedPublished_.load(std::memory_order_relaxed), kIndexSize);
++        if (count > 0) {
++            auto const entries = std::span(*index_).first(count);
++            auto const after = std::ranges::upper_bound(entries, from, {}, &IndexEntry::rendered);
++            if (after != entries.begin()) {
++                start = *std::prev(after);
+             }
+-            if (count <= 0) {
+-                return false;
++        }
++        auto offset = start.file;
++        auto rendered = start.rendered;
++        std::string text;
++        while (offset < end) {
++            auto const kind = readRecord(offset, text);
++            if (!kind || !visit(*kind, std::string_view(text), rendered)) {
++                break;
+             }
+-            out = out.subspan(static_cast<std::size_t>(count));
+-            offset += static_cast<std::size_t>(count);
++            rendered += renderedLength(*kind, text.size());
++            offset += kHeader + text.size();
++        }
++        return start.lines;
++    }
++
++    // The record at file offset `offset`, with its text in `text`. nullopt
++    // when it cannot be read or is not a record.
++    [[nodiscard]] auto readRecord(std::size_t offset, std::string & text) const -> std::optional<SpillKind>
++    {
++        std::array<std::byte, kHeader> header{};
++        if (!readAt(header, offset)) {
++            return std::nullopt;
++        }
++        std::array<std::byte, sizeof(std::uint32_t)> raw{};
++        std::ranges::copy(std::span(header).subspan<1>(), raw.begin());
++        auto const len = std::bit_cast<std::uint32_t>(raw);
++        auto const kind = std::to_integer<std::uint8_t>(header.front());
++        if (len > kMaxText || kind > static_cast<std::uint8_t>(SpillKind::note)) {
++            return std::nullopt;
++        }
++        text.resize(len);
++        if (!readAt(std::as_writable_bytes(std::span(text)), offset + kHeader)) {
++            return std::nullopt;
+         }
+-        return true;
++        return static_cast<SpillKind>(kind);
++    }
++
++    [[nodiscard]] auto writeAt(std::span<const std::byte> data, std::size_t offset) const -> bool
++    {
++        return pwriteAll(fd_.get(), data, offset);
++    }
++
++    [[nodiscard]] auto readAt(std::span<std::byte> out, std::size_t offset) const -> bool
++    {
++        return preadUpTo(fd_.get(), out, offset) == out.size();
+     }
+ 
+     std::size_t cap_;
+     UniqueFd fd_; // owner writes it before the first release store of written_
+     std::atomic<std::size_t> written_{0};
++    std::atomic<std::size_t> rendered_{0};
++    // Allocated with the file. Entries are written before the release store
++    // of written_ that covers them, and never change after.
++    std::unique_ptr<std::array<IndexEntry, kIndexSize>> index_;
++    std::atomic<std::size_t> indexedPublished_{0};
+     bool ended_ = false; // owner only: truncated, or the temp file failed
++    // Owner only.
++    std::size_t indexed_ = 0;
++    std::size_t nextMark_ = 0;
++    std::size_t lines_ = 0;
+ };
+ 
+ // A reader's side of the protocol: replay `spill` to emit(SpillKind, text) and
+diff --git a/src/daemon/main.cc b/src/daemon/main.cc
+index 4b02fa4..bc59a6c 100644
+--- a/src/daemon/main.cc
++++ b/src/daemon/main.cc
+@@ -9,8 +9,6 @@
+ #include <algorithm>
+ #include <array>
+ #include <atomic>
+-#include <cerrno>
+-#include <system_error>
+ #include <chrono>
+ #include <csignal>
+ #include <signal.h> // NOLINT(modernize-deprecated-headers): sigaction is POSIX, not in <csignal>
+@@ -39,8 +37,6 @@
+ 
+ #include <sys/socket.h>
+ 
+-#include <bzlib.h>
+-#include <unistd.h>
+ 
+ #include <grpc/impl/channel_arg_names.h>
+ #include <grpcpp/resource_quota.h>
+@@ -76,6 +72,7 @@
+ #include <nix/util/util.hh>
+ 
+ #include "build-log.hh"
++#include "build-log-service.hh"
+ #include "acl.hh"
+ #include "auth.hh"
+ #include "backend.hh"
+@@ -123,6 +120,7 @@ using nixgrpc::stopSignal;
+ 
+ static_assert(static_cast<int>(nixgrpc::SpillKind::line) == static_cast<int>(nixgrpc::BuildEvent::Kind::line));
+ static_assert(static_cast<int>(nixgrpc::SpillKind::phase) == static_cast<int>(nixgrpc::BuildEvent::Kind::phase));
++static_assert(static_cast<int>(nixgrpc::SpillKind::note) == static_cast<int>(nixgrpc::BuildEvent::Kind::note));
+ 
+ class NixRemoteService final : public nix::remote::NixRemote::Service
+ {
+@@ -133,6 +131,7 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
+     nixgrpc::Auth & auth;
+     nixgrpc::Backends backends;
+     nixgrpc::Coordinator & coord;
++    nixgrpc::BuildLogService buildLogs;
+ 
+     nixgrpc::LocalStore local;
+     nixgrpc::UploadClaims uploads;
+@@ -143,6 +142,15 @@ class NixRemoteService final : public nix::remote::NixRemote::Service
+     // Last: its thread uses the members above.
+     std::unique_ptr<nixgrpc::LogUploader> uploader;
+ 
++    auto logDir() -> std::optional<std::filesystem::path>
++    {
++        auto const localStore = local.shared();
++        if (const auto * const fsStore = dynamic_cast<const nix::LocalFSStore *>(&*localStore)) {
++            return fsStore->config.logDir.get();
++        }
++        return std::nullopt;
++    }
++
+     // Retryable on another worker or later: guarded() maps it to UNAVAILABLE.
+     struct Unavailable : nix::Error
+     {
+@@ -254,7 +262,7 @@ private:
+         if (auto const status = auth.authorize(caller, method, minRole, buildMode); !status.ok()) {
+             throw Denied{status};
+         }
+-        metrics.countRpc(std::string(method), caller.name);
++        metrics.countRpc(std::string(method), caller.watchRule.value_or(caller.name));
+         logDebug({{"event", "rpc_start"}, {"method", std::string(method)}, {"cn", caller.name}, {"peer", context.peer()}});
+         return Rpc{.context = &context, .method = method, .caller = std::move(caller)};
+     }
+@@ -286,6 +294,7 @@ public:
+         nixgrpc::LogLevel logLevel,
+         nixgrpc::Auth & auth,
+         nixgrpc::Coordinator & coord,
++        const std::string & advertise,
+         std::string buildLogStore)
+         : workerName(std::move(workerName))
+         , metrics(metrics)
+@@ -296,13 +305,15 @@ public:
+               .socketPath = std::move(socketPath),
+               .activities = coord.tally != nullptr ? coord.tally->activitySink() : nixgrpc::ActivitySink{}}
+         , coord(coord)
++        , buildLogs({.advertise = advertise}, metrics, coord.builder ? &*coord.builder : nullptr)
+         , local(std::move(storeUri))
+         , logStoreUrl(std::move(buildLogStore))
+     {
+         if (!logStoreUrl.empty() && coord.builder) {
+             uploader = std::make_unique<nixgrpc::LogUploader>(
+                 [this](const std::string & drv, uint64_t limit) -> std::optional<std::string> {
+-                    return readKeptLog(nix::StorePath(drv), limit);
++                    auto const dir = logDir();
++                    return dir ? nixgrpc::readKeptLog(*dir, drv, limit) : std::nullopt;
+                 },
+                 [this](const std::string & drv, std::string_view log) -> void { addToLogStore(drv, log); },
+                 metrics);
+@@ -582,125 +593,24 @@ public:
+         });
+     }
+ 
+-    // Finds the log like LocalFSStore::getBuildLogExact, but streams it
+-    // instead of loading it whole: a small .bz2 can expand to gigabytes.
++    // The build log of a derivation on this node, from its spill while it
++    // builds here, else from the file nix kept (build-log-service.hh).
+     auto GetBuildLog(
+         grpc::ServerContext * context,
+         const nix::remote::GetBuildLogRequest * request,
+         BuildLogWriter * writer) -> grpc::Status override
+     {
+         return guarded([&] -> grpc::Status {
+-            auto const rpc = begin(*context, "GetBuildLog", nixgrpc::Role::readOnly);
+-            std::optional<nix::StorePath> drvPath;
+-            try {
+-                drvPath.emplace(request->drv_path());
+-            } catch (nix::BadStorePath & err) {
+-                return {grpc::StatusCode::INVALID_ARGUMENT, err.what()};
+-            }
+-            auto const localStore = local.shared();
+-            auto * const fsStore = dynamic_cast<nix::LocalFSStore *>(&*localStore);
+-            if (fsStore == nullptr) {
+-                return {grpc::StatusCode::UNIMPLEMENTED, "the store behind this daemon keeps no build logs"};
+-            }
+-            auto const kept = openKeptLog(*fsStore, *drvPath);
+-            if (!kept) {
+-                // Not a SysError: guarded() would treat ENOENT as a lost nix-daemon.
+-                return {grpc::StatusCode::INTERNAL, kept.error()};
+-            }
+-            auto const & found = *kept;
+-            if (!found) {
+-                return {grpc::StatusCode::NOT_FOUND, "no build log of " + request->drv_path()};
+-            }
+-            auto const & log = *found;
+-            try {
+-                nixgrpc::ZstdWriterSink<BuildLogWriter, nix::remote::GetBuildLogChunk> sink(*writer);
+-                if (!log.compressed) {
+-                    nix::FdSource(log.file.get()).drainInto(sink);
+-                } else if (!bunzip2(log.file.get(), sink)) {
+-                    // Part of the log may be sent already, so no fallback to the next file.
+-                    return {grpc::StatusCode::DATA_LOSS, log.path.string() + " does not decompress"};
+-                }
+-                sink.finish();
+-            } catch (nixgrpc::StreamClosed &) {
+-                return {grpc::StatusCode::CANCELLED, "the client went away"};
+-            }
+-            rpc.done({{"drv", request->drv_path()}});
+-            return grpc::Status::OK;
+-        });
+-    }
+-
+-    struct KeptLog
+-    {
+-        nix::AutoCloseFD file;
+-        std::filesystem::path path;
+-        bool compressed = false;
+-    };
+-
+-    // The file Nix kept the log of `drvPath` in, found like
+-    // LocalFSStore::getBuildLogExact, and opened. nullopt: there is none. The
+-    // error names a file that exists but cannot be opened.
+-    static auto openKeptLog(const nix::LocalFSStore & fsStore, const nix::StorePath & drvPath)
+-        -> std::expected<std::optional<KeptLog>, std::string>
+-    {
+-        auto const base = std::string(drvPath.to_string());
+-        for (auto const & rel : {nix::LocalFSStore::drvsLogDir / base.substr(0, 2) / base.substr(2),
+-                                 nix::LocalFSStore::drvsLogDir / base}) {
+-            auto const plain = fsStore.config.logDir.get() / rel;
+-            auto bz2 = plain;
+-            bz2 += ".bz2";
+-            bool const compressed = !nix::pathExists(plain);
+-            auto path = compressed ? bz2 : plain;
+-            auto file = nix::openFileReadonly(path);
+-            if (!file) {
+-                auto const err = errno;
+-                if (compressed && err == ENOENT) {
+-                    continue;
+-                }
+-                return std::unexpected("cannot open " + path.string() + ": " + std::system_category().message(err));
+-            }
+-            return KeptLog{.file = std::move(file), .path = std::move(path), .compressed = compressed};
+-        }
+-        return std::nullopt;
+-    }
+-
+-    // The log Nix kept for `drvPath`, decoded, cut after `limit` bytes and
+-    // one more, so the uploader can tell a larger log. nullopt: there is none.
+-    auto readKeptLog(const nix::StorePath & drvPath, uint64_t limit) -> std::optional<std::string>
+-    {
+-        auto const localStore = local.shared();
+-        auto const * const fsStore = dynamic_cast<const nix::LocalFSStore *>(&*localStore);
+-        if (fsStore == nullptr) {
+-            return std::nullopt;
+-        }
+-        auto const kept = openKeptLog(*fsStore, drvPath);
+-        if (!kept) {
+-            throw nix::Error("%s", kept.error());
+-        }
+-        auto const & found = *kept;
+-        if (!found) {
+-            return std::nullopt;
+-        }
+-        auto const & log = *found;
+-        struct Full : std::exception
+-        {
+-        };
+-        std::string text;
+-        nix::LambdaSink sink([&](std::string_view data) -> void {
+-            text.append(data.substr(0, static_cast<size_t>(std::min<uint64_t>(data.size(), limit + 1 - text.size()))));
+-            if (text.size() > limit) {
+-                throw Full();
+-            }
++            auto const rpc = begin(*context, "GetBuildLog", nixgrpc::Role::watch);
++            auto const served = buildLogs.serve(*context, rpc.caller, *request, *writer, logDir());
++            rpc.done(
++                {{"drv", request->drv_path()},
++                 {"source", std::string(served.source)},
++                 {"offset", std::to_string(served.offset)},
++                 {"bytes", std::to_string(served.bytes)},
++                 {"code", std::to_string(served.status.error_code())}});
++            return served.status;
+         });
+-        try {
+-            if (!log.compressed) {
+-                nix::FdSource(log.file.get()).drainInto(sink);
+-            } else if (!bunzip2(log.file.get(), sink)) {
+-                throw nix::Error("%s does not decompress", log.path.string());
+-            }
+-        } catch (Full &) {
+-            return text; // too large, and the caller can tell
+-        }
+-        return text;
+     }
+ 
+     // Called on the uploader's thread only.
+@@ -716,68 +626,6 @@ public:
+         logs->addBuildLog(nix::StorePath(drv), log);
+     }
+ 
+-    // Reads into `buf`, retrying on EINTR. 0 at end of file.
+-    static auto readSome(int logFd, std::span<char> buf) -> size_t
+-    {
+-        for (;;) {
+-            auto const got = ::read(logFd, buf.data(), buf.size());
+-            if (got >= 0) {
+-                return static_cast<size_t>(got);
+-            }
+-            if (errno != EINTR) {
+-                // Not a SysError, see GetBuildLog.
+-                throw nix::Error("reading build log: %s", std::system_category().message(errno));
+-            }
+-        }
+-    }
+-
+-    // Decompresses the concatenated bzip2 streams in `logFd` into `out`.
+-    // Returns false on corrupt data. Like libarchive in nix, an empty file is
+-    // an empty log and trailing garbage is ignored.
+-    static auto bunzip2(int logFd, nix::Sink & out) -> bool
+-    {
+-        static constexpr size_t bufSize = 64 << 10;
+-        static constexpr unsigned bidBytes = 14; // libarchive's bzip2 bid
+-        std::vector<char> input(bufSize);
+-        std::vector<char> output(bufSize);
+-        bz_stream strm{};
+-        std::unique_ptr<bz_stream, decltype(&BZ2_bzDecompressEnd)> decoder(nullptr, &BZ2_bzDecompressEnd);
+-        bool ended = false;
+-        auto const trailingGarbage = [&] -> bool {
+-            return ended && strm.total_in_hi32 == 0 && strm.total_in_lo32 < bidBytes;
+-        };
+-        for (;;) {
+-            if (strm.avail_in == 0) {
+-                auto const got = readSome(logFd, input);
+-                if (got == 0) {
+-                    return !decoder || trailingGarbage();
+-                }
+-                strm.next_in = input.data();
+-                strm.avail_in = static_cast<unsigned>(got);
+-            }
+-            if (!decoder) {
+-                if (auto const ret = BZ2_bzDecompressInit(&strm, 0, 0); ret != BZ_OK) {
+-                    throw nix::Error("BZ2_bzDecompressInit failed: %d", ret);
+-                }
+-                decoder.reset(&strm);
+-            }
+-            strm.next_out = output.data();
+-            strm.avail_out = static_cast<unsigned>(output.size());
+-            auto const ret = BZ2_bzDecompress(&strm);
+-            if (ret == BZ_DATA_ERROR || ret == BZ_DATA_ERROR_MAGIC) {
+-                return trailingGarbage();
+-            }
+-            if (ret != BZ_OK && ret != BZ_STREAM_END) {
+-                throw nix::Error("BZ2_bzDecompress failed: %d", ret);
+-            }
+-            out({output.data(), output.size() - strm.avail_out});
+-            if (ret == BZ_STREAM_END) {
+-                decoder.reset();
+-                ended = true;
+-            }
+-        }
+-    }
+-
+     // Outputs built on another node live only in the cache. Clients read them back through us.
+     void substituteIfRemote(nix::Store & store, const nix::StorePath & path) const
+     {
+@@ -1094,9 +942,12 @@ public:
+             roots->addTempRoot(path);
+         }
+         nix::BuildResult res;
+-        log({.text = workerName + ": building " + std::string(drvPath.to_string())});
++        log({.kind = nixgrpc::BuildEvent::Kind::note, .text = workerName + ": building " + std::string(drvPath.to_string())});
+         try {
+             phase.next("build");
++            shared.startedMs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
++                                                         std::chrono::system_clock::now().time_since_epoch())
++                                                         .count());
+             nixgrpc::Metrics::Held const building(metrics, "build_slot");
+             res = backends.storedBuild(cancelled, localStore, drvPath, mode, limits, log);
+             phase.done();
+@@ -1462,7 +1313,7 @@ try {
+          {"max_jobs", std::to_string(options.maxJobs)}});
+     NixRemoteService service(
+         options.socketPath, options.storeUri, options.workerName, metrics, idle, options.logLevel, auth, coord,
+-        options.buildLogStore);
++        options.advertise, options.buildLogStore);
+ 
+     grpc::EnableDefaultHealthCheckService(true);
+     grpc::ServerBuilder builder;
+diff --git a/src/daemon/metrics.hh b/src/daemon/metrics.hh
+index 01f7a4b..21ad878 100644
+--- a/src/daemon/metrics.hh
++++ b/src/daemon/metrics.hh
+@@ -148,6 +148,21 @@ class Metrics
+              .Name("nix_grpc_sched_failures_total")
+              .Help("Failed builds the scheduler heard of, by Nix BuildResult status, WorkerError or unreported")
+              .Register(*registry);
++    prometheus::Family<prometheus::Counter> * buildLogCalls =
++        &prometheus::BuildCounter()
++             .Name("nix_grpc_build_log_calls_total")
++             .Help("GetBuildLog calls, by where the log came from and the gRPC status code")
++             .Register(*registry);
++    prometheus::Family<prometheus::Counter> * buildLogBytesFam =
++        &prometheus::BuildCounter()
++             .Name("nix_grpc_build_log_bytes_total")
++             .Help("Decoded build log bytes GetBuildLog sent, by where they came from")
++             .Register(*registry);
++    prometheus::Gauge * buildLogStreamsGauge = &prometheus::BuildGauge()
++                                                    .Name("nix_grpc_build_log_streams")
++                                                    .Help("GetBuildLog calls following a running build now")
++                                                    .Register(*registry)
++                                                    .Add({});
+     prometheus::Family<prometheus::Counter> * buildLogUploads =
+         &prometheus::BuildCounter()
+              .Name("nix_grpc_build_log_uploads_total")
+@@ -231,6 +246,11 @@ public:
+         {
+             gauge->Increment();
+         }
++        explicit Held(prometheus::Gauge & counted)
++            : gauge(&counted)
++        {
++            gauge->Increment();
++        }
+         Held(const Held &) = delete;
+         Held(Held &&) = delete;
+         auto operator=(const Held &) -> Held & = delete;
+@@ -241,6 +261,22 @@ public:
+         }
+     };
+ 
++    // One open GetBuildLog follow call, while the result lives.
++    [[nodiscard]] auto buildLogStream() -> Held
++    {
++        return Held(*buildLogStreamsGauge);
++    }
++
++    // `code`: the call's grpc::StatusCode.
++    void buildLogCall(std::string_view source, int code)
++    {
++        buildLogCalls->Add({{"source", std::string(source)}, {"code", std::to_string(code)}}).Increment();
++    }
++    void buildLogBytes(std::string_view source, uint64_t bytes)
++    {
++        buildLogBytesFam->Add({{"source", std::string(source)}}).Increment(static_cast<double>(bytes));
++    }
++
+     auto inflightNow(const std::string & kind) -> double
+     {
+         return inflight->Add({{"kind", kind}}).Value();
+diff --git a/tests/acl-test.cc b/tests/acl-test.cc
+index 7e1bc4a..06c455c 100644
+--- a/tests/acl-test.cc
++++ b/tests/acl-test.cc
+@@ -6,6 +6,7 @@
+ #include <iostream>
+ #include <optional>
+ #include <string>
++#include <string_view>
+ 
+ #include <nix/util/error.hh>
+ 
+@@ -70,15 +71,32 @@ void run()
+     for (const auto & row : rows) {
+         assert(acl(row.cfg).roleFor(row.cn) == row.role);
+     }
++    // Metrics count a caller that a rule lets only watch under the rule's
++    // pattern, so the viewers a proxy names one by one share one series.
++    Acl rules;
++    rules.addRule("dash-*=watch");
++    rules.addRule("ci-*=trusted");
++    rules.addRule("*=watch");
++    assert(rules.watchPattern("dash-user-42") == "dash-*");
++    assert(rules.watchPattern("dash-anon-10.0.0.7") == "dash-*");
++    assert(rules.watchPattern("dev") == "*");
++    assert(rules.watchPattern("ci-1") == std::nullopt);
++    assert(rules.watchPattern(std::string("dash-1\0x", 8)) == std::nullopt);
++    assert(rules.watchPattern(std::nullopt) == std::nullopt);
++    assert(Acl().watchPattern("dev") == std::nullopt);
+     // watch is below read-only, so every existing RPC refuses it.
+     assert(nixgrpc::parseRole("watch") == Role::watch && nixgrpc::roleName(Role::watch) == "watch");
+     assert(Role::watch < Role::readOnly);
+-    // Anonymous callers can never watch, so that role would grant nothing.
++    // Build logs (GetBuildLog) need only watch: a watcher reads them, and
++    // every role above it does too.
++    assert(Role::watch <= Role::watch && Role::watch < Role::write);
++    // Anonymous callers can never watch, so that role would grant them build
++    // logs only. Acl refuses it, and the message says what to use instead.
+     bool refused = false;
+     try {
+         Acl().allowAnonymous(Role::watch);
+-    } catch (nix::Error &) {
+-        refused = true;
++    } catch (nix::Error & err) {
++        refused = std::string_view(err.what()).contains("grants only build logs; use read-only");
+     }
+     assert(refused);
+ }
+diff --git a/tests/build-log-test.cc b/tests/build-log-test.cc
+index f016c91..6629bb3 100644
+--- a/tests/build-log-test.cc
++++ b/tests/build-log-test.cc
+@@ -13,7 +13,9 @@
+ #include <nix/util/logging.hh>
+ #include <nix/util/serialise.hh>
+ 
++#include "backend.hh"
+ #include "build-log.hh"
++#include "nix_remote.pb.h"
+ 
+ // NOLINTBEGIN(*-magic-numbers): test vectors.
+ namespace {
+@@ -71,6 +73,28 @@ void activitiesReachTheCallback()
+     assert(events.empty() && (lines == std::vector<std::string>{"a line"}));
+ }
+ 
++// The daemon's own messages are notes: a BuildDerivation client still gets
++// them as log lines, but the build log leaves them out.
++void stderrNextRelaysAsANote()
++{
++    nix::StringSink sink;
++    sink << STDERR_NEXT << "warning: from the daemon\n";
++    sink << STDERR_RESULT << uint64_t{8} << uint64_t{nix::resBuildLogLine} << uint64_t{1} << uint64_t{1} << "built";
++    sink << STDERR_RESULT << uint64_t{8} << uint64_t{nix::resSetPhase} << uint64_t{1} << uint64_t{1} << "buildPhase";
++    sink << STDERR_LAST;
++    nix::StringSource source(sink.s);
++    std::vector<nixgrpc::BuildEvent> events;
++    nixgrpc::relayBuildLog(source, [&](nixgrpc::BuildEvent event) -> void { events.push_back(std::move(event)); });
++    using Kind = nixgrpc::BuildEvent::Kind;
++    assert(events.size() == 3);
++    assert(events.at(0).kind == Kind::note && events.at(0).text == "warning: from the daemon");
++    assert(events.at(1).kind == Kind::line && events.at(2).kind == Kind::phase);
++    auto const note = nixgrpc::toChunk<nix::remote::BuildDerivationChunk>(events.at(0));
++    assert(note.log_line() == "warning: from the daemon" && note.phase().empty());
++    auto const phase = nixgrpc::toChunk<nix::remote::BuildDerivationChunk>(events.at(2));
++    assert(phase.phase() == "buildPhase" && phase.log_line().empty());
++}
++
+ } // namespace
+ // NOLINTEND(*-magic-numbers)
+ 
+@@ -79,6 +103,7 @@ auto main() -> int
+     try {
+         longLinesAreCut();
+         activitiesReachTheCallback();
++        stderrNextRelaysAsANote();
+     } catch (std::exception & err) {
+         std::cerr << "error: " << err.what() << "\n";
+         return 1;
+diff --git a/tests/builder-log-test.cc b/tests/builder-log-test.cc
+new file mode 100644
+index 0000000..ecf8a9e
+--- /dev/null
++++ b/tests/builder-log-test.cc
+@@ -0,0 +1,235 @@
++// The builder's Expect table as GetBuildLog sees it: followers wake when an
++// Expect leaves without finishing, keptBy names the build that wrote Nix's
++// kept log, and that log is served until a new build of it starts.
++
++#include <cassert>
++#include <chrono>
++#include <csignal>
++#include <cstdint>
++#include <exception>
++#include <filesystem>
++#include <fstream>
++#include <functional>
++#include <iostream>
++#include <mutex>
++#include <string>
++#include <thread>
++#include <vector>
++
++#include <stdlib.h> // NOLINT(modernize-deprecated-headers): mkdtemp is POSIX.
++
++#include <grpcpp/impl/call_op_set.h>
++#include <grpcpp/server_context.h>
++#include <grpcpp/support/status.h>
++
++#include <nix/store/globals.hh>
++
++#include "acl.hh"
++#include "auth.hh"
++#include "backend.hh"
++#include "build-log-service.hh"
++#include "builder.hh"
++#include "metrics.hh"
++#include "nix_remote.pb.h"
++
++// NOLINTBEGIN(*-magic-numbers): assignment ids and waits.
++namespace {
++
++using nixgrpc::Builder;
++using nix::remote::WorkerMsg;
++
++constexpr auto advertise = "10.0.0.1:50051";
++
++auto config() -> Builder::Config
++{
++    return {.advertise = advertise, .systems = {"x86_64-linux"}, .features = {}, .maxJobs = 1};
++}
++
++// Sent messages, for the tests that look at them.
++struct Sent
++{
++    std::mutex mutex;
++    std::vector<WorkerMsg> msgs;
++
++    auto send() -> Builder::SendFn
++    {
++        return [this](const WorkerMsg & msg) -> bool {
++            const std::scoped_lock lock(mutex);
++            msgs.push_back(msg);
++            return true;
++        };
++    }
++};
++
++void expect(Builder & builder, const std::string & drv, uint64_t assignId)
++{
++    nix::remote::Expect exp;
++    exp.set_drv_path(drv);
++    exp.set_assign_id(assignId);
++    builder.onExpect(exp);
++}
++
++// Waits on the Expect's condition variable as a follower does, without a
++// poll of its own, and says how long until the entry was gone.
++auto wokenAfter(Builder & builder, const std::string & drv, const std::function<void()> & act) -> std::chrono::milliseconds
++{
++    auto const run = builder.running(drv);
++    assert(run);
++    auto & shared = *run->shared;
++    auto const start = std::chrono::steady_clock::now();
++    std::thread actor([&] -> void {
++        std::this_thread::sleep_for(std::chrono::milliseconds(100));
++        act();
++    });
++    {
++        std::unique_lock lock(shared.mutex);
++        shared.cv.wait_for(lock, std::chrono::seconds(10), [&] -> bool { return !builder.running(drv); });
++    }
++    actor.join();
++    assert(!builder.running(drv));
++    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start);
++}
++
++void aRevokeBeforeStartWakesAFollower(nixgrpc::Metrics & metrics)
++{
++    Sent sent;
++    Builder builder(config(), metrics);
++    builder.setSend(sent.send());
++    expect(builder, "aaa-x.drv", 7);
++    nix::remote::Revoke rev;
++    rev.set_drv_path("aaa-x.drv");
++    auto const took = wokenAfter(builder, "aaa-x.drv", [&] -> void { builder.onRevoke(rev); });
++    assert(took < std::chrono::seconds(2));
++}
++
++void aGiveBackOnDrainWakesAFollower(nixgrpc::Metrics & metrics)
++{
++    Sent sent;
++    Builder builder(config(), metrics);
++    builder.setSend(sent.send());
++    assert(builder.greet());
++    expect(builder, "bbb-y.drv", 8);
++    auto const took =
++        wokenAfter(builder, "bbb-y.drv", [&] -> void { builder.setUnavailable(Builder::Unavailable::stopping, true); });
++    assert(took < std::chrono::seconds(2));
++    const std::scoped_lock lock(sent.mutex);
++    bool gaveBack = false;
++    for (const auto & msg : sent.msgs) {
++        gaveBack = gaveBack || (msg.has_done() && msg.done().drv_path() == "bbb-y.drv");
++    }
++    assert(gaveBack);
++}
++
++// A GetBuildLog stream that keeps what it is sent.
++struct Chunks final : nixgrpc::BuildLogStream
++{
++    std::vector<nix::remote::GetBuildLogChunk> msgs;
++
++    void SendInitialMetadata() override {}
++    auto Write(const nix::remote::GetBuildLogChunk & msg, grpc::WriteOptions /*options*/) -> bool override
++    {
++        msgs.push_back(msg);
++        return true;
++    }
++};
++
++// Nix replaces the kept log when a new build of the derivation starts, not
++// when it is assigned here, which can be a minute or more earlier.
++void theKeptLogStaysUntilTheBuildStarts(nixgrpc::Metrics & metrics)
++{
++    std::string const drv = "00000000000000000000000000000000-logged.drv";
++    std::string dir = (std::filesystem::temp_directory_path() / "builder-test-XXXXXX").string();
++    assert(::mkdtemp(dir.data()) != nullptr);
++    std::filesystem::path const logDir = dir;
++    auto const kept = logDir / "drvs" / drv.substr(0, 2) / drv.substr(2);
++    std::filesystem::create_directories(kept.parent_path());
++    std::string const lastLog = "the last build\n";
++    std::ofstream(kept) << lastLog;
++
++    Builder builder(config(), metrics);
++    nixgrpc::BuildLogService service({.advertise = advertise}, metrics, &builder);
++    using Source = nix::remote::BuildLogInfo;
++    struct Got
++    {
++        grpc::Status status;
++        std::vector<nix::remote::GetBuildLogChunk> msgs;
++    };
++    auto const get = [&](uint64_t assignId) -> Got {
++        grpc::ServerContext context;
++        Chunks chunks;
++        nix::remote::GetBuildLogRequest request;
++        request.set_drv_path(drv);
++        request.set_assign_id(assignId);
++        nixgrpc::Caller const caller{
++            .name = "viewer", .role = nixgrpc::Role::watch, .kind = nixgrpc::Caller::Kind::named};
++        auto const served = service.serve(context, caller, request, chunks, logDir);
++        return {.status = served.status, .msgs = chunks.msgs};
++    };
++    auto const keptLog = [&](uint64_t assignId) -> bool {
++        auto const got = get(assignId);
++        return got.status.ok() && !got.msgs.empty() && got.msgs.front().info().source() == Source::SOURCE_KEPT
++               && got.msgs.front().info().size() == lastLog.size();
++    };
++    auto const live = [&](uint64_t assignId) -> bool {
++        auto const got = get(assignId);
++        return got.status.ok() && !got.msgs.empty() && got.msgs.front().info().source() == Source::SOURCE_LIVE;
++    };
++
++    expect(builder, drv, 22);
++    assert(keptLog(0) && keptLog(21) && live(22));
++    auto adm = builder.admit(drv);
++    assert(adm);
++    assert(keptLog(0) && keptLog(21) && live(22));
++    adm->shared->startedMs = 1;
++    assert(live(0) && live(22));
++    assert(get(21).status.error_code() == grpc::StatusCode::NOT_FOUND);
++    builder.finished(drv, nix::remote::Done::FAILED, {}, "");
++    std::filesystem::remove_all(logDir);
++}
++
++void keptByNamesTheLastBuildOfADerivation(nixgrpc::Metrics & metrics)
++{
++    Sent sent;
++    Builder builder(config(), metrics);
++    builder.setSend(sent.send());
++    auto const build = [&](uint64_t assignId, bool started) -> void {
++        expect(builder, "ccc-z.drv", assignId);
++        auto adm = builder.admit("ccc-z.drv");
++        assert(adm && adm->assignId == assignId);
++        if (started) {
++            adm->shared->startedMs = 1;
++        }
++        builder.finished("ccc-z.drv", nix::remote::Done::FAILED, {}, "");
++    };
++    assert(builder.keptBy("ccc-z.drv") == 0);
++    build(11, true);
++    assert(builder.keptBy("ccc-z.drv") == 11);
++    build(12, true);
++    assert(builder.keptBy("ccc-z.drv") == 12);
++    // A build that never started wrote no log.
++    build(13, false);
++    assert(builder.keptBy("ccc-z.drv") == 12);
++    assert(builder.keptBy("ddd-other.drv") == 0);
++}
++
++} // namespace
++// NOLINTEND(*-magic-numbers)
++
++// What the daemon's signal handler sets; the build log service reads it.
++volatile std::sig_atomic_t nixgrpc::stopSignal = 0; // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
++
++auto main() -> int
++{
++    try {
++        nix::initLibStore(false);
++        nixgrpc::Metrics metrics("");
++        aRevokeBeforeStartWakesAFollower(metrics);
++        aGiveBackOnDrainWakesAFollower(metrics);
++        theKeptLogStaysUntilTheBuildStarts(metrics);
++        keptByNamesTheLastBuildOfADerivation(metrics);
++    } catch (std::exception & err) {
++        std::cerr << "error: " << err.what() << "\n";
++        return 1;
++    }
++    return 0;
++}
+diff --git a/tests/e2e/transfer.rs b/tests/e2e/transfer.rs
+index 925b6da..f2bd643 100644
+--- a/tests/e2e/transfer.rs
++++ b/tests/e2e/transfer.rs
+@@ -1,7 +1,8 @@
++use std::collections::HashMap;
+ use std::time::Instant;
+ 
+ use crate::fixtures::*;
+-use crate::harness::{MACHINE, metrics, retry};
++use crate::harness::{MACHINE, metrics, retry, sleep};
+ 
+ #[test]
+ fn add_path_and_read_it_back_locally() {
+@@ -305,47 +306,447 @@ fn add_path_through_envoy() {
+     assert_journal("nix-grpc-daemon", "event=rpc method=Connect");
+ }
+ 
+-/// Writes /tmp/{name}.nix, a derivation that runs `script` with coreutils,
+-/// and returns its .drv path.
++// ---- GetBuildLog: offsets, follow, assignments and limits ----------------
++
++/// What `ngs-build-log` (tests/lib/build-log.py) printed: the status, the
++/// node that answered, the info fields and the timings, by name.
++pub(crate) struct LogAnswer(pub HashMap<String, String>);
++
++impl LogAnswer {
++    pub(crate) fn get(&self, key: &str) -> &str {
++        self.0.get(key).map_or("", String::as_str)
++    }
++
++    pub(crate) fn num(&self, key: &str) -> u64 {
++        self.get(key).parse().unwrap_or(0)
++    }
++
++    pub(crate) fn code(&self) -> u64 {
++        self.get("code").parse().unwrap_or(u64::MAX)
++    }
++}
++
++impl std::fmt::Debug for LogAnswer {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        let mut keys: Vec<_> = self.0.iter().collect();
++        keys.sort();
++        write!(f, "{keys:?}")
++    }
++}
++
++pub(crate) fn parse_log_answer(out: &str) -> LogAnswer {
++    LogAnswer(
++        out.lines()
++            .filter_map(|line| line.split_once('='))
++            .map(|(key, value)| (key.to_string(), value.to_string()))
++            .collect(),
++    )
++}
++
++/// One GetBuildLog call on the machine.
++fn build_log(args: &[&str]) -> LogAnswer {
++    let mut argv = vec!["ngs-build-log"];
++    argv.extend(args);
++    parse_log_answer(&succeed(&argv))
++}
++
++/// The mTLS daemon on 50052, as the client certificate `name`.
++fn tls_args(name: &str) -> Vec<String> {
++    let d = cert_dir();
++    vec![
++        "--url".into(),
++        "https://localhost:50052".into(),
++        format!("--curl=--cacert={d}/ca.pem"),
++        format!("--curl=--cert={d}/{name}.pem"),
++        format!("--curl=--key={d}/{name}.key"),
++    ]
++}
++
++fn strs(args: &[String]) -> Vec<&str> {
++    args.iter().map(String::as_str).collect()
++}
++
++/// A derivation that runs `script` with coreutils on PATH, under a name no
++/// other test uses. Returns the .drv file's base name.
+ fn log_drv(name: &str, script: &str) -> String {
+     let file = format!("/tmp/{name}.nix");
++    let script = script.replace('\\', "\\\\").replace('"', "\\\"").replace('$', "\\$");
+     write_file(
+         &file,
+         &format!(r#"import /etc/log-drv.nix {{ name = "{name}"; script = "{script}"; }}"#),
+     );
+-    succeed(&["nix-instantiate", &file]).trim().to_string()
++    let drv = succeed(&["nix-instantiate", &file]);
++    drv.trim().rsplit('/').next().unwrap().to_string()
+ }
+ 
+-fn build_ok(store: &str, name: &str) -> bool {
++fn build_in_background(store: &str, name: &str) {
++    let file = format!("/tmp/{name}.nix");
++    succeed(&[
++        "sh",
++        "-c",
++        r#"setsid -f nix build --store "$1" --impure -f "$2" --no-link > "/tmp/$3.build" 2>&1 < /dev/null"#,
++        "sh",
++        store,
++        &file,
++        name,
++    ]);
++}
++
++fn build_now(store: &str, name: &str) -> bool {
+     let file = format!("/tmp/{name}.nix");
+     run_t(
+-        &[
+-            "nix",
+-            "build",
+-            "--store",
+-            store,
+-            "--impure",
+-            "-f",
+-            &file,
+-            "--no-link",
+-        ],
++        &["nix", "build", "--store", store, "--impure", "-f", &file, "--no-link"],
+         300,
+     )
+     .code
+         == 0
+ }
+ 
++/// The kept log's path for `base`, without the .bz2.
++fn kept_path(base: &str) -> String {
++    format!("/nix/var/log/nix/drvs/{}/{}", &base[..2], &base[2..])
++}
++
++/// Follows `base` until a call reaches the running build (earlier calls
++/// find nothing yet), then until it ends.
++fn follow(base: &str, extra: &[&str]) -> LogAnswer {
++    let mut answer = None;
++    retry(120, &format!("a follow call of {base} reaches the build"), || {
++        let mut args = vec![base];
++        if !extra.contains(&"--follow") {
++            args.push("--follow");
++        }
++        args.extend(extra);
++        let got = build_log(&args);
++        let live = got.code() == 0 && got.get("source") == "live";
++        if live {
++            answer = Some(got);
++        }
++        live
++    });
++    answer.unwrap()
++}
++
++fn same_bytes(left: &str, right: &str) {
++    succeed(&["cmp", left, right]);
++}
++
++/// Offsets, limits and tails on a kept log, .bz2 then plain, against the
++/// whole log.
++#[test]
++fn build_log_offsets_limits_and_tails() {
++    let base = log_drv(
++        "offsets-grpc",
++        "i=0; while [ $i -lt 3000 ]; do echo line $i of a log with some width; i=$((i+1)); done; echo > $out",
++    );
++    assert!(build_now(STORE, "offsets-grpc"));
++    let kept = kept_path(&base);
++    succeed(&["sh", "-c", r#"bzcat "$1.bz2" > /tmp/offsets.want"#, "sh", &kept]);
++    let size: u64 = succeed(&["stat", "-c", "%s", "/tmp/offsets.want"]).trim().parse().unwrap();
++    assert!(size > 100_000, "{size}");
++
++    let check = |what: &str| {
++        let all = build_log(&[&base, "--out", "/tmp/offsets.all"]);
++        assert_eq!(all.code(), 0, "{what}: {all:?}");
++        assert_eq!(all.get("source"), "kept", "{what}: {all:?}");
++        assert!(!all.get("node").is_empty(), "{what}: no x-nix-node: {all:?}");
++        same_bytes("/tmp/offsets.all", "/tmp/offsets.want");
++        for offset in [1, 777, size / 2, size - 1] {
++            let got = build_log(&[&base, "--offset", &offset.to_string(), "--out", "/tmp/offsets.part"]);
++            assert_eq!(got.code(), 0, "{what} {offset}: {got:?}");
++            assert_eq!(got.num("offset"), offset, "{what}: {got:?}");
++            succeed(&[
++                "sh",
++                "-c",
++                r#"tail -c +$(($1 + 1)) /tmp/offsets.want | cmp - /tmp/offsets.part"#,
++                "sh",
++                &offset.to_string(),
++            ]);
++            let lines = succeed(&[
++                "sh",
++                "-c",
++                r#"head -c "$1" /tmp/offsets.want | tr -cd '\n' | wc -c"#,
++                "sh",
++                &offset.to_string(),
++            ]);
++            assert_eq!(got.num("first_line"), lines.trim().parse::<u64>().unwrap(), "{what}: {got:?}");
++        }
++        // At the end: nothing. Past it: OUT_OF_RANGE.
++        let end = build_log(&[&base, "--offset", &size.to_string()]);
++        assert!(end.code() == 0 && end.num("bytes") == 0, "{what}: {end:?}");
++        let past = build_log(&[&base, "--offset", &(size + 1).to_string()]);
++        assert_eq!(past.code(), 11, "{what}: {past:?}");
++        assert!(!past.get("node").is_empty(), "{what}: {past:?}");
++        // A limit stops at that byte.
++        let head = build_log(&[&base, "--limit", "1000", "--out", "/tmp/offsets.part"]);
++        assert_eq!(head.num("bytes"), 1000, "{what}: {head:?}");
++        succeed(&["sh", "-c", "head -c 1000 /tmp/offsets.want | cmp - /tmp/offsets.part"]);
++        // A tail starts at a line start, and first_line counts what it skipped.
++        let tail = build_log(&[&base, "--tail", "5000", "--out", "/tmp/offsets.part"]);
++        assert_eq!(tail.code(), 0, "{what}: {tail:?}");
++        let start = tail.num("offset");
++        assert!(start >= size - 5000 && start < size - 5000 + 100, "{what}: {tail:?}");
++        let before = succeed(&[
++            "sh",
++            "-c",
++            r#"head -c "$1" /tmp/offsets.want | tail -c 1 | od -An -c"#,
++            "sh",
++            &start.to_string(),
++        ]);
++        assert_eq!(before.trim(), "\\n", "{what}: {tail:?}");
++        let lines = succeed(&[
++            "sh",
++            "-c",
++            r#"head -c "$1" /tmp/offsets.want | tr -cd '\n' | wc -c"#,
++            "sh",
++            &start.to_string(),
++        ]);
++        assert_eq!(tail.num("first_line"), lines.trim().parse::<u64>().unwrap(), "{what}: {tail:?}");
++        succeed(&[
++            "sh",
++            "-c",
++            r#"tail -c +$(($1 + 1)) /tmp/offsets.want | cmp - /tmp/offsets.part"#,
++            "sh",
++            &start.to_string(),
++        ]);
++        tail
++    };
++    check(".bz2");
++    // The same log as a plain file: its size is known from the start.
++    succeed(&["sh", "-c", r#"mv "$1.bz2" /tmp/offsets.bz2 && cp /tmp/offsets.want "$1""#, "sh", &kept]);
++    let plain = check("plain");
++    assert_eq!(plain.num("size"), size, "{plain:?}");
++    succeed(&["sh", "-c", r#"rm "$1" && mv /tmp/offsets.bz2 "$1.bz2""#, "sh", &kept]);
++}
++
++/// A follow call on a running build gets each line as the build prints it,
++/// then `ended`, and the whole log matches the file Nix kept.
++#[test]
++fn build_log_follows_a_running_build() {
++    let base = log_drv(
++        "follow-grpc",
++        "i=0; while [ $i -lt 25 ]; do echo follow-$i $(date +%s%N); sleep 0.2; i=$((i+1)); done; echo > $out",
++    );
++    build_in_background(STORE, "follow-grpc");
++    succeed(&["rm", "-f", "/tmp/follow.lines"]);
++    let got = follow(&base, &["--out", "/tmp/follow.log", "--lines", "/tmp/follow.lines"]);
++    assert_eq!(got.get("ended"), "1", "{got:?}");
++    assert!(got.num("started_ms") > 0 && got.num("assign_id") > 0, "{got:?}");
++    assert!(!got.get("node").is_empty() && !got.get("initial_node").is_empty(), "{got:?}");
++    // Each line within a second of the build printing it.
++    let lines = succeed(&["cat", "/tmp/follow.lines"]);
++    let mut seen = 0;
++    for line in lines.lines() {
++        let parts: Vec<&str> = line.split(' ').collect();
++        if parts.len() == 3 && parts[1].starts_with("follow-") {
++            let arrived: u64 = parts[0].parse().unwrap();
++            let printed: u64 = parts[2].parse().unwrap();
++            assert!(
++                arrived < printed + 1_000_000_000,
++                "{line}: {} ms late",
++                (arrived - printed) / 1_000_000
++            );
++            seen += 1;
++        }
++    }
++    assert!(seen >= 20, "{lines}");
++    // LIVE bytes are the kept log's: the daemon's own messages stay out.
++    wait_until_succeeds(&["test", "-e", &format!("{}.bz2", kept_path(&base))], 60);
++    succeed(&["sh", "-c", r#"bzcat "$1.bz2" | cmp - /tmp/follow.log"#, "sh", &kept_path(&base)]);
++}
++
++/// A build printing 2,000 lines a second costs a follower about ten
++/// messages a second.
++#[test]
++fn build_log_follow_batches_a_chatty_build() {
++    let base = log_drv(
++        "chatty-grpc",
++        "i=0; while [ $i -lt 12000 ]; do echo chatty line $i; i=$((i+1)); if [ $((i % 200)) = 0 ]; then sleep 0.1; fi; done; echo > $out",
++    );
++    build_in_background(STORE, "chatty-grpc");
++    let got = follow(&base, &["--out", "/tmp/chatty.log"]);
++    assert_eq!(got.get("ended"), "1", "{got:?}");
++    assert!(got.num("max_per_second") <= 15, "{got:?}");
++    wait_until_succeeds(&["test", "-e", &format!("{}.bz2", kept_path(&base))], 60);
++    succeed(&["sh", "-c", r#"bzcat "$1.bz2" | cmp - /tmp/chatty.log"#, "sh", &kept_path(&base)]);
++}
++
++fn build_log_streams(port: u16) -> u64 {
++    metrics(MACHINE, port)
++        .iter()
++        .find(|line| line.starts_with("nix_grpc_build_log_streams "))
++        .and_then(|line| line.split_whitespace().nth(1))
++        .map_or(0, |value| value.parse::<f64>().unwrap_or(0.0) as u64)
++}
++
++/// A follower that hangs up frees its call within a second or two, even on
++/// a build that prints nothing. Eight per caller, the ninth is refused.
++#[test]
++fn build_log_follow_calls_end_and_count() {
++    let base = log_drv("quiet-grpc", "echo one line; sleep 90; echo > $out");
++    build_in_background(&cert_store("client"), "quiet-grpc");
++    // A caller of its own: other tests read logs on 50052 at the same time.
++    let tls = tls_args("follower");
++    let mut probe = vec![base.as_str()];
++    probe.extend(strs(&tls));
++    retry(120, "the quiet build runs on 50052", || {
++        let got = build_log(&probe);
++        got.code() == 0 && got.get("source") == "live"
++    });
++    // Eight follow calls from one caller stay open; curl hangs up after 30 s.
++    let opened = Instant::now();
++    for idx in 0..8 {
++        let mut args = vec!["sh", "-c", r#"setsid -f ngs-build-log "$@" > "/tmp/quiet-$0.out" 2>&1 < /dev/null"#];
++        let tag = idx.to_string();
++        args.push(&tag);
++        args.push(&base);
++        args.push("--follow");
++        args.extend(strs(&tls));
++        args.extend(["--curl=--max-time", "--curl=30"]);
++        succeed(&args);
++    }
++    retry(20, "eight follow calls are open", || build_log_streams(9464) >= 8);
++    let mut ninth = vec![base.as_str()];
++    ninth.extend(strs(&tls));
++    let refused = build_log(&ninth);
++    assert_eq!(refused.code(), 8, "{refused:?}");
++    assert!(refused.get("message").contains("too many build log readers"), "{refused:?}");
++    // Another caller still gets in.
++    let mut other = vec![base.as_str()];
++    let ro = tls_args("ro");
++    other.extend(strs(&ro));
++    assert_eq!(build_log(&other).code(), 0);
++    // After the hang-up, all eight calls end within a second or two.
++    let hangup = std::time::Duration::from_secs(30);
++    if let Some(left) = hangup.checked_sub(opened.elapsed()) {
++        std::thread::sleep(left);
++    }
++    retry(5, "the follow calls closed", || {
++        crate::harness::journal_count(
++            MACHINE,
++            "nix-grpc-daemon-mtls",
++            &format!("method=GetBuildLog cn=follower .*drv={base} source=live .*code=1"),
++        ) == 8
++    });
++}
++
++/// With assign_id, a node never answers with a newer build's log: while a
++/// retry runs, the earlier build's log is gone (Nix truncated it), and after
++/// it the kept log names the retry. On 50052, which keeps running and so
++/// remembers which build wrote a kept log.
++#[test]
++fn build_log_of_an_earlier_build_while_a_retry_runs() {
++    let base = log_drv("retry-grpc", "echo attempt; sleep 10; exit 1");
++    let store = cert_store("client");
++    let tls = tls_args("client");
++    let call = |extra: &[&str]| {
++        let mut args = vec![base.as_str()];
++        args.extend(extra);
++        args.extend(strs(&tls));
++        build_log(&args)
++    };
++    build_in_background(&store, "retry-grpc");
++    let mut follow_args = vec!["--follow"];
++    follow_args.extend(strs(&tls));
++    let first = follow(&base, &follow_args);
++    let first_id = first.num("assign_id");
++    assert!(first_id > 0 && first.get("ended") == "1", "{first:?}");
++    // A KEPT read names the build that wrote the file.
++    retry(30, "the first build's kept log", || {
++        let got = call(&[]);
++        got.code() == 0 && got.get("source") == "kept" && got.num("assign_id") == first_id
++    });
++    build_in_background(&store, "retry-grpc");
++    let mut second_id = 0;
++    retry(60, "the retry runs", || {
++        let got = call(&[]);
++        if got.get("source") == "live" && got.num("assign_id") != first_id {
++            second_id = got.num("assign_id");
++        }
++        second_id != 0
++    });
++    let first_arg = first_id.to_string();
++    let earlier = call(&["--assign-id", &first_arg]);
++    assert_eq!(earlier.code(), 5, "{earlier:?}");
++    assert_eq!(earlier.num("rebuilding"), second_id, "{earlier:?}");
++    assert!(!earlier.get("node").is_empty(), "{earlier:?}");
++    // Its own assignment still answers from the spill.
++    let second_arg = second_id.to_string();
++    let live = call(&["--assign-id", &second_arg]);
++    assert!(live.code() == 0 && live.get("source") == "live", "{live:?}");
++    retry(60, "the retry ended", || {
++        let got = call(&["--assign-id", &first_arg]);
++        got.code() == 0 && got.get("source") == "kept" && got.num("assign_id") == second_id
++    });
++}
++
++/// Decodes of .bz2 logs: one per caller and two at a time per node. A third
++/// caller waits for a slot, then gets the whole log.
++#[test]
++fn build_log_decode_slots() {
++    succeed(&[
++        "sh",
++        "-c",
++        r#"yes 'a line of a long build log, repeated many times over' | head -c 150M | bzip2 -1 > /tmp/big.bz2
++for n in 1 2 3; do
++  base=0000000000000000000000000000000$n-big-$n.drv
++  mkdir -p /nix/var/log/nix/drvs/00
++  cp /tmp/big.bz2 /nix/var/log/nix/drvs/00/${base#00}.bz2
++done"#,
++    ]);
++    for (n, cert) in [(1, "ro"), (2, "rw")] {
++        let base = format!("0000000000000000000000000000000{n}-big-{n}.drv");
++        let mut args = vec![
++            "sh".to_string(),
++            "-c".to_string(),
++            r#"setsid -f ngs-build-log "$@" > "/tmp/big-$0.out" 2>&1 < /dev/null"#.to_string(),
++            n.to_string(),
++            base,
++        ];
++        args.extend(tls_args(cert));
++        succeed(&strs(&args));
++    }
++    sleep(1);
++    let mut third = vec!["00000000000000000000000000000003-big-3.drv".to_string()];
++    third.extend(tls_args("watcher"));
++    let got = build_log(&strs(&third));
++    assert_eq!(got.code(), 0, "{got:?}");
++    assert_eq!(got.num("bytes"), 150 << 20, "{got:?}");
++    let waited = got.num("first_data_ns") - got.num("start_ns");
++    assert!(waited > 300_000_000, "the third decode did not wait: {got:?}");
++    for n in [1, 2] {
++        wait_until_succeeds(&["grep", "-q", "^bytes=157286400$", &format!("/tmp/big-{n}.out")], 60);
++    }
++}
++
++/// The watch role is enough for build logs. A caller no rule matches is denied.
++#[test]
++fn build_log_needs_only_watch() {
++    let base = log_drv("watched-grpc", "echo watched line; echo > $out");
++    assert!(build_now(STORE, "watched-grpc"));
++    let mut args = vec![base.as_str()];
++    let watcher = tls_args("watcher");
++    args.extend(strs(&watcher));
++    let got = build_log(&args);
++    assert_eq!(got.code(), 0, "{got:?}");
++    let mut args = vec![base.as_str()];
++    let stranger = tls_args("stranger");
++    args.extend(strs(&stranger));
++    let denied = build_log(&args);
++    assert_eq!(denied.code(), 7, "{denied:?}");
++}
++
+ /// The daemon on 50051 copies build logs to a log store. A failed build's
+ /// log gets there, and `nix log --store` reads it.
+ #[test]
+ fn failed_build_log_reaches_the_log_store() {
+-    let drv = log_drv(
++    let base = log_drv(
+         "stored-grpc",
+         "echo stored line one; echo stored line two; exit 1",
+     );
+-    assert!(!build_ok(STORE, "stored-grpc"));
+-    let base = drv.rsplit('/').next().unwrap();
++    assert!(!build_now(STORE, "stored-grpc"));
+     wait_until_succeeds(&["test", "-s", &format!("/srv/logstore/log/{base}")], 60);
++    let drv = format!("/nix/store/{base}");
+     let log = succeed(&["nix", "log", "--store", "http://127.0.0.1:8090", &drv]);
+     assert!(log.contains("stored line two"), "{log}");
+ }
+@@ -363,9 +764,9 @@ fn log_store_skips_large_logs_and_drains() {
+ 
+     let big = log_drv(
+         "huge-grpc",
+-        "head -c 70000000 /dev/zero | tr '\\\\0' x | fold -w 1000; echo > $out",
++        "head -c 70000000 /dev/zero | tr '\\0' x | fold -w 1000; echo > $out",
+     );
+-    assert!(build_ok(store, "huge-grpc"));
++    assert!(build_now(store, "huge-grpc"));
+     retry(60, "the huge log is skipped", || {
+         metrics(MACHINE, 9465).iter().any(|line| {
+             line.strip_prefix(r#"nix_grpc_build_log_uploads_total{result="skipped"} "#)
+@@ -373,13 +774,11 @@ fn log_store_skips_large_logs_and_drains() {
+                 == Some(1.0)
+         })
+     });
+-    let big = big.rsplit('/').next().unwrap();
+     fail(&["test", "-e", &format!("/srv/logstore/slow/log/{big}")]);
+ 
+     let last = log_drv("last-grpc", "echo the last build; echo > $out");
+-    assert!(build_ok(store, "last-grpc"));
++    assert!(build_now(store, "last-grpc"));
+     succeed(&["systemctl", "kill", "-s", "TERM", LOGSTORE]);
+     retry(90, "the daemon exits", || unit_state(LOGSTORE) != "active");
+-    let last = last.rsplit('/').next().unwrap();
+     succeed(&["test", "-s", &format!("/srv/logstore/slow/log/{last}")]);
+ }
+diff --git a/tests/farm.nix b/tests/farm.nix
+index aae958a..05195bf 100644
+--- a/tests/farm.nix
++++ b/tests/farm.nix
+@@ -19,6 +19,8 @@ let
+   niks3Url = "http://lb:5751";
+   niks3Pkgs = niks3.packages.${system};
+ 
++  buildLog = import ./lib/build-log.nix { inherit pkgs; };
++
+   # nixos test framework: nodes get 192.168.1.<n> in attribute-name order.
+   ip = {
+     client = "192.168.1.1";
+@@ -101,6 +103,13 @@ let
+         };
+         trustedProxies = [ "lb-*" ];
+         accessRules = [
++          {
++            # A dashboard's proxy names each viewer dashboard-user-<id> or
++            # dashboard-anon-<address>. This rule lets those names watch the
++            # stream and read build logs.
++            cn = "dashboard-*";
++            role = "watch";
++          }
+           {
+             cn = "ci-*";
+             role = "trusted";
+@@ -186,6 +195,17 @@ let
+       args = [ "-c" "echo BOOM-''${tag} >&2; exit 1" ];
+     }
+   '';
++  # A build pinned to worker1 that prints `lines` lines, one a second.
++  logExpr = pkgs.writeText "log.nix" ''
++    { tag, lines ? 0 }:
++    derivation {
++      name = "logged-''${tag}";
++      system = builtins.currentSystem;
++      requiredSystemFeatures = [ "vip" ];
++      builder = "/bin/sh";
++      args = [ "-c" "i=0; while [ $i -lt ''${toString lines} ]; do echo line-$i-''${tag} >&2; read -t 1 x < /dev/zero; i=$((i+1)); done; echo done-''${tag} >&2; echo ''${tag} > $out" ];
++    }
++  '';
+   slowExpr = pkgs.writeText "slow.nix" ''
+     { tag }:
+     derivation {
+@@ -291,6 +311,10 @@ pkgs.testers.runNixOSTest {
+           module
+         ];
+         programs.nix-grpc-store.enable = true;
++        environment.systemPackages = [
++          buildLog
++          pkgs.curl
++        ];
+         nix.settings.substituters = lib.mkForce [ ];
+         # build-remote runs inside nix-daemon.service; prove the hook still
+         # reaches the balancer with daemon egress filtering on.
+@@ -342,5 +366,117 @@ pkgs.testers.runNixOSTest {
+ 
+     with subtest("scheduler and lifecycle"):
+         run_e2e(nodes, env, "farm::serial::", "--test-threads=1")
++
++    with subtest("build logs through the balancer, also from a draining builder"):
++        store = "grpc://lb:50051?client-cert=${certs}/ci.pem&client-key=${certs}/ci.key"
++        farm = "https://lb:50051"
++        ci = "--curl=--cert --curl=${certs}/ci.pem --curl=--key --curl=${certs}/ci.key"
++        w1 = "${ip.worker1}:50051"
++        w2 = "${ip.worker2}:50051"
++
++        def drv(tag, lines):
++            return client.succeed(
++                f"nix-instantiate ${logExpr} --argstr tag {tag} --arg lines {lines}"
++            ).strip().rsplit("/", 1)[1]
++
++        def log_call(base, worker, extra = "", out = "/dev/null"):
++            """A GetBuildLog call through the balancer, to the builder that x-nix-worker names."""
++            text = client.succeed(
++                f"ngs-build-log {base} --url {farm} {ci} "
++                f"-H 'x-nix-worker: {worker}' -H 'x-nix-system: ${system}' --out {out} {extra}"
++            )
++            return dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
++
++        def follow_in_background(unit, base, worker, assign):
++            client.succeed(
++                f"systemd-run --unit {unit} -p StandardOutput=file:/tmp/{unit}.out "
++                f"$(command -v ngs-build-log) {base} --url {farm} {ci} "
++                f"-H 'x-nix-worker: {worker}' -H 'x-nix-system: ${system}' "
++                f"--follow --assign-id {assign} --out /tmp/{unit}.log"
++            )
++
++        def lines(unit):
++            return int(client.succeed(f"grep -c ^line- /tmp/{unit}.log || true").strip())
++
++        tag = "drain"
++        a = drv(tag + "-a", 0)
++        b = drv(tag + "-b", 30)
++        client.succeed(f"nix build --eval-store auto --store '{store}' -f ${logExpr} --argstr tag {tag}-a --arg lines 0 --no-link")
++        client.succeed(
++            f"systemd-run --unit build-b -E HOME=/root $(command -v nix) build --eval-store auto --store '{store}' -f ${logExpr} --argstr tag {tag}-b --arg lines 30 --no-link"
++        )
++        # A caller learns the assignment's builder from the scheduler's
++        # events, and asks that builder.
++        live = {}
++        def running(_):
++            live.update(log_call(b, w1))
++            return live.get("code") == "0" and live.get("source") == "live"
++        retry(running, timeout_seconds = 120)
++        assert live["node"] == w1, live
++        follow_in_background("follow-1", b, w1, live["assign_id"])
++        client.wait_until_succeeds("test $(grep -c ^line- /tmp/follow-1.log) -ge 3", timeout = 60)
++
++        # SIGTERM drains worker1 with B still running. The active scheduler,
++        # on either node, logs the drain, and EDS marks worker1 DRAINING with it.
++        worker1.succeed("systemctl kill -s TERM --kill-whom=main nix-grpc-daemon.service")
++        def drained(_):
++            return any(
++                w.execute(f"journalctl -u nix-grpc-daemon -o cat | grep worker_load | grep 'addr={w1}' | grep -q 'draining=1'")[0] == 0
++                for w in [worker1, worker2]
++            )
++        retry(drained, timeout_seconds = 60)
++        # The balancer's worker cluster still finds worker1 for calls that
++        # name it, and worker1 still serves them.
++        before = lines("follow-1")
++        follow_in_background("follow-2", b, w1, live["assign_id"])
++        client.wait_until_succeeds("test $(grep -c ^line- /tmp/follow-2.log) -ge 1", timeout = 60)
++        client.wait_until_succeeds(f"test $(grep -c ^line- /tmp/follow-1.log) -gt {before}", timeout = 30)
++        kept = log_call(a, w1, out = "/tmp/a.log")
++        assert kept["code"] == "0" and kept["source"] == "kept" and kept["node"] == w1, kept
++        client.succeed(f"grep -q done-{tag}-a /tmp/a.log")
++
++        # Both end with `ended` when B finishes. The daemon then exits, and
++        # systemd starts it again.
++        for unit in ["follow-1", "follow-2"]:
++            client.wait_until_succeeds(f"grep -q '^ended=1$' /tmp/{unit}.out", timeout = 120)
++            out = client.succeed(f"cat /tmp/{unit}.out")
++            assert "code=0" in out and f"node={w1}" in out, out
++        assert lines("follow-1") == 30, client.succeed("cat /tmp/follow-1.log")
++        client.wait_until_succeeds('test "$(systemctl show -p ActiveState --value build-b)" != active', timeout = 60)
++
++        # Back in EDS, worker1 answers from the file Nix kept.
++        finished = {}
++        def kept_again(_):
++            finished.update(log_call(b, w1, out = "/tmp/b.log"))
++            return finished.get("code") == "0" and finished.get("source") == "kept" and finished.get("node") == w1
++        retry(kept_again, timeout_seconds = 180)
++        want = worker1.succeed(f"nix log /nix/store/{b} | sha256sum").split()[0]
++        got = client.succeed("sha256sum < /tmp/b.log").split()[0]
++        assert want == got, (want, got)
++
++        # Another builder kept no log of it. It says who answered, and has
++        # nothing.
++        other = log_call(b, w2)
++        assert other["node"] == w2 and other["code"] == "5", other
++
++    with subtest("viewers a proxy names read build logs and share their rule's metrics series"):
++        # A dashboard's proxy names a signed-in viewer by user and any other
++        # by address. The client acts as that proxy, with the balancer's
++        # client certificate, and calls worker2 directly.
++        proxy = "--curl=--cacert --curl=${certs}/ca.pem --curl=--cert --curl=${certs}/lb-client.pem --curl=--key --curl=${certs}/lb-client.key"
++        missing = "0" * 32 + "-missing.drv"
++        for viewer in ["user-42", "anon-${ip.client}", "anon-2001:db8::7"]:
++            text = client.succeed(
++                f"ngs-build-log {missing} --url https://${ip.worker2}:50051 {proxy} "
++                f"-H 'x-forwarded-client-cert: Subject=\"CN=dashboard-{viewer}\"'"
++            )
++            answer = dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
++            # The access rule lets that name read logs, so the answer is
++            # NOT_FOUND, not PERMISSION_DENIED.
++            assert answer["code"] == "5" and answer["node"] == "${ip.worker2}:50051", answer
++        rpcs = worker2.succeed(
++            "${pkgs.curl}/bin/curl -sS 127.0.0.1:9464/metrics | grep '^nix_grpc_rpcs_total{.*cn=\"dashboard-' || true"
++        )
++        assert rpcs.count("\n") == 1 and 'cn="dashboard-*",method="GetBuildLog"' in rpcs, rpcs
+   '';
+ }
+diff --git a/tests/lib/build-log.nix b/tests/lib/build-log.nix
+new file mode 100644
+index 0000000..4ff93e2
+--- /dev/null
++++ b/tests/lib/build-log.nix
+@@ -0,0 +1,9 @@
++# ngs-build-log: one GetBuildLog call through curl, for the VM tests
++# (build-log.py says what it prints).
++{ pkgs }:
++let
++  python = pkgs.python3.withPackages (ps: [ ps.zstandard ]);
++in
++pkgs.writeShellScriptBin "ngs-build-log" ''
++  PATH=${pkgs.curl}/bin:$PATH exec ${python}/bin/python3 ${./build-log.py} "$@"
++''
+diff --git a/tests/lib/build-log.py b/tests/lib/build-log.py
+new file mode 100644
+index 0000000..f698026
+--- /dev/null
++++ b/tests/lib/build-log.py
+@@ -0,0 +1,248 @@
++"""GetBuildLog through curl, for the VM tests.
++
++Sends one request, as gRPC or gRPC-web, decodes the zstd stream as it
++arrives, writes the log to --out, and prints what came back as key=value
++lines: the status, x-nix-node from the headers and the trailers, the info
++fields, whether `ended` came, and when messages and lines arrived.
++"""
++
++import argparse
++import os
++import subprocess
++import sys
++import time
++
++import zstandard
++
++SOURCES = {0: "unspecified", 1: "live", 2: "kept", 3: "store", 4: "cache"}
++INFO_FIELDS = {
++    1: "source",
++    2: "size",
++    3: "offset",
++    4: "first_line",
++    5: "assign_id",
++    6: "started_ms",
++    7: "modified_ms",
++}
++
++
++def varint(value):
++    out = bytearray()
++    while True:
++        byte = value & 0x7F
++        value >>= 7
++        if value:
++            out.append(byte | 0x80)
++        else:
++            out.append(byte)
++            return bytes(out)
++
++
++def read_varint(data, pos):
++    value = shift = 0
++    while True:
++        byte = data[pos]
++        pos += 1
++        value |= (byte & 0x7F) << shift
++        shift += 7
++        if not byte & 0x80:
++            return value, pos
++
++
++def fields(data):
++    """Yields (number, value) for each field of a protobuf message."""
++    pos = 0
++    while pos < len(data):
++        key, pos = read_varint(data, pos)
++        number, kind = key >> 3, key & 7
++        if kind == 0:
++            value, pos = read_varint(data, pos)
++        elif kind == 2:
++            size, pos = read_varint(data, pos)
++            value, pos = data[pos : pos + size], pos + size
++        else:
++            raise ValueError(f"wire type {kind}")
++        yield number, value
++
++
++def request(args):
++    body = b"\x0a" + varint(len(args.drv)) + args.drv.encode()
++    for number, value in (
++        (2, args.offset),
++        (3, int(args.follow)),
++        (4, args.assign_id),
++        (5, args.limit),
++        (6, args.tail),
++    ):
++        if value:
++            body += varint(number << 3) + varint(value)
++    return b"\x00" + len(body).to_bytes(4, "big") + body
++
++
++def headers(path):
++    """The header blocks curl wrote: the response headers, then trailers."""
++    blocks = [[]]
++    try:
++        text = open(path, encoding="utf-8", errors="replace").read()
++    except FileNotFoundError:
++        return {}, {}
++    for line in text.splitlines():
++        line = line.strip()
++        if not line:
++            if blocks[-1]:
++                blocks.append([])
++            continue
++        blocks[-1].append(line)
++    parsed = []
++    for block in blocks:
++        entries = {}
++        for line in block:
++            if line.startswith("HTTP/"):
++                entries[":status"] = line.split()[1]
++            elif ":" in line:
++                key, value = line.split(":", 1)
++                entries[key.strip().lower()] = value.strip()
++        if entries:
++            parsed.append(entries)
++    head = parsed[0] if parsed else {}
++    tail = {}
++    for block in parsed[1:]:
++        tail.update(block)
++    return head, tail
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("drv")
++    parser.add_argument("--url", default="http://127.0.0.1:50051")
++    parser.add_argument("--offset", type=int, default=0)
++    parser.add_argument("--follow", action="store_true")
++    parser.add_argument("--assign-id", type=int, default=0)
++    parser.add_argument("--limit", type=int, default=0)
++    parser.add_argument("--tail", type=int, default=0)
++    parser.add_argument("--out", default="/dev/null")
++    parser.add_argument("--lines", help="append '<arrival ns> <line>' per line here")
++    parser.add_argument("--web", action="store_true", help="gRPC-web, as a browser sends it")
++    parser.add_argument("-H", "--header", action="append", default=[])
++    parser.add_argument("--curl", action="append", default=[], help="an extra curl argument")
++    args = parser.parse_args()
++
++    tag = f"{os.getpid()}"
++    head_file = f"/tmp/build-log-{tag}.hdr"
++    command = ["curl", "-sS", "-N", "-X", "POST", "-D", head_file, "--data-binary", "@-"]
++    if args.web:
++        command += ["-H", "content-type: application/grpc-web+proto", "-H", "x-grpc-web: 1"]
++    else:
++        command += ["-H", "content-type: application/grpc", "-H", "te: trailers"]
++        if args.url.startswith("http://"):
++            command += ["--http2-prior-knowledge"]
++        else:
++            command += ["--http2"]
++    for header in args.header:
++        command += ["-H", header]
++    command += args.curl
++    command.append(args.url.rstrip("/") + "/nix.remote.NixRemote/GetBuildLog")
++
++    start = time.time_ns()
++    proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
++    proc.stdin.write(request(args))
++    proc.stdin.close()
++
++    decoder = zstandard.ZstdDecompressor().decompressobj()
++    out = open(args.out, "wb")
++    lines = open(args.lines, "a") if args.lines else None
++    partial = b""
++    buffered = b""
++    info = {}
++    seen_info = False
++    ended = False
++    messages = []  # (arrival ns, data bytes, decoded total)
++    web_trailers = {}
++    decoded = 0
++    first_data = 0
++    while True:
++        chunk = proc.stdout.read1(1 << 16)
++        if not chunk:
++            break
++        buffered += chunk
++        while len(buffered) >= 5:
++            flags = buffered[0]
++            size = int.from_bytes(buffered[1:5], "big")
++            if len(buffered) < 5 + size:
++                break
++            frame, buffered = buffered[5 : 5 + size], buffered[5 + size :]
++            now = time.time_ns()
++            if flags & 0x80:
++                for line in frame.decode(errors="replace").split("\r\n"):
++                    if ":" in line:
++                        key, value = line.split(":", 1)
++                        web_trailers[key.strip().lower()] = value.strip()
++                continue
++            data = b""
++            for number, value in fields(frame):
++                if number == 1:
++                    data = value
++                elif number == 2:
++                    seen_info = True
++                    for inner, field in fields(value):
++                        if inner in INFO_FIELDS:
++                            info[INFO_FIELDS[inner]] = field
++                elif number == 3:
++                    ended = bool(value)
++            text = decoder.decompress(data) if data else b""
++            if text and not first_data:
++                first_data = now
++            decoded += len(text)
++            out.write(text)
++            out.flush()
++            if lines is not None and text:
++                partial += text
++                *done, partial = partial.split(b"\n")
++                for line in done:
++                    lines.write(f"{now} {line.decode(errors='replace')}\n")
++                lines.flush()
++            messages.append((now, len(data), decoded))
++    proc.wait()
++    end = time.time_ns()
++    head, trailers = headers(head_file)
++    trailers.update(web_trailers)
++    if not trailers and "grpc-status" in head:
++        # A trailers-only answer: the status came with the headers.
++        trailers, head = head, {key: value for key, value in head.items() if key == ":status"}
++    if os.path.exists(head_file):
++        os.unlink(head_file)
++    status = trailers.get("grpc-status", head.get("grpc-status", ""))
++    message = trailers.get("grpc-message", head.get("grpc-message", ""))
++
++    per_second = 0
++    times = [t for t, _, _ in messages]
++    for idx, first in enumerate(times):
++        per_second = max(per_second, sum(1 for t in times[idx:] if t - first < 1_000_000_000))
++
++    result = {
++        "code": status,
++        "message": message,
++        "http": head.get(":status", ""),
++        "node": trailers.get("x-nix-node", ""),
++        "initial_node": head.get("x-nix-node", ""),
++        "rebuilding": trailers.get("x-nix-rebuilding", head.get("x-nix-rebuilding", "")),
++        "has_info": int(seen_info),
++        "ended": int(ended),
++        "messages": len(messages),
++        "max_per_second": per_second,
++        "bytes": decoded,
++        "start_ns": start,
++        "first_data_ns": first_data,
++        "end_ns": end,
++        "curl": proc.returncode,
++    }
++    for key in INFO_FIELDS.values():
++        value = info.get(key, 0)
++        result[key] = SOURCES.get(value, value) if key == "source" else value
++    for key, value in result.items():
++        print(f"{key}={value}")
++    sys.stdout.flush()
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/log-cache-test.cc b/tests/log-cache-test.cc
+new file mode 100644
+index 0000000..7472773
+--- /dev/null
++++ b/tests/log-cache-test.cc
+@@ -0,0 +1,333 @@
++// The decode cache: one decode per log for every reader, readers that join
++// while it runs, line starts and counts, the size cap, and decode slots.
++
++#include <algorithm>
++#include <atomic>
++#include <cassert>
++#include <chrono>
++#include <condition_variable>
++#include <cstddef>
++#include <cstdint>
++#include <exception>
++#include <iostream>
++#include <mutex>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <iterator>
++#include <thread>
++#include <utility>
++
++#include "log-cache.hh"
++
++// NOLINTBEGIN(*-magic-numbers,misc-const-correctness): test vectors, and
++// readers that count while they live.
++using nixgrpc::DecodeSlots;
++using nixgrpc::LogCache;
++
++namespace {
++
++constexpr std::chrono::milliseconds poll{50};
++constexpr std::chrono::seconds patience{10};
++
++// A log of `lines` numbered lines.
++auto numbered(std::size_t lines) -> std::string
++{
++    std::string out;
++    for (std::size_t idx = 0; idx < lines; idx++) {
++        out += "line " + std::to_string(idx) + " of the log\n";
++    }
++    return out;
++}
++
++// Writes `text` in pieces of `piece` bytes, and counts its runs.
++auto decoder(const std::string & text, std::atomic<int> & runs, std::size_t piece = 1000) -> LogCache::Decode
++{
++    return [&text, &runs, piece](const LogCache::Write & write) -> bool {
++        runs++;
++        for (std::size_t pos = 0; pos < text.size(); pos += piece) {
++            if (!write(std::string_view(text).substr(pos, piece))) {
++                return true;
++            }
++        }
++        return true;
++    };
++}
++
++// Tests declare their slots before their cache. The cache joins its threads
++// as it goes, and they give their slots back as they end.
++auto slot(DecodeSlots & slots, const std::string & caller = "c") -> DecodeSlots::Slot
++{
++    auto got = slots.acquire(caller, std::chrono::seconds(1), {});
++    assert(got);
++    return std::move(*got);
++}
++
++// Everything the entry holds once it ends.
++auto readAll(const LogCache::Reader & reader) -> std::string
++{
++    auto const deadline = std::chrono::steady_clock::now() + patience;
++    auto state = reader->state();
++    while (!state.ended() && std::chrono::steady_clock::now() < deadline) {
++        state = reader->waitPast(state.written, poll);
++    }
++    std::string out(state.written, '\0');
++    assert(reader->read(0, out) == out.size());
++    return out;
++}
++
++void twoReadersDecodeOnce()
++{
++    DecodeSlots slots(2, 1);
++    LogCache cache;
++    std::atomic<int> runs{0};
++    auto const text = numbered(5000);
++    assert(!cache.find("a.bz2@1"));
++    auto first = cache.start("a.bz2@1", decoder(text, runs), slot(slots));
++    auto second = cache.find("a.bz2@1");
++    assert(second);
++    assert(readAll(first) == text);
++    assert(readAll(*second) == text);
++    assert(runs == 1);
++    assert(first->state().complete);
++    // A third, after the decode: still the same entry.
++    auto third = cache.find("a.bz2@1");
++    assert(third && readAll(*third) == text);
++    assert(runs == 1);
++    // Another mtime is another log.
++    assert(!cache.find("a.bz2@2"));
++}
++
++// The decode waits for the test at a gate, so the second reader joins midway.
++void aReaderThatJoinsMidDecodeGetsTheSameBytes()
++{
++    DecodeSlots slots(2, 1);
++    LogCache cache;
++    auto const text = numbered(20000);
++    std::mutex mutex;
++    std::condition_variable gate;
++    bool open = false;
++    auto decode = [&](const LogCache::Write & write) -> bool {
++        auto const half = text.size() / 2;
++        if (!write(std::string_view(text).substr(0, half))) {
++            return true;
++        }
++        std::unique_lock lock(mutex);
++        gate.wait(lock, [&] -> bool { return open; });
++        lock.unlock();
++        (void) write(std::string_view(text).substr(half));
++        return true;
++    };
++    auto first = cache.start("b@1", decode, slot(slots));
++    while (first->state().written == 0) {
++        (void) first->waitPast(0, poll);
++    }
++    assert(!first->state().complete);
++    auto second = cache.find("b@1");
++    assert(second);
++    {
++        const std::scoped_lock lock(mutex);
++        open = true;
++    }
++    gate.notify_all();
++    assert(readAll(*second) == text);
++    assert(readAll(first) == text);
++}
++
++void tailStartsAtALineStartAndFirstLineIsExact()
++{
++    LogCache::Limits limits;
++    limits.stride = 4096; // many index entries in a small log
++    DecodeSlots slots(2, 1);
++    LogCache cache(limits);
++    std::atomic<int> runs{0};
++    auto const text = numbered(30000);
++    auto reader = cache.start("c@1", decoder(text, runs, 777), slot(slots));
++    assert(readAll(reader) == text);
++    constexpr std::size_t step = 997;
++    for (std::size_t from = 0; from <= text.size(); from += step) {
++        auto start = from;
++        while (start < text.size() && start > 0 && text.at(start - 1) != '\n') {
++            start++;
++        }
++        assert(reader->lineStartAtOrAfter(from) == start);
++        auto const lines = static_cast<uint64_t>(
++            std::count(text.begin(), std::next(text.begin(), static_cast<std::ptrdiff_t>(start)), '\n'));
++        assert(reader->linesBefore(start) == lines);
++    }
++    assert(reader->lineStartAtOrAfter(text.size() + 5) == text.size());
++}
++
++void anEntryOverTheSizeCapIsNotCached()
++{
++    LogCache::Limits limits;
++    limits.bytes = 10000;
++    limits.tooBigFor = std::chrono::milliseconds(500);
++    DecodeSlots slots(2, 1);
++    LogCache cache(limits);
++    std::atomic<int> runs{0};
++    auto const text = numbered(2000); // about 44 kB
++    auto reader = cache.start("d@1", decoder(text, runs), slot(slots));
++    auto const prefix = readAll(reader);
++    auto const state = reader->state();
++    assert(state.uncached && !state.complete && !state.failed);
++    // What it holds is the start of the log, and the caller decodes the rest.
++    assert(!prefix.empty() && prefix.size() <= limits.bytes && text.starts_with(prefix));
++    assert(cache.size() == 0);
++    assert(cache.bytes() == 0);
++    // A log that fits is cached as usual.
++    auto const small = numbered(10);
++    {
++        auto fits = cache.start("e@1", decoder(small, runs), slot(slots));
++        assert(readAll(fits) == small && fits->state().complete);
++    }
++    // For a while, a call for the log that did not fit gets an empty
++    // uncached reader at once, from find() or start(): no decode, and the
++    // unread entry stays.
++    auto const decodes = runs.load();
++    auto again = cache.find("d@1");
++    assert(again && (*again)->state().uncached && (*again)->state().written == 0);
++    auto started = cache.start("d@1", decoder(text, runs), slot(slots));
++    assert(started->state().uncached && started->state().written == 0);
++    assert(runs == decodes && cache.size() == 1 && cache.find("e@1"));
++    // Then it is tried again.
++    std::this_thread::sleep_for(limits.tooBigFor + poll);
++    assert(!cache.find("d@1"));
++}
++
++void theDecodeGoesOnWhileAnotherReaderRemains()
++{
++    DecodeSlots slots(2, 1);
++    LogCache cache;
++    auto const text = numbered(50000);
++    std::atomic<std::size_t> progress{0};
++    std::atomic<bool> release{false};
++    auto decode = [&](const LogCache::Write & write) -> bool {
++        constexpr std::size_t piece = 1000;
++        for (std::size_t pos = 0; pos < text.size(); pos += piece) {
++            while (pos > 0 && !release) {
++                std::this_thread::sleep_for(std::chrono::milliseconds(1));
++            }
++            if (!write(std::string_view(text).substr(pos, piece))) {
++                return true;
++            }
++            progress = pos;
++        }
++        return true;
++    };
++    std::optional<LogCache::Reader> second;
++    {
++        auto first = cache.start("f@1", decode, slot(slots));
++        auto joined = cache.find("f@1");
++        assert(joined);
++        second.emplace(std::move(*joined));
++        (void) first;
++    } // the first leaves mid-decode
++    release = true;
++    assert(readAll(*second) == text);
++    assert((*second)->state().complete);
++
++    // With nobody left, it stops early and leaves the cache.
++    std::atomic<bool> begin{false};
++    std::atomic<bool> stopped{false};
++    auto endless = [&](const LogCache::Write & write) -> bool {
++        while (!begin) {
++            std::this_thread::sleep_for(std::chrono::milliseconds(1));
++        }
++        while (write("more\n")) {
++        }
++        stopped = true;
++        return true;
++    };
++    {
++        auto only = cache.start("g@1", endless, slot(slots));
++        (void) only;
++    }
++    begin = true;
++    auto const deadline = std::chrono::steady_clock::now() + patience;
++    while (!stopped && std::chrono::steady_clock::now() < deadline) {
++        std::this_thread::sleep_for(poll);
++    }
++    assert(stopped);
++    // the slot came back too
++    auto const back = std::chrono::steady_clock::now() + patience;
++    while (slots.inUse() != 0 && std::chrono::steady_clock::now() < back) {
++        std::this_thread::sleep_for(poll);
++    }
++    assert(slots.inUse() == 0);
++    assert(!cache.find("g@1"));
++}
++
++void oldEntriesGoFirst()
++{
++    LogCache::Limits limits;
++    limits.entries = 2;
++    DecodeSlots slots(2, 1);
++    LogCache cache(limits);
++    std::atomic<int> runs{0};
++    auto const text = numbered(10);
++    for (auto const * key : {"h@1", "i@1", "j@1"}) {
++        auto reader = cache.start(key, decoder(text, runs), slot(slots));
++        assert(readAll(reader) == text);
++        std::this_thread::sleep_for(std::chrono::milliseconds(2));
++    }
++    assert(cache.size() == 2);
++    assert(!cache.find("h@1"));
++    assert(cache.find("j@1"));
++
++    // Complete entries that nobody read for `keep` leave the cache too.
++    LogCache::Limits brief;
++    brief.keep = std::chrono::milliseconds(20);
++    LogCache shortLived(brief);
++    {
++        auto reader = shortLived.start("k@1", decoder(text, runs), slot(slots));
++        assert(readAll(reader) == text);
++    }
++    std::this_thread::sleep_for(std::chrono::milliseconds(50));
++    assert(!shortLived.find("k@1"));
++}
++
++void slotsPerCallerAndInAll()
++{
++    DecodeSlots slots(2, 1);
++    auto first = slots.acquire("a", std::chrono::seconds(1), {});
++    assert(first);
++    // One per caller: a's second waits and gives up.
++    auto const before = std::chrono::steady_clock::now();
++    assert(!slots.acquire("a", std::chrono::milliseconds(200), {}));
++    assert(std::chrono::steady_clock::now() - before >= std::chrono::milliseconds(200));
++    auto second = slots.acquire("b", std::chrono::seconds(1), {});
++    assert(second);
++    // Two in all: c waits until one is back, then gets it.
++    std::thread freeing([&] -> void {
++        std::this_thread::sleep_for(std::chrono::milliseconds(300));
++        first->release();
++    });
++    auto const waited = std::chrono::steady_clock::now();
++    auto third = slots.acquire("c", std::chrono::seconds(5), {});
++    assert(third);
++    assert(std::chrono::steady_clock::now() - waited >= std::chrono::milliseconds(250));
++    freeing.join();
++    // A cancelled wait ends early.
++    assert(!slots.acquire("d", std::chrono::seconds(5), [] -> bool { return true; }));
++}
++
++} // namespace
++// NOLINTEND(*-magic-numbers,misc-const-correctness)
++
++auto main() -> int
++{
++    try {
++        twoReadersDecodeOnce();
++        aReaderThatJoinsMidDecodeGetsTheSameBytes();
++        tailStartsAtALineStartAndFirstLineIsExact();
++        anEntryOverTheSizeCapIsNotCached();
++        theDecodeGoesOnWhileAnotherReaderRemains();
++        oldEntriesGoFirst();
++        slotsPerCallerAndInAll();
++    } catch (std::exception & err) {
++        std::cerr << "error: " << err.what() << "\n";
++        return 1;
++    }
++    return 0;
++}
+diff --git a/tests/log-spill-test.cc b/tests/log-spill-test.cc
+index 9532070..da9692c 100644
+--- a/tests/log-spill-test.cc
++++ b/tests/log-spill-test.cc
+@@ -1,5 +1,10 @@
++#include <algorithm>
+ #include <cassert>
+ #include <chrono>
++#include <cstdint>
++#include <fstream>
++#include <iterator>
++#include <random>
+ #include <condition_variable>
+ #include <cstddef>
+ #include <mutex>
+@@ -158,6 +163,187 @@ void cancelledReaderGivesUp()
+     assert(!done);
+ }
+ 
++// NOLINTBEGIN(*-magic-numbers): test vectors.
++// The log as Nix keeps it, for comparison.
++auto rendering(const Records & records) -> std::string
++{
++    std::string out;
++    for (const auto & [kind, text] : records) {
++        if (kind == SpillKind::line) {
++            out += text + "\n";
++        } else if (kind == SpillKind::phase) {
++            out += R"(@nix { "action": "setPhase", "phase": ")" + text + "\" }\n";
++        }
++    }
++    return out;
++}
++
++auto drainAll(const LogSpill & spill, std::size_t from, std::size_t limit = SIZE_MAX) -> std::string
++{
++    std::string out;
++    auto const reached = spill.drainRendered(from, limit, [&](std::string_view piece) -> void { out += piece; });
++    (void) reached;
++    assert(reached == from + out.size());
++    return out;
++}
++
++// Records of random kinds and sizes, the same for every run.
++auto randomRecords(std::size_t count) -> Records
++{
++    constexpr std::size_t maxText = 300;
++    std::mt19937 rng(42); // NOLINT(cert-msc32-c,cert-msc51-cpp,bugprone-random-generator-seed): the same records every run.
++    std::uniform_int_distribution<int> kind(0, 9);
++    std::uniform_int_distribution<std::size_t> size(0, maxText);
++    Records out;
++    for (std::size_t idx = 0; idx < count; idx++) {
++        auto const pick = kind(rng);
++        auto spillKind = SpillKind::line;
++        if (pick == 0) {
++            spillKind = SpillKind::phase;
++        } else if (pick == 1) {
++            spillKind = SpillKind::note;
++        }
++        out.emplace_back(spillKind, std::string(size(rng), static_cast<char>('a' + (idx % 26))));
++    }
++    return out;
++}
++
++void renderedBytesMatchTheKeptLogRendering()
++{
++    LogSpill spill;
++    Records const records{
++        {SpillKind::line, "Running phase: unpackPhase"},
++        {SpillKind::phase, "unpackPhase"},
++        {SpillKind::note, "worker-1: building x.drv"},
++        {SpillKind::line, ""},
++        {SpillKind::line, "done"}};
++    for (const auto & [kind, text] : records) {
++        spill.append(kind, text);
++    }
++    auto const want = rendering(records);
++    assert(want == "Running phase: unpackPhase\n@nix { \"action\": \"setPhase\", \"phase\": \"unpackPhase\" }\n\ndone\n");
++    assert(spill.renderedSize() == want.size());
++    assert(drainAll(spill, 0) == want);
++    assert(LogSpill::renderedLength(SpillKind::phase, 1) == 44);
++}
++
++void notesRenderAsNothingAndCountNoLines()
++{
++    LogSpill spill;
++    spill.append(SpillKind::note, "a warning from the daemon");
++    assert(spill.renderedSize() == 0 && drainAll(spill, 0).empty());
++    spill.append(SpillKind::line, "x");
++    spill.append(SpillKind::note, "another");
++    assert(drainAll(spill, 0) == "x\n");
++    assert(spill.linesBefore(2) == 1);
++    // A note between two lines is not a line start of its own.
++    assert(spill.lineStartAtOrAfter(1) == 2);
++}
++
++void drainRenderedFromEveryOffsetGivesTheSameSuffix()
++{
++    constexpr std::size_t records = 10000;
++    constexpr std::size_t step = 997;
++    LogSpill spill;
++    auto const all = randomRecords(records);
++    for (const auto & [kind, text] : all) {
++        spill.append(kind, text);
++    }
++    auto const want = rendering(all);
++    assert(spill.renderedSize() == want.size());
++    for (std::size_t from = 0; from <= want.size(); from += step) {
++        // The whole suffix from every 16th offset, a piece of it from every one.
++        if (from % (16 * step) == 0) {
++            assert(drainAll(spill, from) == want.substr(from));
++        }
++        assert(drainAll(spill, from, step) == want.substr(from, step));
++    }
++    assert(drainAll(spill, want.size()).empty());
++    assert(drainAll(spill, want.size() + 1).empty());
++}
++
++void linesBeforeMatchesACountOverTheRendering()
++{
++    constexpr std::size_t records = 10000;
++    constexpr std::size_t step = 997;
++    LogSpill spill;
++    auto const all = randomRecords(records);
++    for (const auto & [kind, text] : all) {
++        spill.append(kind, text);
++    }
++    auto const want = rendering(all);
++    auto const nth = [&](std::size_t pos) -> std::string::const_iterator {
++        return std::next(want.begin(), static_cast<std::ptrdiff_t>(pos));
++    };
++    // A running count, so the check stays linear in the log's size.
++    std::size_t lines = 0;
++    std::size_t counted = 0;
++    for (std::size_t from = 0; from <= want.size(); from += step) {
++        lines += static_cast<std::size_t>(std::count(nth(counted), nth(from), '\n'));
++        counted = from;
++        assert(spill.linesBefore(from) == lines);
++        // the first line start at or after it
++        auto start = from;
++        while (start < want.size() && start > 0 && want.at(start - 1) != '\n') {
++            start++;
++        }
++        assert(spill.lineStartAtOrAfter(from) == start);
++    }
++}
++
++#ifdef __linux__
++// Bytes this process read with read(2) and pread(2) so far.
++auto bytesRead() -> std::uint64_t
++{
++    std::ifstream stats("/proc/self/io");
++    std::string key;
++    std::uint64_t value = 0;
++    while (stats >> key >> value) {
++        if (key == "rchar:") {
++            return value;
++        }
++    }
++    return 0;
++}
++#endif
++
++void theIndexLetsAReaderStartNearTheEnd()
++{
++    constexpr std::size_t size = std::size_t{60} << 20U;
++    constexpr std::size_t lineSize = 999;
++    LogSpill spill;
++    std::string const line(lineSize, 'x');
++    while (spill.renderedSize() < size) {
++        spill.append(SpillKind::line, line);
++    }
++    auto const end = spill.renderedSize();
++#ifdef __linux__
++    auto const before = bytesRead();
++#endif
++    assert(drainAll(spill, end - 1) == "\n");
++#ifdef __linux__
++    auto const read = bytesRead() - before;
++    assert(read <= LogSpill::kStride + (2 * (lineSize + 5)));
++#endif
++}
++
++void manyOneLetterPhasesStopAt64MiBRendered()
++{
++    constexpr std::size_t phases = 10'000'000;
++    LogSpill spill;
++    for (std::size_t idx = 0; idx < phases; idx++) {
++        spill.append(SpillKind::phase, "x");
++    }
++    assert(spill.renderedSize() <= LogSpill::kDefaultCap + LogSpill::kTruncated.size() + 1);
++    std::string last;
++    (void) spill.drain(0, [&](SpillKind, std::string_view text) -> void { last = text; });
++    assert(last == LogSpill::kTruncated);
++    // The index covers the whole rendering: a read from the end is short.
++    assert(drainAll(spill, spill.renderedSize() - 1) == "\n");
++    assert(spill.linesBefore(spill.renderedSize()) == ((spill.renderedSize() - LogSpill::kTruncated.size() - 1) / 44) + 1);
++}
++
++// NOLINTEND(*-magic-numbers)
+ } // namespace
+ 
+ auto main() -> int
+@@ -168,6 +354,12 @@ try {
+     unusableTmpdirLosesTheReplayOnly();
+     followersSeeEveryLine();
+     cancelledReaderGivesUp();
++    renderedBytesMatchTheKeptLogRendering();
++    notesRenderAsNothingAndCountNoLines();
++    drainRenderedFromEveryOffsetGivesTheSameSuffix();
++    linesBeforeMatchesACountOverTheRendering();
++    theIndexLetsAReaderStartNearTheEnd();
++    manyOneLetterPhasesStopAt64MiBRendered();
+     return 0;
+ } catch (...) {
+     return 1;
+diff --git a/tests/nixos-test.nix b/tests/nixos-test.nix
+index 27d1a04..6bbfffd 100644
+--- a/tests/nixos-test.nix
++++ b/tests/nixos-test.nix
+@@ -45,6 +45,7 @@ let
+   # nix.conf), so it cannot be generated at runtime like the TLS certs.
+   signingSecretKey = "nix-grpc-test-1:1/icU6Hlts+rG2LxnM8NoIMcrLWAzdCgJEOLjewE8DxGQKUPC9+LF07Ci6sEjhQP2G50TfF9TkQFBwwVRW5FXw==";
+   signingPublicKey = "nix-grpc-test-1:RkClDwvfixdOwourBI4UD9hudE3xfU5EBQcMFUVuRV8=";
++  buildLog = import ./lib/build-log.nix { inherit pkgs; };
+   # A binary cache store for build logs: serves and takes files under
+   # /srv/logstore. An upload below /slow is answered after 20 s.
+   logStoreServer = pkgs.writeText "log-store-server.py" ''
+@@ -141,6 +142,7 @@ pkgs.testers.runNixOSTest {
+         pkgs.perf
+         pkgs.curl
+         pkgs.openssl
++        buildLog
+       ];
+       # Allow perf to resolve kernel symbols and record system-wide as root.
+       boot.kernel.sysctl."kernel.kptr_restrict" = 0;
+@@ -187,7 +189,7 @@ pkgs.testers.runNixOSTest {
+       '';
+       system.extraDependencies = [ pkgs.coreutils ];
+ 
+-      # Log store tests: a derivation that runs a script with coreutils.
++      # Build log tests: a derivation that runs a script with coreutils.
+       environment.etc."log-drv.nix".text = ''
+         { name, script }:
+         derivation {
+@@ -227,6 +229,8 @@ pkgs.testers.runNixOSTest {
+           issue ro ro-client
+           issue rw rw-client
+           issue stranger stranger
++          issue watcher watcher
++          issue follower follower
+           openssl req -newkey rsa:2048 -nodes \
+             -keyout expired.key -out expired.csr -subj /CN=localhost
+           openssl x509 -req -in expired.csr -not_before 20200101000000Z -not_after 20200102000000Z \
+@@ -283,6 +287,8 @@ pkgs.testers.runNixOSTest {
+             --allow localhost=trusted \
+             --allow ro-client=read-only \
+             --allow rw-client=write \
++            --allow watcher=watch \
++            --allow follower=watch \
+             --allow-anonymous read-only \
+             --metrics-listen 127.0.0.1:9464
+         '';
+-- 
+2.56.0
+

@@ -1,0 +1,39 @@
+/*
+ * Svelte Flow's --xy-* variables mapped to our tokens, so the canvas follows
+ * the Catppuccin theme instead of the library's stock greys. The .svelte-flow
+ * selector (with .dark) beats the library's own defaults by specificity.
+ * Only the parts this app draws are mapped: nodes, edges and handles are our
+ * own components, and nothing can be selected or connected.
+ */
+.svelte-flow,
+.svelte-flow.dark {
+	--xy-background-color: var(--canvas-bg);
+	--xy-background-pattern-color: var(--canvas-dots);
+
+	font-family: var(--font-sans);
+}
+
+/* One color per line kind, for lines and legend swatches: use var(--flow-c). */
+.flow-request {
+	--flow-c: var(--flow-request);
+}
+
+.flow-assign {
+	--flow-c: var(--flow-assign);
+}
+
+.flow-hit {
+	--flow-c: var(--flow-hit);
+}
+
+.flow-publish {
+	--flow-c: var(--flow-publish);
+}
+
+.flow-fetch {
+	--flow-c: var(--flow-fetch);
+}
+
+.flow-substitute {
+	--flow-c: var(--flow-substitute);
+}

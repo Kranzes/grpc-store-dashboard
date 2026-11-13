@@ -1,0 +1,11 @@
+# Generates src/lib/gen from ../proto. Run with `npm run gen`.
+version: v2
+clean: true
+inputs:
+  - directory: ../proto
+plugins:
+  - local: ['node', 'node_modules/@bufbuild/protoc-gen-es/bin/protoc-gen-es']
+    out: src/lib/gen
+    opt:
+      - target=ts
+      - import_extension=ts

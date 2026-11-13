@@ -1,0 +1,858 @@
+From ddddaf982d530f2de81ab0c48009290cdc727c06 Mon Sep 17 00:00:00 2001
+From: Ilan Joselevich <personal@ilanjoselevich.com>
+Date: Tue, 10 Nov 2026 19:27:48 +0100
+Subject: [PATCH 10/12] workers: report each running build's phase, and show it
+ to watchers
+
+The scheduler sees assignments, not build starts. A derivation stays
+"assigned" through the client's upload, input fetching, the build and
+publishing. A dashboard that says "Running" or names the current phase
+needs what only the builder knows.
+
+Builders note when each build started on the nix-daemon and its last
+stdenv phase with the time it began. Their WorkerReport lists the
+running builds that changed since the last report, and every running
+build in a session's first report, under the existing rules: at most
+every 2 s, only when something changed, only after ReportsWanted. A
+buildCommand build, a NixOS test included, never sets a phase and
+reports its start alone.
+
+The scheduler keeps the three values on the assigned entry, for that
+worker's current assignment only. Once a second it sends a DrvState
+with the new CAUSE_PROGRESS for each derivation a report changed.
+DrvState gains build_phase, build_started_ms and
+build_phase_started_ms, set in snapshots too. Both sides cut a phase
+name to 64 bytes and make it valid UTF-8, since a report that is not
+would fail to parse and drop the builder's session.
+
+events-test and builder-log-test cover the reports, the DrvStates, stale
+assignments, requeues, and long or invalid phase names.
+---
+ proto/events.proto              |  21 ++++-
+ proto/nix_remote.proto          |  13 +++
+ src/daemon/builder.cc           |  30 ++++++-
+ src/daemon/builder.hh           |  32 +++++++
+ src/daemon/dispatcher-events.cc |  24 ++++++
+ src/daemon/dispatcher.hh        |   8 +-
+ src/daemon/main.cc              |   4 +-
+ src/daemon/scheduler-link.hh    |  41 ++++++++-
+ src/daemon/scheduler.hh         |  37 ++++++++
+ tests/builder-log-test.cc       | 144 ++++++++++++++++++++++++++++++--
+ tests/events-test.cc            | 108 ++++++++++++++++++++++++
+ 11 files changed, 445 insertions(+), 17 deletions(-)
+
+diff --git a/proto/events.proto b/proto/events.proto
+index 33ec6c1..2dfd6f6 100644
+--- a/proto/events.proto
++++ b/proto/events.proto
+@@ -56,7 +56,8 @@ message WatchEvent {
+   // When the event happened, Unix ms: the scheduler's wall clock at process
+   // start plus monotonic time since. It never goes backwards within one
+   // instance and does not follow later system clock steps. Every *_ms field
+-  // uses this clock.
++  // uses this clock, except the build start and phase times that builders
++  // report.
+   uint64 time_ms = 2;
+   oneof event {
+     Reset reset = 3;
+@@ -164,14 +165,17 @@ message ClientGone {
+ }
+ 
+ // A derivation the scheduler is tracking: queued or assigned. Upsert keyed by
+-// drv_path. Removed by DrvGone.
++// drv_path. Removed by DrvGone. A CAUSE_PROGRESS update changes only
++// build_phase, build_started_ms and build_phase_started_ms, at most once a
++// second per derivation.
+ message DrvState {
+   enum Phase {
+     PHASE_QUEUED = 0;
+     // No connected worker offers its system and features. Still queued.
+     PHASE_UNPLACEABLE = 1;
+     // Sent to a worker. Covers the client's upload, input fetching, the
+-    // build and publishing outputs: the scheduler does not see a build start.
++    // build and publishing outputs. The scheduler does not see a build
++    // start itself; builders that report it set build_started_ms.
+     PHASE_ASSIGNED = 2;
+   }
+   // What made the scheduler send this update.
+@@ -199,6 +203,8 @@ message DrvState {
+     CAUSE_REQUEUED = 5;
+     // `phase` switched between PHASE_QUEUED and PHASE_UNPLACEABLE.
+     CAUSE_PLACEABILITY = 6;
++    // The builder reported a new phase or the start of the build.
++    CAUSE_PROGRESS = 7;
+   }
+   string drv_path = 1; // base name, "<hash>-<name>.drv"
+   Phase phase = 2;
+@@ -230,6 +236,15 @@ message DrvState {
+   // inputs_unknown.
+   repeated InputSource input_sources = 15;
+   uint32 inputs_unknown = 16;
++  // ASSIGNED only, as the builder last reported them. Empty and 0 until
++  // then, and from builders that do not report them. The scheduler sees the
++  // assignment; these say when the build started on the builder (Unix ms,
++  // the builder's clock), its last stdenv phase, and when that began. A
++  // derivation with a buildCommand, a NixOS test included, never sets a
++  // phase.
++  string build_phase = 17;
++  uint64 build_started_ms = 18;
++  uint64 build_phase_started_ms = 19;
+ }
+ 
+ message InputSource {
+diff --git a/proto/nix_remote.proto b/proto/nix_remote.proto
+index 060d346..b8d39f5 100644
+--- a/proto/nix_remote.proto
++++ b/proto/nix_remote.proto
+@@ -413,6 +413,19 @@ message WorkerReport {
+   // on this session or an earlier one, per substituter, only those with
+   // traffic. At most 32.
+   repeated Substituter substituters = 3;
++  // Running builds here whose phase or start changed since the last report;
++  // every running build in the first report of a session. A build that ends
++  // needs no entry: its Done tells the scheduler.
++  repeated BuildProgress builds = 4;
++}
++
++// What a builder knows about one running build that the scheduler does not.
++message BuildProgress {
++  string drv_path = 1;          // base name
++  uint64 assign_id = 2;
++  string phase = 3;             // the last setPhase, such as "buildPhase"; empty before the first
++  uint64 started_ms = 4;        // when the build started here, Unix ms
++  uint64 phase_started_ms = 5;  // when this node saw that setPhase; 0 with no phase
+ }
+ 
+ message WorkerMsg {
+diff --git a/src/daemon/builder.cc b/src/daemon/builder.cc
+index 930a338..e29c160 100644
+--- a/src/daemon/builder.cc
++++ b/src/daemon/builder.cc
+@@ -17,6 +17,7 @@
+ #include "logfmt.hh"
+ #include "metrics.hh"
+ #include "nix_remote.pb.h"
++#include "scheduler-link.hh"
+ #include "substituter-url.hh"
+ 
+ namespace nixgrpc {
+@@ -384,7 +385,34 @@ void Builder::tick()
+     giveBack(
+         takeUnclaimed([&](const Expected & ent) -> bool { return draining || now - ent.since > expectTimeout; }),
+         draining ? nix::remote::Done::DRAINING : nix::remote::Done::UNREACHABLE);
+-    link.tick(now);
++    link.tick(now, runningBuilds());
++}
++
++auto Builder::runningBuilds() const -> std::vector<RunningBuild>
++{
++    std::vector<std::pair<RunningBuild, std::shared_ptr<Expected::Shared>>> started;
++    {
++        auto lck = state.lock();
++        for (const auto & [drv, ent] : lck->expected) {
++            if (ent.running && ent.shared->progressVersion > 0) {
++                auto & run = started.emplace_back(RunningBuild{}, ent.shared).first;
++                run.progress.set_drv_path(drv);
++                run.progress.set_assign_id(ent.assignId);
++            }
++        }
++    }
++    // Takes each build's lock only after releasing the table's.
++    std::vector<RunningBuild> out;
++    out.reserve(started.size());
++    for (auto & [run, shared] : started) {
++        const std::scoped_lock lock(shared->mutex);
++        run.version = shared->progressVersion;
++        run.progress.set_started_ms(shared->startedMs);
++        run.progress.set_phase(shared->phase);
++        run.progress.set_phase_started_ms(shared->phaseStartedMs);
++        out.push_back(std::move(run));
++    }
++    return out;
+ }
+ 
+ } // namespace nixgrpc
+diff --git a/src/daemon/builder.hh b/src/daemon/builder.hh
+index ad3cb97..12ec336 100644
+--- a/src/daemon/builder.hh
++++ b/src/daemon/builder.hh
+@@ -22,6 +22,7 @@
+ 
+ #include <nix/util/sync.hh>
+ 
++#include "build-report.hh"
+ #include "log-spill.hh"
+ #include "metrics.hh"
+ #include "nix_remote.pb.h"
+@@ -32,6 +33,13 @@ namespace nixgrpc {
+ 
+ using Clock = std::chrono::steady_clock;
+ 
++// The time now in Unix ms, as reports carry it.
++inline auto unixNowMs() -> uint64_t
++{
++    return static_cast<uint64_t>(
++        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
++}
++
+ // One assignment the builder accepted from its scheduler.
+ struct Expected
+ {
+@@ -57,6 +65,21 @@ struct Expected
+         LogSpill spill; // the owner's build log, replayed to whoever attaches
+         // Unix ms when the owner handed the build to the nix-daemon, 0 before.
+         std::atomic<uint64_t> startedMs{0};
++        // The last setPhase and when it came, under `mutex`, for the
++        // scheduler's reports. `progressVersion` grows with the start and
++        // each phase. The name is cut to `maxPhase` bytes at a character
++        // boundary and made valid UTF-8, as a proto3 string must be: the
++        // scheduler cannot parse a report that is not.
++        std::string phase;
++        uint64_t phaseStartedMs = 0;
++        std::atomic<uint64_t> progressVersion{0};
++
++        // Owner only.
++        void started(uint64_t unixMs)
++        {
++            startedMs = unixMs;
++            progressVersion++;
++        }
+ 
+         // Owner only. Waking under the lock keeps an attacher that just
+         // checked `written()` from sleeping through this record.
+@@ -64,8 +87,15 @@ struct Expected
+         {
+             spill.append(kind, text);
+             const std::scoped_lock lock(mutex);
++            if (kind == SpillKind::phase) {
++                phase = cleanUtf8(cutAtChar(text, maxPhase));
++                phaseStartedMs = unixNowMs();
++                progressVersion++;
++            }
+             cv.notify_all();
+         }
++
++        static constexpr size_t maxPhase = 64;
+     };
+ 
+     std::shared_ptr<Shared> shared = std::make_shared<Shared>();
+@@ -228,6 +258,8 @@ private:
+     // An Expect left the table without finishing: mark it, and wake whoever
+     // follows its log.
+     static void wake(Expected::Shared & shared);
++    // Builds that started here, for the next report.
++    [[nodiscard]] auto runningBuilds() const -> std::vector<RunningBuild>;
+     void giveBack(const std::vector<std::pair<std::string, uint64_t>> & drvs, nix::remote::Done::Reason reason);
+     auto takeUnclaimed(const std::function<bool(const Expected &)> & pred) -> std::vector<std::pair<std::string, uint64_t>>;
+ };
+diff --git a/src/daemon/dispatcher-events.cc b/src/daemon/dispatcher-events.cc
+index ff6dd9f..ceb25f4 100644
+--- a/src/daemon/dispatcher-events.cc
++++ b/src/daemon/dispatcher-events.cc
+@@ -295,6 +295,9 @@ auto Dispatcher::drvEventLocked(const sched::Entry & ent, DrvState::Cause cause,
+         known += src.paths;
+     }
+     out.set_inputs_unknown(static_cast<uint32_t>(ent.inputs.size()) - known);
++    out.set_build_phase(ent.buildPhase);
++    out.set_build_started_ms(ent.buildStartedMs);
++    out.set_build_phase_started_ms(ent.buildPhaseStartedMs);
+     return event;
+ }
+ 
+@@ -433,6 +436,16 @@ void Dispatcher::flushWorkersLocked()
+             emitLocked(workerEventLocked(wid));
+         }
+     }
++    // A drv requeued or gone since its report needs none.
++    for (const auto & path : std::exchange(progressed, {})) {
++        auto const drv = core.findDrv(path);
++        if (!drv || eventWatchers.empty()) {
++            continue;
++        }
++        if (const auto & ent = core.entry(*drv); ent && ent->worker != sched::noWorker) {
++            emitLocked(drvEventLocked(*ent, DrvState::CAUSE_PROGRESS));
++        }
++    }
+ }
+ 
+ auto Dispatcher::farmTrafficLocked(const std::string & url) -> SubstituterTraffic &
+@@ -487,6 +500,17 @@ void Dispatcher::onReport(sched::WorkerId wid, const nix::remote::WorkerReport &
+     if (report.has_disk_total_bytes()) {
+         info.diskTotal = report.disk_total_bytes();
+     }
++    // Only the worker's own assignments. A phase name is short; a longer
++    // one is cut, then made valid UTF-8.
++    for (const auto & run : report.builds()) {
++        auto const phase = cleanUtf8(std::string_view(run.phase()).substr(0, maxPhaseLen));
++        if (core.setProgress(wid, run.drv_path(), run.assign_id(), phase, run.started_ms(), run.phase_started_ms())) {
++            progressed.insert(run.drv_path());
++        }
++    }
++    if (report.substituters_size() == 0 && !report.has_disk_free_bytes() && !report.has_disk_total_bytes()) {
++        return; // builds only: the WorkerState did not change
++    }
+     if (!std::exchange(info.dirty, true)) {
+         dirtyWorkers.push_back(wid);
+     }
+diff --git a/src/daemon/dispatcher.hh b/src/daemon/dispatcher.hh
+index 5044ebb..fb6bd18 100644
+--- a/src/daemon/dispatcher.hh
++++ b/src/daemon/dispatcher.hh
+@@ -19,6 +19,7 @@
+ #include <initializer_list>
+ #include <memory>
+ #include <optional>
++#include <set>
+ #include <span>
+ #include <string>
+ #include <string_view>
+@@ -181,6 +182,8 @@ private:
+     using Clock = std::chrono::steady_clock;
+     // Longer is not a system: onWant and onHello refuse it, cachedLocked leaves it out.
+     static constexpr size_t maxSystemLen = 64;
++    // A reported build phase is cut to this.
++    static constexpr size_t maxPhaseLen = 64;
+     Config config;
+     Metrics & metrics;
+     prometheus::Counter & assignedCtr;
+@@ -209,6 +212,8 @@ private:
+     };
+     std::vector<WorkerInfo> workerInfo ABSL_GUARDED_BY(mutex);
+     std::vector<sched::WorkerId> dirtyWorkers ABSL_GUARDED_BY(mutex);
++    // Assigned drvs a report changed since the last stats pass, by path.
++    std::set<std::string> progressed ABSL_GUARDED_BY(mutex);
+     uint64_t passes ABSL_GUARDED_BY(mutex) = 0;
+     bool lettingGo ABSL_GUARDED_BY(mutex) = false;
+     // Assigned drvs whose last follower left. Revoked unless one is back in time.
+@@ -314,7 +319,8 @@ private:
+     // Adds a report's deltas to the worker's totals and to the counters.
+     // Touches no queue, membership or placeability state.
+     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void onReport(sched::WorkerId wid, const nix::remote::WorkerReport & report);
+-    // One WorkerState per worker a report changed, if anyone watches.
++    // One WorkerState per worker a report changed, and one CAUSE_PROGRESS
++    // DrvState per derivation, if anyone watches.
+     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void flushWorkersLocked();
+     // The entry for `url` in Counters.substituters, kept sorted by URL.
+     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) auto farmTrafficLocked(const std::string & url) -> nix::remote::SubstituterTraffic &;
+diff --git a/src/daemon/main.cc b/src/daemon/main.cc
+index bc59a6c..9c3832e 100644
+--- a/src/daemon/main.cc
++++ b/src/daemon/main.cc
+@@ -945,9 +945,7 @@ public:
+         log({.kind = nixgrpc::BuildEvent::Kind::note, .text = workerName + ": building " + std::string(drvPath.to_string())});
+         try {
+             phase.next("build");
+-            shared.startedMs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+-                                                         std::chrono::system_clock::now().time_since_epoch())
+-                                                         .count());
++            shared.started(nixgrpc::unixNowMs());
+             nixgrpc::Metrics::Held const building(metrics, "build_slot");
+             res = backends.storedBuild(cancelled, localStore, drvPath, mode, limits, log);
+             phase.done();
+diff --git a/src/daemon/scheduler-link.hh b/src/daemon/scheduler-link.hh
+index c15a5c6..c5bb5e1 100644
+--- a/src/daemon/scheduler-link.hh
++++ b/src/daemon/scheduler-link.hh
+@@ -7,16 +7,22 @@
+ // this session or an earlier one, so a scheduler that restarts never counts
+ // a builder's history twice and a failed send loses nothing. An older
+ // scheduler never asks, so it gets no reports.
++//
++// They also carry the running builds whose phase or start changed since the
++// last report that went out, and every running build in the first report of
++// a session, which a new scheduler needs.
+ 
+ #include <algorithm>
+ #include <chrono>
+ #include <cstddef>
+ #include <cstdint>
+ #include <functional>
++#include <map>
+ #include <mutex>
+ #include <optional>
+ #include <string>
+ #include <utility>
++#include <vector>
+ 
+ #include <nix/util/sync.hh>
+ 
+@@ -25,6 +31,14 @@
+ 
+ namespace nixgrpc {
+ 
++// A build running here, as the builder's reports describe it. `version`
++// grows with each change.
++struct RunningBuild
++{
++    nix::remote::BuildProgress progress;
++    uint64_t version = 0;
++};
++
+ class SchedulerLink
+ {
+ public:
+@@ -75,8 +89,9 @@ public:
+ 
+     // From the serve loop: sends a report when one is due. The first goes
+     // out on the first tick after ReportsWanted, then one at most every
+-    // minInterval when traffic grew or free disk moved by a step.
+-    void tick(Clock::time_point now = Clock::now())
++    // minInterval when traffic grew, free disk moved by a step or a build in
++    // `running` changed.
++    void tick(Clock::time_point now = Clock::now(), const std::vector<RunningBuild> & running = {})
+     {
+         const std::scoped_lock lock(reportMutex);
+         SendFn sendFn;
+@@ -99,9 +114,20 @@ public:
+         auto & report = *msg.mutable_report();
+         bool const traffic = addDeltas(report, totals);
+         bool const step = disk && (!diskSent || diskStep(*diskSent, disk->free));
+-        if (!first && !traffic && !step) {
++        std::vector<const RunningBuild *> changed;
++        for (const auto & run : running) {
++            auto const sentAs = progressSent.find(run.progress.drv_path());
++            if (first || sentAs == progressSent.end()
++                || sentAs->second != std::pair(run.progress.assign_id(), run.version)) {
++                changed.push_back(&run);
++            }
++        }
++        if (!first && !traffic && !step && changed.empty()) {
+             return;
+         }
++        for (const auto * run : changed) {
++            *report.add_builds() = run->progress;
++        }
+         bool const withDisk = disk && (first || step);
+         if (withDisk) {
+             report.set_disk_free_bytes(disk->free);
+@@ -114,6 +140,13 @@ public:
+         if (withDisk) {
+             diskSent = disk->free;
+         }
++        for (const auto * run : changed) {
++            progressSent[run->progress.drv_path()] = {run->progress.assign_id(), run->version};
++        }
++        std::erase_if(progressSent, [&](const auto & item) -> bool {
++            return std::ranges::none_of(
++                running, [&](const RunningBuild & run) -> bool { return run.progress.drv_path() == item.first; });
++        });
+         lastReport = now;
+         if (auto lck = session.lock(); lck->generation == generation) {
+             lck->reported = true;
+@@ -143,6 +176,8 @@ private:
+     SubstituterTotals sent; // what the last successful report covered
+     std::optional<Disk> disk;
+     std::optional<uint64_t> diskSent;
++    // Each running build's assignment and version, as last sent in a report.
++    std::map<std::string, std::pair<uint64_t, uint64_t>> progressSent;
+     Clock::time_point lastReport;
+ 
+     [[nodiscard]] auto diskStep(uint64_t last, uint64_t now) const -> bool
+diff --git a/src/daemon/scheduler.hh b/src/daemon/scheduler.hh
+index 2ef23a1..664a08e 100644
+--- a/src/daemon/scheduler.hh
++++ b/src/daemon/scheduler.hh
+@@ -360,6 +360,17 @@ struct Entry
+     double assignMs = 0;              // placed at; 0 if a Hello reported someone else's assignment
+     bool cacheChecked = false;        // a Want for it was looked up in the cache and missed
+     std::vector<InputSource> sources; // where its inputs were when placed
++    // As the assigned builder last reported them; cleared by an assignment.
++    std::string buildPhase;
++    uint64_t buildStartedMs = 0;
++    uint64_t buildPhaseStartedMs = 0;
++
++    void clearProgress()
++    {
++        buildPhase.clear();
++        buildStartedMs = 0;
++        buildPhaseStartedMs = 0;
++    }
+ };
+ 
+ // What a give-back says: the worker takes no builds at all right now, or it
+@@ -665,6 +676,7 @@ public:
+             }
+             if (slot->assignId != assignId) {
+                 slot->assignMs = 0; // another assignment, placed at an unknown time
++                slot->clearProgress();
+             }
+             slot->worker = wid;
+             slot->assignId = assignId;
+@@ -867,6 +879,30 @@ public:
+         }
+     }
+ 
++    // A builder's report on a build it runs. False, and nothing changes,
++    // unless `drvPath` is assigned to `wid` under `assignId` and the report
++    // says something new.
++    auto setProgress(
++        WorkerId wid, std::string_view drvPath, uint64_t assignId, std::string_view phase, uint64_t startedMs,
++        uint64_t phaseStartedMs) -> bool
++    {
++        auto const drv = findDrv(drvPath);
++        if (!drv) {
++            return false;
++        }
++        auto & slot = entries.at(*drv);
++        if (!slot || slot->worker != wid || slot->assignId != assignId) {
++            return false;
++        }
++        if (slot->buildPhase == phase && slot->buildStartedMs == startedMs && slot->buildPhaseStartedMs == phaseStartedMs) {
++            return false;
++        }
++        slot->buildPhase = std::string(phase);
++        slot->buildStartedMs = startedMs;
++        slot->buildPhaseStartedMs = phaseStartedMs;
++        return true;
++    }
++
+     // What a follower was last told about a queued entry.
+     void markUnplaceable(DrvId drv, bool unplaceable)
+     {
+@@ -1133,6 +1169,7 @@ private:
+         slot->worker = *wid;
+         slot->assignId = ++lastAssignId;
+         slot->sources = inputSources(*slot);
++        slot->clearProgress();
+         workers.at(*wid).running.push_back(drv);
+         refreshFree(*wid);
+         out.push_back(Assign{.drv = drv, .worker = *wid, .assignId = slot->assignId, .clients = slot->followers});
+diff --git a/tests/builder-log-test.cc b/tests/builder-log-test.cc
+index ecf8a9e..e771739 100644
+--- a/tests/builder-log-test.cc
++++ b/tests/builder-log-test.cc
+@@ -1,6 +1,7 @@
+-// The builder's Expect table as GetBuildLog sees it: followers wake when an
+-// Expect leaves without finishing, keptBy names the build that wrote Nix's
+-// kept log, and that log is served until a new build of it starts.
++// The builder's Expect table: followers of a log wake when an Expect leaves
++// without finishing, keptBy names the build that wrote Nix's kept log, that
++// log is served until a new build of it starts, and reports carry each
++// running build's start and phase when they change.
+ 
+ #include <cassert>
+ #include <chrono>
+@@ -11,9 +12,12 @@
+ #include <fstream>
+ #include <functional>
+ #include <iostream>
++#include <map>
++#include <memory>
+ #include <mutex>
+ #include <string>
+ #include <thread>
++#include <utility>
+ #include <vector>
+ 
+ #include <stdlib.h> // NOLINT(modernize-deprecated-headers): mkdtemp is POSIX.
+@@ -29,10 +33,11 @@
+ #include "backend.hh"
+ #include "build-log-service.hh"
+ #include "builder.hh"
++#include "log-spill.hh"
+ #include "metrics.hh"
+ #include "nix_remote.pb.h"
+ 
+-// NOLINTBEGIN(*-magic-numbers): assignment ids and waits.
++// NOLINTBEGIN(*-magic-numbers): assignment ids, times and waits.
+ namespace {
+ 
+ using nixgrpc::Builder;
+@@ -40,9 +45,9 @@ using nix::remote::WorkerMsg;
+ 
+ constexpr auto advertise = "10.0.0.1:50051";
+ 
+-auto config() -> Builder::Config
++auto config(std::function<nixgrpc::Clock::time_point()> now = nixgrpc::Clock::now) -> Builder::Config
+ {
+-    return {.advertise = advertise, .systems = {"x86_64-linux"}, .features = {}, .maxJobs = 1};
++    return {.advertise = advertise, .systems = {"x86_64-linux"}, .features = {}, .maxJobs = 1, .now = std::move(now)};
+ }
+ 
+ // Sent messages, for the tests that look at them.
+@@ -50,15 +55,36 @@ struct Sent
+ {
+     std::mutex mutex;
+     std::vector<WorkerMsg> msgs;
++    bool failing = false; // the next sends fail, as on a broken stream
+ 
+     auto send() -> Builder::SendFn
+     {
+         return [this](const WorkerMsg & msg) -> bool {
+             const std::scoped_lock lock(mutex);
++            if (failing) {
++                return false;
++            }
+             msgs.push_back(msg);
+             return true;
+         };
+     }
++
++    // The builds of each report sent since the last call, by drv path.
++    auto reports() -> std::vector<std::map<std::string, nix::remote::BuildProgress>>
++    {
++        const std::scoped_lock lock(mutex);
++        std::vector<std::map<std::string, nix::remote::BuildProgress>> out;
++        for (const auto & msg : std::exchange(msgs, {})) {
++            if (!msg.has_report()) {
++                continue;
++            }
++            auto & builds = out.emplace_back();
++            for (const auto & run : msg.report().builds()) {
++                builds[run.drv_path()] = run;
++            }
++        }
++        return out;
++    }
+ };
+ 
+ void expect(Builder & builder, const std::string & drv, uint64_t assignId)
+@@ -212,6 +238,111 @@ void keptByNamesTheLastBuildOfADerivation(nixgrpc::Metrics & metrics)
+     assert(builder.keptBy("ddd-other.drv") == 0);
+ }
+ 
++// A build admitted here that the owner has started.
++// NOLINTNEXTLINE(bugprone-easily-swappable-parameters): an id, then a time.
++auto start(Builder & builder, const std::string & drv, uint64_t assignId, uint64_t startedMs)
++    -> std::shared_ptr<nixgrpc::Expected::Shared>
++{
++    expect(builder, drv, assignId);
++    auto adm = builder.admit(drv);
++    assert(adm);
++    adm->shared->started(startedMs);
++    return adm->shared;
++}
++
++void reportsCarryWhatChanged(nixgrpc::Metrics & metrics)
++{
++    using std::chrono::seconds;
++    Sent sent;
++    auto now = nixgrpc::Clock::now();
++    Builder builder(config([&] -> nixgrpc::Clock::time_point { return now; }), metrics);
++    builder.setSend(sent.send());
++    builder.reportsWanted();
++    auto const one = start(builder, "aaa-one.drv", 1, 1000);
++    auto const two = start(builder, "bbb-two.drv", 2, 2000);
++    // A buildCommand build never sets a phase: its start alone is reported.
++    auto const three = start(builder, "ccc-three.drv", 3, 3000);
++    one->logged(nixgrpc::SpillKind::phase, "unpackPhase");
++
++    // The first report of a session lists every running build.
++    builder.tick();
++    auto reports = sent.reports();
++    assert(reports.size() == 1 && reports.front().size() == 3);
++    assert(reports.front().at("aaa-one.drv").phase() == "unpackPhase");
++    assert(reports.front().at("aaa-one.drv").phase_started_ms() > 0);
++    assert(reports.front().at("aaa-one.drv").started_ms() == 1000);
++    assert(reports.front().at("ccc-three.drv").phase().empty());
++    assert(reports.front().at("ccc-three.drv").started_ms() == 3000);
++    assert(reports.front().at("ccc-three.drv").phase_started_ms() == 0);
++    assert(reports.front().at("bbb-two.drv").assign_id() == 2);
++
++    // Nothing changed: no report.
++    now += seconds(3);
++    builder.tick();
++    assert(sent.reports().empty());
++
++    // One build changed phase: a report with it alone, and the time it began.
++    auto const before = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
++                                                  std::chrono::system_clock::now().time_since_epoch())
++                                                  .count());
++    two->logged(nixgrpc::SpillKind::phase, "buildPhase");
++    two->logged(nixgrpc::SpillKind::line, "a line is no change");
++    now += seconds(3);
++    builder.tick();
++    reports = sent.reports();
++    assert(reports.size() == 1 && reports.front().size() == 1);
++    assert(reports.front().at("bbb-two.drv").phase() == "buildPhase");
++    assert(reports.front().at("bbb-two.drv").phase_started_ms() >= before);
++
++    // Within 2 s of the last report it waits.
++    one->logged(nixgrpc::SpillKind::phase, "patchPhase");
++    now += seconds(1);
++    builder.tick();
++    assert(sent.reports().empty());
++    // A failed send keeps the change for the next report.
++    {
++        const std::scoped_lock lock(sent.mutex);
++        sent.failing = true;
++    }
++    now += seconds(2);
++    builder.tick();
++    {
++        const std::scoped_lock lock(sent.mutex);
++        sent.failing = false;
++    }
++    now += seconds(3);
++    builder.tick();
++    reports = sent.reports();
++    assert(reports.size() == 1 && reports.front().size() == 1);
++    assert(reports.front().at("aaa-one.drv").phase() == "patchPhase");
++
++    // A phase name is cut at a character boundary and made valid UTF-8,
++    // or the scheduler could not parse the report.
++    one->logged(nixgrpc::SpillKind::phase, std::string(63, 'p') + "\xC3\xA9Phase");
++    two->logged(nixgrpc::SpillKind::phase, "bad\xFF\xC3Phase");
++    now += seconds(3);
++    builder.tick();
++    {
++        const std::scoped_lock lock(sent.mutex);
++        assert(sent.msgs.size() == 1);
++        WorkerMsg parsed;
++        assert(parsed.ParseFromString(sent.msgs.front().SerializeAsString()));
++    }
++    reports = sent.reports();
++    assert(reports.size() == 1 && reports.front().size() == 2);
++    assert(reports.front().at("aaa-one.drv").phase() == std::string(63, 'p'));
++    assert(reports.front().at("bbb-two.drv").phase() == "bad\xEF\xBF\xBD\xEF\xBF\xBDPhase");
++
++    // A new session gets every running build again.
++    builder.setSend(sent.send());
++    builder.reportsWanted();
++    now += seconds(1);
++    builder.tick();
++    reports = sent.reports();
++    assert(reports.size() == 1 && reports.front().size() == 3);
++    (void) three;
++}
++
+ } // namespace
+ // NOLINTEND(*-magic-numbers)
+ 
+@@ -227,6 +358,7 @@ auto main() -> int
+         aGiveBackOnDrainWakesAFollower(metrics);
+         theKeptLogStaysUntilTheBuildStarts(metrics);
+         keptByNamesTheLastBuildOfADerivation(metrics);
++        reportsCarryWhatChanged(metrics);
+     } catch (std::exception & err) {
+         std::cerr << "error: " << err.what() << "\n";
+         return 1;
+diff --git a/tests/events-test.cc b/tests/events-test.cc
+index 49ea135..1bc1ea7 100644
+--- a/tests/events-test.cc
++++ b/tests/events-test.cc
+@@ -1700,6 +1700,113 @@ void testRandom()
+     }
+ }
+ 
++// NOLINTNEXTLINE(bugprone-easily-swappable-parameters): as BuildProgress orders them.
++auto progressMsg(const std::string & path, uint64_t assignId, const std::string & phase, uint64_t started, uint64_t phaseStarted)
++    -> rpc::WorkerMsg
++{
++    rpc::WorkerMsg msg;
++    auto * run = msg.mutable_report()->add_builds();
++    run->set_drv_path(path);
++    run->set_assign_id(assignId);
++    run->set_phase(phase);
++    run->set_started_ms(started);
++    run->set_phase_started_ms(phaseStarted);
++    return msg;
++}
++
++// The assignment the worker was told to expect for `path`.
++auto expected(Session & session, const std::string & path) -> uint64_t
++{
++    const std::scoped_lock lock(session.mutex);
++    uint64_t assignId = 0;
++    for (const auto & cmd : session.cmds) {
++        if (cmd.has_expect() && cmd.expect().drv_path() == path) {
++            assignId = cmd.expect().assign_id();
++        }
++    }
++    return assignId;
++}
++
++// What builders report about running builds reaches watchers as
++// CAUSE_PROGRESS DrvStates, at most one per derivation and stats pass,
++// for the derivation's current assignment only.
++void testProgress()
++{
++    Metrics metrics("");
++    Dispatcher disp({.defaultSystem = std::string(x86), .lookupThreads = 0}, metrics);
++    Session wkr;
++    sendOne(disp, wkr.worker, helloMsg("w1", 4));
++    auto const client = disp.connectClient([](const rpc::SchedMsg &) -> bool { return true; }, [] -> void {}, "ci");
++    rpc::ClientMsgs wants;
++    wants.add_msgs()->mutable_want()->set_drv_path("p.drv");
++    disp.clientMsgs(client, wants);
++    auto const assignId = expected(wkr, "p.drv");
++    assert(assignId > 0);
++    Sink sink;
++    auto const watcher = disp.watch(sink.send(), sink.end());
++    assert(watcher);
++    sink.take();
++    auto const progress = [&] -> std::vector<rpc::DrvState> {
++        std::vector<rpc::DrvState> out;
++        for (const auto & event : sink.take()) {
++            if (event.has_drv() && event.drv().cause() == rpc::DrvState::CAUSE_PROGRESS) {
++                out.push_back(event.drv());
++            }
++        }
++        return out;
++    };
++    auto const waitProgress = [&](size_t count) -> std::vector<rpc::DrvState> {
++        std::vector<rpc::DrvState> seen;
++        waitFor([&] -> bool {
++            auto more = progress();
++            seen.insert(seen.end(), more.begin(), more.end());
++            return seen.size() >= count;
++        });
++        return seen;
++    };
++
++    // A report sets the start, the phase and its start on the assigned drv.
++    sendOne(disp, wkr.worker, progressMsg("p.drv", assignId, "", 1000, 0));
++    auto got = waitProgress(1);
++    assert(got.size() == 1 && got.front().build_started_ms() == 1000 && got.front().build_phase().empty());
++    assert(got.front().phase() == rpc::DrvState::PHASE_ASSIGNED && got.front().assign_id() == assignId);
++    // Two phase changes within a stats pass: one DrvState, with the last.
++    sendOne(disp, wkr.worker, progressMsg("p.drv", assignId, "configurePhase", 1000, 2000));
++    sendOne(disp, wkr.worker, progressMsg("p.drv", assignId, "buildPhase", 1000, 3000));
++    got = waitProgress(1);
++    std::this_thread::sleep_for(std::chrono::milliseconds(1200));
++    auto const late = progress();
++    got.insert(got.end(), late.begin(), late.end());
++    assert(got.size() == 1);
++    assert(got.front().build_phase() == "buildPhase" && got.front().build_phase_started_ms() == 3000);
++    assert(got.front().build_started_ms() == 1000);
++    // The same report again changes nothing.
++    sendOne(disp, wkr.worker, progressMsg("p.drv", assignId, "buildPhase", 1000, 3000));
++    // A stale assignment and a drv the worker does not run change nothing.
++    sendOne(disp, wkr.worker, progressMsg("p.drv", assignId + 7, "installPhase", 1000, 4000));
++    sendOne(disp, wkr.worker, progressMsg("q.drv", assignId, "installPhase", 1000, 4000));
++    std::this_thread::sleep_for(std::chrono::milliseconds(1200));
++    assert(progress().empty());
++    // A snapshot carries it.
++    auto const snap = snapshot(disp);
++    assert(snap.drvs.at("p.drv").build_phase() == "buildPhase");
++    assert(snap.drvs.at("p.drv").build_phase_started_ms() == 3000);
++    // A requeue clears it: the next assignment starts without a phase.
++    rpc::WorkerMsg back;
++    back.mutable_done()->set_drv_path("p.drv");
++    back.mutable_done()->set_assign_id(assignId);
++    back.mutable_done()->set_outcome(rpc::Done::GIVEN_BACK);
++    sendOne(disp, wkr.worker, back);
++    Session other;
++    sendOne(disp, other.worker, helloMsg("w2", 4));
++    waitFor([&] -> bool { return expected(other, "p.drv") != 0 || expected(wkr, "p.drv") != assignId; });
++    auto const again = snapshot(disp);
++    const auto & requeued = again.drvs.at("p.drv");
++    assert(requeued.assign_id() != assignId);
++    assert(requeued.build_phase().empty() && requeued.build_started_ms() == 0 && requeued.build_phase_started_ms() == 0);
++    disp.unwatch(*watcher);
++}
++
+ } // namespace
+ // NOLINTEND(*-magic-numbers, *-avoid-unchecked-container-access, bugprone-unchecked-optional-access, readability-identifier-length, cert-msc32-c, cert-msc51-cpp, bugprone-random-generator-seed, misc-use-internal-linkage)
+ 
+@@ -1712,6 +1819,7 @@ try {
+     testDrainReasons();
+     testVersionCut();
+     testReports();
++    testProgress();
+     testRandom();
+     return 0;
+ } catch (std::exception & err) {
+-- 
+2.56.0
+

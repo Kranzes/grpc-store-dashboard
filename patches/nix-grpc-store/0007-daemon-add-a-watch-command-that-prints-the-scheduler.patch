@@ -1,0 +1,833 @@
+From 5b8c85b43a5662f22e4192fef162b7adc20bf2b8 Mon Sep 17 00:00:00 2001
+From: Ilan Joselevich <personal@ilanjoselevich.com>
+Date: Tue, 10 Nov 2026 19:18:42 +0100
+Subject: [PATCH 07/12] daemon: add a watch command that prints the scheduler's
+ events
+
+The event stream should have a client in this repository, to try it on
+a farm, to script against it, and to test the service from outside.
+nix-grpc-daemon watch --json prints each event as one line of
+protobuf's JSON mapping, flushed per batch, so jq and shell loops can
+read it. When the stream ends, it prints the status on stderr and exits
+with 1 unless the status is OK. It prints fields at their zero value
+too, because PHASE_QUEUED, CAUSE_SNAPSHOT and BUILT are zero values.
+--json is required, so a format for people can become the default
+later without breaking scripts.
+
+watch takes the builder's flags for dialing the scheduler (--scheduler,
+--scheduler-token-file, --tls-cert, --tls-key, --client-ca) and the
+same credentials code, which moves from coordinator.cc to options.cc as
+makeSchedulerCredentials(). It needs TLS, since Watch refuses anonymous
+callers and the command sends no token over plaintext. It pings like
+the builder's session and the plugin do, so a scheduler that vanished
+without a FIN does not leave it waiting forever. All three now take
+their keepalive from setKeepalive() in keepalive.hh.
+
+events-grpc-test runs the command against the real service, with a
+client certificate and with a bearer token, and reads every line back
+into a WatchEvent. watch-command-test runs the built binary.
+---
+ meson.build                     |  17 +++-
+ nix/packages/nix-grpc-store.nix |   1 +
+ proto/events.proto              |   4 +-
+ src/client/store.cc             |   4 +-
+ src/daemon/coordinator.cc       |  53 +---------
+ src/daemon/main.cc              |  11 ++-
+ src/daemon/options.cc           |  45 +++++++++
+ src/daemon/options.hh           |   5 +
+ src/daemon/watch-command.cc     | 138 ++++++++++++++++++++++++++
+ src/daemon/watch-command.hh     |  30 ++++++
+ src/keepalive.hh                |  11 +++
+ tests/events-grpc-test.cc       | 165 ++++++++++++++++++++++++++++++--
+ tests/watch-command-test.sh     |  15 +++
+ 13 files changed, 430 insertions(+), 69 deletions(-)
+ create mode 100644 src/daemon/watch-command.cc
+ create mode 100644 src/daemon/watch-command.hh
+ create mode 100755 tests/watch-command-test.sh
+
+diff --git a/meson.build b/meson.build
+index 4cae38c..6283176 100644
+--- a/meson.build
++++ b/meson.build
+@@ -220,10 +220,11 @@ if build_server
+     'src/daemon/eds.cc',
+     'src/daemon/events.cc',
+     'src/daemon/options.cc',
++    'src/daemon/watch-command.cc',
+     {'darwin': 'src/daemon/sandbox-darwin.cc', 'linux': 'src/daemon/sandbox-linux.cc'}.get(host_machine.system(), 'src/daemon/sandbox-unsupported.cc'),
+   ] + (host_machine.system() == 'darwin' ? ['src/daemon/sbpl.cc'] : [])
+ 
+-  executable('nix-grpc-daemon',
++  daemon = executable('nix-grpc-daemon',
+     sources : daemon_sources + [gen, eds_gen, events_gen],
+     include_directories : [gen_inc, src_inc],
+     cpp_pch : do_pch ? ['pch/daemon_pch.hh'] : [],
+@@ -312,14 +313,20 @@ if build_server
+     cpp_args : ['-UNDEBUG'],
+   ), timeout : 120)
+ 
+-  # Events.Watch over loopback gRPC, with the real service's auth checks.
+-  # oidc-test.sh serves the JWKS for its bearer tokens.
++  # Events.Watch over loopback gRPC, with the real service's auth checks and
++  # the watch command as a client. oidc-test.sh serves the JWKS for its
++  # bearer tokens.
+   events_grpc_test = executable('events-grpc-test',
+-    sources : ['tests/events-grpc-test.cc', 'src/daemon/events.cc', 'src/daemon/auth.cc', events_gen[2], events_gen[3]],
++    sources : [
++      'tests/events-grpc-test.cc', 'src/daemon/events.cc', 'src/daemon/auth.cc', 'src/daemon/watch-command.cc',
++      'src/daemon/options.cc', 'src/client/channel.cc', events_gen[2], events_gen[3],
++    ],
+     dependencies : [dispatcher_dep, grpc_dep, nix_store_dep, curl_dep, json_dep, openssl_dep],
+-    cpp_args : ['-UNDEBUG'],
++    cpp_args : nix_compat_args + ['-UNDEBUG'],
+   )
+   test('events-grpc', find_program('tests/oidc-test.sh'), args : [events_grpc_test], timeout : 60)
++  # The subcommand in the real binary, before any daemon setup.
++  test('watch-command', find_program('tests/watch-command-test.sh'), args : [daemon], timeout : 30)
+ 
+   test('sbpl', executable('sbpl-test',
+     sources : ['tests/sbpl-test.cc', 'src/daemon/sbpl.cc'],
+diff --git a/nix/packages/nix-grpc-store.nix b/nix/packages/nix-grpc-store.nix
+index 42016cb..0ab7ae0 100644
+--- a/nix/packages/nix-grpc-store.nix
++++ b/nix/packages/nix-grpc-store.nix
+@@ -86,6 +86,7 @@ stdenv.mkDerivation {
+         ../../tests/http-test.cc
+         ../../tests/events-test.cc
+         ../../tests/events-grpc-test.cc
++        ../../tests/watch-command-test.sh
+         ../../tests/dispatcher-bench.cc
+         ../../tests/scheduler-grpc-bench.cc
+       ]
+diff --git a/proto/events.proto b/proto/events.proto
+index ac41a2b..c9bd595 100644
+--- a/proto/events.proto
++++ b/proto/events.proto
+@@ -3,8 +3,8 @@ syntax = "proto3";
+ package nix.remote;
+ 
+ // The scheduler's events: a read-only live view of the active scheduler,
+-// for anything that follows a farm as it runs, such as a dashboard or a
+-// script.
++// for anything that follows a farm as it runs, such as a dashboard, a script
++// or `nix-grpc-daemon watch --json`.
+ //
+ // Watch sends a snapshot of the scheduler's state, then one event per change.
+ // A snapshot starts with Reset and ends with SnapshotDone, and every event in
+diff --git a/src/client/store.cc b/src/client/store.cc
+index fb2978e..3324d0f 100644
+--- a/src/client/store.cc
++++ b/src/client/store.cc
+@@ -84,9 +84,7 @@ auto GrpcStore::makeChannel(bool ownConnection) -> std::shared_ptr<grpc::Channel
+   args.SetInt(GRPC_ARG_MIN_RECONNECT_BACKOFF_MS, minReconnectBackoffMs);
+   args.SetMaxSendMessageSize(-1);
+   // RPCs have no deadline, so notice a peer that vanished without a FIN.
+-  args.SetInt(GRPC_ARG_KEEPALIVE_TIME_MS, nixgrpc::kKeepaliveTimeMs);
+-  args.SetInt(GRPC_ARG_KEEPALIVE_TIMEOUT_MS, nixgrpc::kKeepaliveTimeoutMs);
+-  args.SetInt(GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA, 0);
++  nixgrpc::setKeepalive(args);
+   if (ownConnection) {
+     // Private subchannel pool = own TCP connection.
+     args.SetInt(GRPC_ARG_USE_LOCAL_SUBCHANNEL_POOL, 1);
+diff --git a/src/daemon/coordinator.cc b/src/daemon/coordinator.cc
+index 5a5550e..3eaf3a2 100644
+--- a/src/daemon/coordinator.cc
++++ b/src/daemon/coordinator.cc
+@@ -25,8 +25,6 @@
+ #include <grpcpp/create_channel.h>
+ #include <grpcpp/health_check_service_interface.h>
+ #include <grpcpp/security/credentials.h>
+-#include <grpcpp/security/tls_certificate_provider.h>
+-#include <grpcpp/security/tls_credentials_options.h>
+ #include <grpcpp/server.h>
+ #include <grpcpp/server_context.h>
+ #include <grpcpp/support/server_callback.h>
+@@ -35,13 +33,11 @@
+ #include <grpcpp/support/sync_stream.h>
+ 
+ #include <nix/store/globals.hh>
+-#include <nix/util/file-system.hh>
+ 
+ #include "acl.hh"
+ #include "auth.hh"
+ #include "builder.hh"
+ #include "cache.hh"
+-#include "client/channel.hh"
+ #include "daemon-probe.hh"
+ #include "keepalive.hh"
+ #include "logfmt.hh"
+@@ -105,46 +101,6 @@ auto SchedulerService::WorkerSession(grpc::CallbackServerContext * context)
+ 
+ // -------------------------------------------------------------- Coordinator
+ 
+-namespace {
+-// TLS unless the URL says http://. Our server cert doubles as client cert,
+-// --scheduler-token-file adds a bearer: either, both or neither. The address
+-// is often the balancer with a public certificate, so trust the system
+-// bundle as well as the farm CA.
+-auto schedulerCreds(const Options & options) -> std::shared_ptr<grpc::ChannelCredentials>
+-{
+-    if (options.schedulerAddr.starts_with(plaintextScheme)) {
+-        return grpc::InsecureChannelCredentials();
+-    }
+-    std::string roots;
+-    if (auto const bundle = defaultCaCert(); !bundle.empty()) {
+-        roots = nix::readFile(bundle);
+-    }
+-    if (!options.clientCA.empty()) {
+-        roots += "\n" + nix::readFile(options.clientCA);
+-    }
+-    grpc::experimental::TlsChannelCredentialsOptions tls;
+-    if (!roots.empty()) {
+-        auto const rootProvider = std::make_shared<grpc::experimental::InMemoryCertificateProvider>();
+-        if (auto const status = rootProvider->UpdateRoot(roots); !status.ok()) {
+-            throw nix::Error("loading CA certificates: %s", status.ToString());
+-        }
+-        tls.set_root_certificate_provider(rootProvider);
+-    }
+-    if (!options.tlsCert.empty()) {
+-        tls.set_identity_certificate_provider(std::make_shared<grpc::experimental::FileWatcherCertificateProvider>(
+-            options.tlsKey, options.tlsCert, certRefreshSeconds));
+-    }
+-    std::shared_ptr<grpc::ChannelCredentials> creds = grpc::experimental::TlsCredentials(tls);
+-    if (!options.schedulerTokenFile.empty()) {
+-        creds = grpc::CompositeChannelCredentials(
+-            creds,
+-            grpc::MetadataCredentialsFromPlugin(std::make_unique<TokenFileCredentials>(options.schedulerTokenFile)));
+-    }
+-    return creds;
+-}
+-} // namespace
+-
+-
+ void Coordinator::setSchedulerActive(bool active)
+ {
+     if (health != nullptr) {
+@@ -279,15 +235,12 @@ void Coordinator::start(grpc::Server & server)
+ 
+ void Coordinator::runRemoteSession(Builder & bld, const std::stop_token & stop)
+ {
+-    auto const creds = schedulerCreds(options);
++    auto const creds = makeSchedulerCredentials(options);
+     grpc::ChannelArguments args;
+-    args.SetInt(GRPC_ARG_KEEPALIVE_TIME_MS, kKeepaliveTimeMs);
+-    args.SetInt(GRPC_ARG_KEEPALIVE_TIMEOUT_MS, kKeepaliveTimeoutMs);
+-    args.SetInt(GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA, 0);
++    setKeepalive(args);
+     // A replaced balancer pod blackholes the first SYN; do not sit out gRPC's 20s.
+     args.SetInt(GRPC_ARG_MIN_RECONNECT_BACKOFF_MS, minReconnectBackoffMs);
+-    auto const target = options.schedulerAddr.starts_with(plaintextScheme) ? options.schedulerAddr.substr(plaintextScheme.size())
+-                                                                    : options.schedulerAddr;
++    auto const target = schedulerTarget(options);
+     auto const channel = grpc::CreateCustomChannel(target, creds, args);
+     auto stub = nix::remote::Scheduler::NewStub(channel);
+     auto backoff = minBackoff;
+diff --git a/src/daemon/main.cc b/src/daemon/main.cc
+index 9f63c83..8065eae 100644
+--- a/src/daemon/main.cc
++++ b/src/daemon/main.cc
+@@ -104,6 +104,7 @@
+ #include "parse-int.hh"
+ #include "sandbox.hh"
+ #include "upload-spool.hh"
++#include "watch-command.hh"
+ 
+ using GrpcStream = grpc::ServerReaderWriter<nix::remote::Chunk, nix::remote::Chunk>;
+ using AddMultipleReader = grpc::ServerReader<nix::remote::AddMultipleChunk>;
+@@ -1348,6 +1349,13 @@ auto sandboxPolicy(const nixgrpc::Options & options, bool listenFdsEmpty) -> nix
+ 
+ auto main(int argc, char ** argv) -> int
+ try {
++    const std::span args(argv, static_cast<size_t>(argc));
++    const std::vector<std::string_view> argList(args.begin(), args.end());
++    // A client of the scheduler, not a daemon: none of the setup below.
++    if (argList.size() > 1 && argList.at(1) == "watch") {
++        return nixgrpc::watchCommand({std::next(argList.begin()), argList.end()});
++    }
++
+     // Pump threads write to a socket whose peer may already be gone; we want
+     // EPIPE, not process death.
+     // NOLINTBEGIN(misc-include-cleaner): darwin's <signal.h> forwards these.
+@@ -1364,8 +1372,7 @@ try {
+     // Required before nix::openStore() in the native RPC handlers.
+     nix::initLibStore();
+ 
+-    const std::span args(argv, static_cast<size_t>(argc));
+-    auto options = nixgrpc::parseOptions({args.begin(), args.end()});
++    auto options = nixgrpc::parseOptions(argList);
+     auto const listenFds = nixgrpc::systemdListenFds();
+     if (options.sandbox) {
+         nixgrpc::sandbox::apply(sandboxPolicy(options, listenFds.empty()));
+diff --git a/src/daemon/options.cc b/src/daemon/options.cc
+index ef52e02..fe9d93e 100644
+--- a/src/daemon/options.cc
++++ b/src/daemon/options.cc
+@@ -19,6 +19,7 @@
+ #include <unistd.h>
+ 
+ #include <grpc/grpc_security_constants.h>
++#include <grpcpp/security/credentials.h>
+ #include <grpcpp/security/server_credentials.h>
+ #include <grpcpp/security/tls_certificate_provider.h>
+ #include <grpcpp/security/tls_credentials_options.h>
+@@ -29,6 +30,7 @@
+ #include <nix/util/environment-variables.hh>
+ 
+ #include "acl.hh"
++#include "client/channel.hh"
+ #include "logfmt.hh"
+ #include "niks3-client.hh"
+ #include "parse-int.hh"
+@@ -316,5 +318,48 @@ auto makeServerCredentials(const Options & options) -> std::shared_ptr<grpc::Ser
+     return grpc::experimental::TlsServerCredentials(tls);
+ }
+ 
++// TLS unless the URL says http://. Our server cert doubles as client cert,
++// --scheduler-token-file adds a bearer: either, both or neither. The address
++// is often the balancer with a public certificate, so trust the system
++// bundle as well as the farm CA.
++auto makeSchedulerCredentials(const Options & options) -> std::shared_ptr<grpc::ChannelCredentials>
++{
++    if (options.schedulerAddr.starts_with(plaintextScheme)) {
++        return grpc::InsecureChannelCredentials();
++    }
++    std::string roots;
++    if (auto const bundle = defaultCaCert(); !bundle.empty()) {
++        roots = nix::readFile(bundle);
++    }
++    if (!options.clientCA.empty()) {
++        roots += "\n" + nix::readFile(options.clientCA);
++    }
++    grpc::experimental::TlsChannelCredentialsOptions tls;
++    if (!roots.empty()) {
++        auto const rootProvider = std::make_shared<grpc::experimental::InMemoryCertificateProvider>();
++        if (auto const status = rootProvider->UpdateRoot(roots); !status.ok()) {
++            throw nix::Error("loading CA certificates: %s", status.ToString());
++        }
++        tls.set_root_certificate_provider(rootProvider);
++    }
++    if (!options.tlsCert.empty()) {
++        tls.set_identity_certificate_provider(std::make_shared<grpc::experimental::FileWatcherCertificateProvider>(
++            options.tlsKey, options.tlsCert, certRefreshSeconds));
++    }
++    std::shared_ptr<grpc::ChannelCredentials> creds = grpc::experimental::TlsCredentials(tls);
++    if (!options.schedulerTokenFile.empty()) {
++        creds = grpc::CompositeChannelCredentials(
++            creds,
++            grpc::MetadataCredentialsFromPlugin(std::make_unique<TokenFileCredentials>(options.schedulerTokenFile)));
++    }
++    return creds;
++}
++
++auto schedulerTarget(const Options & options) -> std::string
++{
++    auto const & addr = options.schedulerAddr;
++    return addr.starts_with(plaintextScheme) ? addr.substr(plaintextScheme.size()) : addr;
++}
++
+ 
+ } // namespace nixgrpc
+diff --git a/src/daemon/options.hh b/src/daemon/options.hh
+index 3d38228..303c153 100644
+--- a/src/daemon/options.hh
++++ b/src/daemon/options.hh
+@@ -9,6 +9,7 @@
+ #include <string_view>
+ #include <vector>
+ 
++#include <grpcpp/security/credentials.h>
+ #include <grpcpp/security/server_credentials.h>
+ 
+ #include "acl.hh"
+@@ -64,5 +65,9 @@ constexpr std::string_view plaintextScheme = "http://";
+ constexpr unsigned certRefreshSeconds = 10;
+ 
+ auto makeServerCredentials(const Options & options) -> std::shared_ptr<grpc::ServerCredentials>;
++// For dialing --scheduler: as a builder, and for `nix-grpc-daemon watch`.
++auto makeSchedulerCredentials(const Options & options) -> std::shared_ptr<grpc::ChannelCredentials>;
++// The address to dial for --scheduler, without the scheme that makes it plaintext.
++auto schedulerTarget(const Options & options) -> std::string;
+ 
+ } // namespace nixgrpc
+diff --git a/src/daemon/watch-command.cc b/src/daemon/watch-command.cc
+new file mode 100644
+index 0000000..5c419ee
+--- /dev/null
++++ b/src/daemon/watch-command.cc
+@@ -0,0 +1,138 @@
++// nix-grpc-daemon watch: Events.Watch as JSON lines.
++
++#include "watch-command.hh"
++
++#include <cstddef>
++#include <functional>
++#include <iostream>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <utility>
++#include <vector>
++
++#include <absl/status/status.h>
++#include <google/protobuf/util/json_util.h>
++#include <grpcpp/client_context.h>
++#include <grpcpp/create_channel.h>
++#include <grpcpp/support/channel_arguments.h>
++#include <grpcpp/support/status.h>
++
++#include <nix/util/error.hh>
++
++#include "client/channel.hh"
++#include "events.grpc.pb.h"
++#include "events.pb.h"
++#include "keepalive.hh"
++#include "options.hh"
++
++namespace nixgrpc {
++
++auto parseWatchOptions(const std::vector<std::string_view> & args) -> Options
++{
++    Options options;
++    bool json = false;
++    for (size_t idx = 1; idx < args.size(); ++idx) {
++        // Also `--flag=value`, as for the daemon.
++        std::string_view arg = args.at(idx);
++        std::optional<std::string_view> inlineValue;
++        if (auto const sep = arg.find('='); arg.starts_with("--") && sep != std::string_view::npos) {
++            inlineValue = arg.substr(sep + 1);
++            arg = arg.substr(0, sep);
++        }
++        auto const next = [&] -> std::string_view {
++            if (inlineValue) {
++                return *std::exchange(inlineValue, std::nullopt);
++            }
++            if (++idx >= args.size()) {
++                throw nix::Error("watch: flag '%s' requires an argument", arg);
++            }
++            return args.at(idx);
++        };
++        if (arg == "--json") {
++            json = true;
++        } else if (arg == "--scheduler") {
++            options.schedulerAddr = next();
++        } else if (arg == "--scheduler-token-file") {
++            options.schedulerTokenFile = next();
++        } else if (arg == "--tls-cert") {
++            options.tlsCert = next();
++        } else if (arg == "--tls-key") {
++            options.tlsKey = next();
++        } else if (arg == "--client-ca") {
++            options.clientCA = next();
++        } else {
++            throw nix::Error("watch: unknown flag '%s'", arg);
++        }
++    }
++    if (!json) {
++        throw nix::Error("watch: --json is required, it is the only output format so far");
++    }
++    if (options.schedulerAddr.empty()) {
++        throw nix::Error("watch: --scheduler is required");
++    }
++    if (!options.schedulerTokenFile.empty() && options.schedulerAddr.starts_with(plaintextScheme)) {
++        throw nix::Error("watch: --scheduler-token-file with --scheduler http:// would send the token in clear");
++    }
++    if (options.tlsCert.empty() != options.tlsKey.empty()) {
++        throw nix::Error("watch: --tls-cert and --tls-key go together");
++    }
++    return options;
++}
++
++auto watchEvents(const Options & options, const std::function<void(std::string_view lines)> & print) -> grpc::Status
++{
++    auto const target = schedulerTarget(options);
++    grpc::ChannelArguments args;
++    // A batch holds up to 1024 events, and a drv with many followers or
++    // inputs makes a large one.
++    args.SetMaxReceiveMessageSize(-1);
++    // The stream has no deadline: notice a scheduler that vanished without
++    // a FIN instead of waiting on it forever, as builders do.
++    setKeepalive(args);
++    auto const stub
++        = nix::remote::Events::NewStub(grpc::CreateCustomChannel(target, makeSchedulerCredentials(options), args));
++    grpc::ClientContext ctx;
++    auto const reader = stub->Watch(&ctx, nix::remote::WatchRequest{});
++    google::protobuf::util::JsonPrintOptions json;
++    // Zero values mean something here: PHASE_QUEUED, CAUSE_SNAPSHOT, BUILT.
++    json.always_print_fields_with_no_presence = true;
++    nix::remote::WatchEvents batch;
++    std::string lines;
++    std::string line;
++    while (reader->Read(&batch)) {
++        lines.clear();
++        for (const auto & event : batch.msgs()) {
++            line.clear();
++            if (auto const status = google::protobuf::util::MessageToJsonString(event, &line, json); !status.ok()) {
++                ctx.TryCancel();
++                static_cast<void>(reader->Finish());
++                return {grpc::StatusCode::INTERNAL, "printing an event as JSON: " + std::string(status.message())};
++            }
++            lines += line;
++            lines += '\n';
++        }
++        print(lines);
++    }
++    return reader->Finish();
++}
++
++auto watchCommand(const std::vector<std::string_view> & args) -> int
++{
++    // A short-lived TLS client, as `nix` with the plugin is: let gRPC's
++    // threads free the channel before OpenSSL's exit handlers run.
++    retainGrpcRuntime();
++    auto const status = watchEvents(parseWatchOptions(args), [](std::string_view lines) -> void {
++        std::cout << lines << std::flush;
++    });
++    if (status.ok()) {
++        return 0;
++    }
++    // grpc::StatusCode has the same values as absl::StatusCode.
++    std::cerr << "nix-grpc-daemon watch: "
++              << absl::StatusCodeToString(static_cast<absl::StatusCode>(status.error_code())) << ": "
++              << status.error_message() << "\n";
++    return 1;
++}
++
++} // namespace nixgrpc
+diff --git a/src/daemon/watch-command.hh b/src/daemon/watch-command.hh
+new file mode 100644
+index 0000000..3e52730
+--- /dev/null
++++ b/src/daemon/watch-command.hh
+@@ -0,0 +1,30 @@
++#pragma once
++// nix-grpc-daemon watch: prints the scheduler's events (Events.Watch,
++// proto/events.proto) as JSON lines, for scripts and as a small client of
++// the stream.
++
++#include <functional>
++#include <string_view>
++#include <vector>
++
++#include <grpcpp/support/status.h>
++
++#include "options.hh"
++
++namespace nixgrpc {
++
++// The flags after `watch` (args[0]). The scheduler is reached as a builder
++// reaches it: --scheduler, --scheduler-token-file, --tls-cert, --tls-key and
++// --client-ca. --json is required, so that another format can be the default
++// later without breaking scripts.
++auto parseWatchOptions(const std::vector<std::string_view> & args) -> Options;
++
++// Prints each event as one line of protobuf JSON until the stream ends, one
++// call per batch the scheduler sends, and returns how the stream ended.
++auto watchEvents(const Options & options, const std::function<void(std::string_view lines)> & print) -> grpc::Status;
++
++// `nix-grpc-daemon watch ...`, args[0] being "watch": the events on stdout,
++// the status the stream ended with on stderr. Returns the exit code.
++auto watchCommand(const std::vector<std::string_view> & args) -> int;
++
++} // namespace nixgrpc
+diff --git a/src/keepalive.hh b/src/keepalive.hh
+index 31ee99c..f86f480 100644
+--- a/src/keepalive.hh
++++ b/src/keepalive.hh
+@@ -3,9 +3,20 @@
+ // Server-side GRPC_ARG_HTTP2_MIN_RECV_PING_INTERVAL_WITHOUT_DATA_MS must stay below the time.
+ // Set GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA to 0 too: by default pings stop after two on a silent stream.
+ 
++#include <grpc/impl/channel_arg_names.h>
++#include <grpcpp/support/channel_arguments.h>
++
+ namespace nixgrpc {
+ 
+ constexpr int kKeepaliveTimeMs = 20'000;
+ constexpr int kKeepaliveTimeoutMs = 20'000;
+ 
++// All three on a client channel.
++inline void setKeepalive(grpc::ChannelArguments & args)
++{
++    args.SetInt(GRPC_ARG_KEEPALIVE_TIME_MS, kKeepaliveTimeMs);
++    args.SetInt(GRPC_ARG_KEEPALIVE_TIMEOUT_MS, kKeepaliveTimeoutMs);
++    args.SetInt(GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA, 0);
++}
++
+ } // namespace nixgrpc
+diff --git a/tests/events-grpc-test.cc b/tests/events-grpc-test.cc
+index 8994ec1..f25ff4d 100644
+--- a/tests/events-grpc-test.cc
++++ b/tests/events-grpc-test.cc
+@@ -3,14 +3,15 @@
+ // leader change and when a bearer token expires, and EventsService turns
+ // away passive nodes, anonymous callers and callers with too many streams.
+ // A balancer can name a viewer that has no certificate, and the access
+-// rules apply to that name. The JWKS for the bearer tokens is served from a
+-// directory given on the command line (python http.server in
+-// tests/oidc-test.sh).
++// rules apply to that name. `nix-grpc-daemon watch` prints what it gets as
++// JSON lines. The JWKS for the bearer tokens is served from a directory
++// given on the command line (python http.server in tests/oidc-test.sh).
+ 
+ #include <algorithm>
+ #include <atomic>
+ #include <cassert>
+ #include <chrono>
++#include <condition_variable>
+ #include <cstddef>
+ #include <cstdint>
+ #include <cstdio>
+@@ -20,8 +21,10 @@
+ #include <functional>
+ #include <iostream>
+ #include <memory>
++#include <mutex>
+ #include <optional>
+ #include <string>
++#include <string_view>
+ #include <thread>
+ #include <utility>
+ #include <vector>
+@@ -39,6 +42,7 @@
+ #include <openssl/x509.h>
+ #include <openssl/x509v3.h>
+ 
++#include <google/protobuf/util/json_util.h>
+ #include <grpc/grpc_security_constants.h>
+ #include <grpc/impl/channel_arg_names.h>
+ #include <grpcpp/client_context.h>
+@@ -58,6 +62,7 @@
+ #include <nlohmann/json.hpp> // NOLINT(misc-include-cleaner): json_fwd.hpp only declares.
+ #include <nlohmann/json_fwd.hpp>
+ 
++#include <nix/util/error.hh>
+ #include <nix/util/file-system.hh>
+ 
+ #include "acl.hh"
+@@ -71,6 +76,7 @@
+ #include "nix_remote.pb.h"
+ #include "oidc.hh"
+ #include "sched-reactor.hh"
++#include "watch-command.hh"
+ 
+ using namespace nixgrpc;
+ namespace rpc = nix::remote;
+@@ -150,8 +156,8 @@ auto privatePem(EVP_PKEY * key) -> std::string
+ 
+ using Key = std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)>;
+ 
+-// A self-signed certificate with CN `name`. It is the server's
+-// certificate, the client's and the CA for both.
++// A self-signed certificate with CN `name`, also valid for 127.0.0.1. It
++// is the server's certificate, the client's and the CA for both.
+ struct Tls
+ {
+     std::string name;
+@@ -180,6 +186,11 @@ struct Tls
+         auto * ext = X509V3_EXT_conf_nid(nullptr, &extCtx, NID_basic_constraints, "critical,CA:TRUE");
+         X509_add_ext(x509.get(), ext, -1);
+         X509_EXTENSION_free(ext);
++        // The watch command checks the address it dials.
++        auto const altNames = "DNS:" + name + ",IP:127.0.0.1";
++        ext = X509V3_EXT_conf_nid(nullptr, &extCtx, NID_subject_alt_name, altNames.c_str());
++        X509_add_ext(x509.get(), ext, -1);
++        X509_EXTENSION_free(ext);
+         assert(X509_sign(x509.get(), pkey.get(), EVP_sha256()) > 0);
+         key = privatePem(pkey.get());
+         cert = pem([&](BIO * bio) -> int { return PEM_write_bio_X509(bio, x509.get()); });
+@@ -240,15 +251,16 @@ struct Server
+     std::unique_ptr<rpc::Events::Stub> stub;
+     // Over TLS with `tls` as the client certificate, if given.
+     std::unique_ptr<rpc::Events::Stub> certStub;
++    int tlsPort = 0;
+ 
+     explicit Server(grpc::Service & service, const std::optional<Tls> & tls = std::nullopt)
+     {
+         grpc::ServerBuilder builder;
+         int port = 0;
+-        int tlsPort = 0;
+         builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &port);
+         if (tls) {
+-            grpc::SslServerCredentialsOptions opts(GRPC_SSL_REQUEST_AND_REQUIRE_CLIENT_CERTIFICATE_AND_VERIFY);
++            // A client certificate is optional, so a bearer token can come over TLS too.
++            grpc::SslServerCredentialsOptions opts(GRPC_SSL_REQUEST_CLIENT_CERTIFICATE_AND_VERIFY);
+             opts.pem_root_certs = tls->cert;
+             opts.pem_key_cert_pairs.push_back({.private_key = tls->key, .cert_chain = tls->cert});
+             builder.AddListeningPort("127.0.0.1:0", grpc::SslServerCredentials(opts), &tlsPort);
+@@ -783,6 +795,143 @@ void testTokenExpiry(const std::string & dir, const std::string & base)
+     srv.server->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds(1));
+ }
+ 
++// What `nix-grpc-daemon watch` printed, line by line, handed over from the
++// thread it runs on.
++struct Printed
++{
++    std::mutex mutex;
++    std::condition_variable changed;
++    std::vector<Json> lines;
++
++    auto print() -> std::function<void(std::string_view)>
++    {
++        return [this](std::string_view text) -> void {
++            const std::scoped_lock lock(mutex);
++            while (!text.empty()) {
++                auto const end = text.find('\n');
++                assert(end != std::string_view::npos); // every line ends
++                auto const line = text.substr(0, end);
++                // protobuf's JSON mapping, so it reads back into the message.
++                rpc::WatchEvent event;
++                assert(google::protobuf::util::JsonStringToMessage(line, &event).ok());
++                lines.push_back(Json::parse(line));
++                text.remove_prefix(end + 1);
++            }
++            changed.notify_all();
++        };
++    }
++
++    auto waitFor(const std::function<bool(const Json &)> & found) -> bool
++    {
++        std::unique_lock lock(mutex);
++        return changed.wait_for(lock, std::chrono::seconds(10), [&] -> bool { return std::ranges::any_of(lines, found); });
++    }
++};
++
++// `watch` takes only its own flags and refuses any that cannot work together.
++void testWatchFlags()
++{
++    auto const refused = [](const std::vector<std::string_view> & args, std::string_view why) -> bool {
++        try {
++            static_cast<void>(parseWatchOptions(args));
++        } catch (nix::Error & err) {
++            return std::string_view(err.what()).contains(why);
++        }
++        return false;
++    };
++    assert(refused({"watch", "--scheduler", "sched:50051"}, "--json is required"));
++    assert(refused({"watch", "--json"}, "--scheduler is required"));
++    assert(refused({"watch", "--json", "--scheduler", "http://sched:50051", "--scheduler-token-file", "t"}, "in clear"));
++    assert(refused({"watch", "--json", "--scheduler", "sched:50051", "--tls-cert", "c.pem"}, "go together"));
++    assert(refused({"watch", "--json", "--scheduler"}, "requires an argument"));
++    assert(refused({"watch", "--json", "--scheduler", "sched:50051", "--listen", "x"}, "unknown flag"));
++    auto const opts = parseWatchOptions(
++        {"watch", "--json", "--scheduler=sched:50051", "--scheduler-token-file", "t", "--client-ca=ca.pem"});
++    assert(opts.schedulerAddr == "sched:50051" && opts.schedulerTokenFile == "t" && opts.clientCA == "ca.pem");
++}
++
++// The watch command against the real service, once with a client
++// certificate and once with a bearer token, given as a builder gives them.
++// Each prints every event as a line of JSON and returns UNAVAILABLE when the
++// scheduler steps down.
++void testWatchCommand(const std::string & dir, const std::string & base)
++{
++    Farm farm;
++    Dispatcher::Worker worker{.send = [](const rpc::SchedCmd &) -> bool { return true; }};
++    rpc::WorkerMsgs hello;
++    auto * hel = hello.add_msgs()->mutable_hello();
++    hel->set_addr("10.0.0.1:50051");
++    hel->add_systems("x86_64-linux");
++    hel->set_max_jobs(1);
++    farm.disp.workerMsgs(worker, hello);
++    auto const client = farm.client("ci-1");
++    rpc::ClientMsgs want;
++    want.add_msgs()->mutable_want()->set_drv_path("a.drv");
++    farm.disp.clientMsgs(client, want);
++
++    Issuer const issuer(dir, base);
++    std::optional<oidc::Verifier> verifier(oidc::loadConfig(dir + "/oidc.json"));
++    Tls const tls("dash-viewer");
++    std::string const certFile = dir + "/viewer.pem";
++    std::string const keyFile = dir + "/viewer.key";
++    std::string const tokenFile = dir + "/token";
++    nix::writeFile(certFile, tls.cert);
++    nix::writeFile(keyFile, tls.key);
++    nix::writeFile(tokenFile, issuer.token("alice", Clock::now() + std::chrono::minutes(5)));
++    Auth auth{.oidc = &verifier};
++    auth.acl.addRule(tls.name + "=watch");
++    IdleTracker idle;
++    EventsService service(farm.disp, auth, idle);
++    Server srv(service, tls);
++    std::string const addr = "127.0.0.1:" + std::to_string(srv.tlsPort);
++
++    auto const byCert = parseWatchOptions(
++        {"watch", "--json", "--scheduler", addr, "--tls-cert", certFile, "--tls-key", keyFile, "--client-ca", certFile});
++    auto const byToken = parseWatchOptions(
++        {"watch", "--json", "--scheduler", addr, "--scheduler-token-file", tokenFile, "--client-ca", certFile});
++    Printed certLines;
++    Printed tokenLines;
++    grpc::Status certStatus;
++    grpc::Status tokenStatus;
++    std::thread certWatch([&] -> void { certStatus = watchEvents(byCert, certLines.print()); });
++    std::thread tokenWatch([&] -> void { tokenStatus = watchEvents(byToken, tokenLines.print()); });
++    auto const synced = [](const Json & line) -> bool { return line.contains("snapshotDone"); };
++    assert(certLines.waitFor(synced) && tokenLines.waitFor(synced));
++    auto const other = farm.client("ci-2");
++    // 64-bit integers are strings in protobuf's JSON.
++    auto const joined = [wanted = std::to_string(other->id)](const Json & line) -> bool {
++        return line.contains("client") && line.at("client").at("id") == wanted;
++    };
++    assert(certLines.waitFor(joined) && tokenLines.waitFor(joined));
++    farm.disp.restarting();
++    certWatch.join();
++    tokenWatch.join();
++    assert(certStatus.error_code() == grpc::StatusCode::UNAVAILABLE);
++    assert(tokenStatus.error_code() == grpc::StatusCode::UNAVAILABLE);
++
++    auto const seqOf = [](const Json & line) -> uint64_t { return std::stoull(line.at("seq").get<std::string>()); };
++    for (const auto * printed : {&certLines, &tokenLines}) {
++        const auto & lines = printed->lines;
++        assert(lines.front().contains("reset"));
++        bool live = false;
++        bool drv = false;
++        for (size_t idx = 1; idx < lines.size(); idx++) {
++            const auto & line = lines.at(idx);
++            // The snapshot carries Reset's seq, and every event after it is one higher.
++            assert(seqOf(line) == (live ? seqOf(lines.at(idx - 1)) + 1 : seqOf(lines.front())));
++            live = live || line.contains("snapshotDone");
++            if (line.contains("drv") && line.at("drv").at("drvPath") == "a.drv") {
++                const auto & state = line.at("drv");
++                // Fields at their zero value are there too: CAUSE_SNAPSHOT is 0.
++                assert(state.at("cause") == "CAUSE_SNAPSHOT" && state.at("phase") == "PHASE_ASSIGNED");
++                assert(state.at("workerAddr") == "10.0.0.1:50051" && state.contains("inputsUnknown"));
++                drv = true;
++            }
++        }
++        assert(live && drv);
++    }
++    srv.server->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds(1));
++}
+ 
+ } // namespace
+ // NOLINTEND(*-magic-numbers, bugprone-unchecked-optional-access, cppcoreguidelines-owning-memory, misc-use-internal-linkage)
+@@ -803,6 +952,8 @@ try {
+     testService();
+     testForwardedViewer(args.at(1));
+     testTokenExpiry(args.at(1), args.at(2));
++    testWatchFlags();
++    testWatchCommand(args.at(1), args.at(2));
+     // gRPC frees TLS endpoints on EventEngine threads that can outlive the
+     // servers and channels, which races OpenSSL's atexit cleanup (see
+     // retainGrpcRuntime in src/client/channel.hh). Every test passed, so
+diff --git a/tests/watch-command-test.sh b/tests/watch-command-test.sh
+new file mode 100755
+index 0000000..036ae8b
+--- /dev/null
++++ b/tests/watch-command-test.sh
+@@ -0,0 +1,15 @@
++#!/bin/sh
++# `nix-grpc-daemon watch` checks its flags and dials the scheduler without
++# any of the daemon's setup, and says on stderr how the stream ended.
++set -eu
++daemon=$1
++if out=$("$daemon" watch --scheduler 127.0.0.1:1 2>&1); then
++  echo "watch without --json succeeded" >&2
++  exit 1
++fi
++echo "$out" | grep -q -- '--json is required' || { echo "$out" >&2; exit 1; }
++if out=$("$daemon" watch --json --scheduler http://127.0.0.1:1 2>&1); then
++  echo "watch with nothing listening succeeded" >&2
++  exit 1
++fi
++echo "$out" | grep -q '^nix-grpc-daemon watch: UNAVAILABLE: ' || { echo "$out" >&2; exit 1; }
+-- 
+2.56.0
+

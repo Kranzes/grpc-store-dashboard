@@ -1,0 +1,475 @@
+syntax = "proto3";
+
+package nix.remote;
+
+// A zstd-compressed chunk of the Nix worker protocol byte stream. The
+// concatenation of all chunks in one direction is a single zstd stream; each
+// chunk ends on a ZSTD_e_flush boundary so it can be decoded in isolation.
+message Chunk {
+  bytes data = 1;
+}
+
+// Batched validity query. Paths are store path base names ("<hash>-<name>").
+message QueryValidPathsRequest {
+  repeated string paths = 1;
+  // If true, the server may try to substitute missing paths.
+  bool substitute = 2;
+}
+
+message QueryValidPathsReply {
+  repeated string paths = 1;
+}
+
+// One message of a client-streamed bulk import. The concatenation of all
+// `data` fields is a single zstd stream; its decompressed content uses the
+// worker-protocol AddMultipleToStore framing: a count, then for each path a
+// ValidPathInfo (protocol 1.16 serialisation) followed by its NAR.
+message AddMultipleChunk {
+  // Only meaningful on the first message of the stream.
+  bool repair = 1;
+  bool check_sigs = 2;
+  bytes data = 3;
+}
+
+message AddMultipleReply {}
+
+message QueryPathInfosRequest {
+  repeated string paths = 1;
+}
+
+// `info` is the worker-protocol UnkeyedValidPathInfo (protocol 1.16)
+// serialisation. Paths unknown to the store are omitted from the reply.
+message PathInfo {
+  string path = 1;
+  bytes info = 2;
+}
+
+message QueryPathInfosReply {
+  repeated PathInfo infos = 1;
+}
+
+// `drv` is the worker-protocol BasicDerivation serialisation. `protocol`
+// (major << 8 | minor) pins the BuildResult serialisation in the reply.
+// The worker only accepts this after the scheduler sent it Expect{drv_path}.
+message BuildDerivationRequest {
+  string drv_path = 1;
+  bytes drv = 2;
+  uint32 build_mode = 3;
+  uint32 protocol = 4;
+  // From Assigned, for log correlation only.
+  uint64 assign_id = 5;
+  // The client's build-timeout / max-silent-time settings, 0 = none.
+  uint64 build_timeout = 6;
+  uint64 max_silent_time = 7;
+}
+
+// `result` is the worker-protocol BuildResult serialisation at the request's
+// `protocol`. Output path infos ride along so the client needs no follow-up
+// queries.
+message BuildDerivationDone {
+  bytes result = 1;
+  repeated PathInfo outputs = 2;
+}
+
+message BuildDerivationChunk {
+  oneof event {
+    // Raw builder stderr, which need not be valid UTF-8.
+    bytes log_line = 1;
+    BuildDerivationDone done = 2;
+    // stdenv phase name (resSetPhase), for progress displays.
+    string phase = 3;
+  }
+}
+
+message QueryMissingRequest {
+  // DerivedPaths in nix's string notation.
+  repeated string targets = 1;
+}
+
+message QueryMissingReply {
+  repeated string will_build = 1;
+  repeated string will_substitute = 2;
+  repeated string unknown = 3;
+  uint64 download_size = 4;
+  uint64 nar_size = 5;
+}
+
+message StoreInfoRequest {}
+
+message StoreInfoReply {
+  optional bool trusted = 1;
+  reserved 2;
+}
+
+message FetchNarsRequest {
+  // Store paths to send, streamed back in this order.
+  repeated string paths = 1;
+}
+
+// One frame of a NAR download. The concatenation of all `data` fields in one
+// FetchNars call is a single zstd stream, so the compression window is
+// shared across paths. The stream is flushed at every frame boundary, so
+// each frame decodes in isolation and its decompressed bytes belong to
+// `paths[path_index]`. `eof` marks the last frame of that path's NAR; the
+// client can restore the path as soon as its frames arrive, while later
+// paths are still in flight.
+message NarFrame {
+  uint32 path_index = 1;
+  bytes data = 2;
+  bool eof = 3;
+}
+
+// The build log of a derivation on this node: while it builds here, as it
+// builds; afterwards, as `nix log` reads it here. `drv_path` is a store path
+// base name. In a farm only the builder that built a derivation holds its log:
+// name it with x-nix-worker, and one of its systems with x-nix-system, as for
+// BuildDerivation. A node without the log may answer from the farm's log store
+// or binary cache (BuildLogInfo.source).
+//
+// INVALID_ARGUMENT: a bad path, or tail or limit with follow. NOT_FOUND: no
+// log of it here or in a store this node reads. UNIMPLEMENTED: this node keeps
+// no logs. DATA_LOSS: a .bz2 log does not decompress. UNAVAILABLE: a store
+// this node reads could not be read just now, and no other source had the
+// log. OUT_OF_RANGE: offset past the end of a finished log.
+// RESOURCE_EXHAUSTED: too many log calls on this node or from this caller,
+// or no decode slot within 10 s.
+// UNAUTHENTICATED "bearer token expired": a follow call outlived its bearer
+// token by a minute, as Events.Watch does.
+//
+// Every response, errors included, carries this node's --advertise address
+// as x-nix-node in its initial metadata (when it sends any) and its trailing
+// metadata. A NOT_FOUND while another build of the derivation runs here also
+// carries that build's assignment as x-nix-rebuilding.
+message GetBuildLogRequest {
+  string drv_path = 1;
+  // Start at this byte of the decoded log. Equal to the end: nothing, or with
+  // follow on a running build, wait for more.
+  uint64 offset = 2;
+  // While the derivation builds here, keep sending as the log grows, until
+  // the build ends. Also waits for a build assigned here that has not started.
+  // Without a running build here it is ignored.
+  bool follow = 3;
+  // The assignment whose log the caller wants (DrvState.assign_id). 0: any.
+  // When set, LIVE answers only for that assignment, and KEPT is skipped
+  // once another assignment of the derivation has started here, since Nix
+  // truncates the kept file when a build starts. Before that start, a call
+  // for any log that does not follow gets KEPT.
+  uint64 assign_id = 4;
+  // Send at most this many decoded bytes. 0: to the end.
+  uint64 limit = 5;
+  // Finished logs only: start at the first line that begins at or after
+  // max(offset, size - tail) instead of at offset. 0: start at offset.
+  uint64 tail = 6;
+}
+
+// The concatenation of all `data` fields in one call is a single zstd stream
+// of the log from `info.offset`. In a follow call the server flushes the
+// stream at the end of every message, so all data sent up to then decodes.
+message GetBuildLogChunk {
+  bytes data = 1;
+  // First message only, from servers that know these fields. It may carry no
+  // data. A server that sends no info ignored every field but drv_path.
+  BuildLogInfo info = 2;
+  // Last message of a follow call: the build ended, or left this node.
+  bool ended = 3;
+}
+
+message BuildLogInfo {
+  enum Source {
+    SOURCE_UNSPECIFIED = 0;
+    SOURCE_LIVE = 1;   // the build runs here; the log up to now
+    SOURCE_KEPT = 2;   // the file this node's nix-daemon kept
+    SOURCE_STORE = 3;  // the farm's log store (--build-log-store)
+    SOURCE_CACHE = 4;  // the farm's binary cache (--niks3-cache-url)
+  }
+  Source source = 1;
+  // Decoded size in bytes: up to now for LIVE; the whole log otherwise, once
+  // this node knows it. 0 when unknown (a .bz2, STORE or CACHE log not yet
+  // in the decode cache).
+  uint64 size = 2;
+  // The byte of the decoded log this call starts at: offset, or the line
+  // start that tail picked.
+  uint64 offset = 3;
+  // The number of newlines before `offset`, so the first line sent is line
+  // first_line + 1. Always exact.
+  uint64 first_line = 4;
+  // LIVE: the assignment running here. KEPT: the assignment whose build
+  // wrote this file, if it ran after this daemon started; 0 when unknown.
+  uint64 assign_id = 5;
+  // LIVE: when the build started here (0: not yet).
+  uint64 started_ms = 6;
+  // KEPT: the file's mtime; CACHE: Last-Modified. 0 when unknown. A later
+  // build of the same derivation replaces the log on the node and in stores.
+  uint64 modified_ms = 7;
+}
+
+// Bidirectional tunnel that carries the same byte stream `nix-daemon --stdio`
+// would exchange over stdin/stdout. The server side hands the stream to
+// `nix::daemon::processConnection`, the client side to `nix::RemoteStore`.
+// QueryValidPaths / AddMultipleToStore bypass the tunnel for the `nix copy`
+// hot path so many small paths share one zstd stream and one round trip.
+service NixRemote {
+  rpc Connect(stream Chunk) returns (stream Chunk);
+  rpc QueryValidPaths(QueryValidPathsRequest) returns (QueryValidPathsReply);
+  rpc AddMultipleToStore(stream AddMultipleChunk) returns (AddMultipleReply);
+  rpc QueryPathInfos(QueryPathInfosRequest) returns (QueryPathInfosReply);
+  rpc FetchNars(FetchNarsRequest) returns (stream NarFrame);
+  rpc BuildDerivation(BuildDerivationRequest) returns (stream BuildDerivationChunk);
+  rpc QueryMissing(QueryMissingRequest) returns (QueryMissingReply);
+  rpc StoreInfo(StoreInfoRequest) returns (StoreInfoReply);
+  rpc GetBuildLog(GetBuildLogRequest) returns (stream GetBuildLogChunk);
+}
+
+// ---- scheduling ----------------------------------------------------------
+//
+// A client opens one Schedule stream per build and sends a Want for every
+// derivation whose inputs exist. The scheduler answers Cached (outputs are in
+// the cache), Unplaceable, or Assigned once a worker has a free slot; the
+// client then calls BuildDerivation with `x-nix-worker: <worker_addr>`.
+// Workers hold one WorkerSession to the scheduler; the scheduler announces each
+// assignment with Expect before telling the client, and learns the outcome
+// from Done. All scheduler state is rebuilt from Hello after a restart.
+
+message Want {
+  string drv_path = 1;
+  // "<hash>.narinfo" of every output; all present in the cache => Cached.
+  repeated string out_keys = 2;
+  // Store paths of all inputs (sources and input drv outputs), for locality.
+  repeated string inputs = 3;
+  // Remaining critical path below this drv in the client's DAG, ms.
+  uint64 cp_hint_ms = 4;
+  uint32 build_mode = 5;
+  repeated string required_features = 6;
+  // drv.platform; empty means the scheduler's own system.
+  string system = 7;
+  // The assignment this client got for the drv and whose worker would not
+  // serve it. The scheduler places the drv on another worker.
+  uint64 refused = 11;
+}
+
+message Cancel {
+  string drv_path = 1;
+}
+
+message ClientMsg {
+  oneof msg {
+    Want want = 1;
+    Cancel cancel = 2;
+  }
+}
+
+message Assigned {
+  string drv_path = 1;
+  // IP:port the balancer knows the worker by; goes into x-nix-worker.
+  string worker_addr = 2;
+  uint64 assign_id = 3;
+  // The worker's native system, for the balancer's x-nix-system routing.
+  string worker_system = 4;
+}
+
+message Cached {
+  string drv_path = 1;
+}
+
+// No connected worker can take this drv right now. The Want stays queued
+// and Assigned follows if one shows up. The client gives up on its own clock.
+message Unplaceable {
+  string drv_path = 1;
+  string reason = 2;
+}
+
+// The scheduler stops serving on purpose (restart, or yielding to another
+// node). Close the stream, reconnect right away and say again what you
+// want or are running. Not an error.
+message Restarting {}
+
+// A worker that can run the drv is back after Unplaceable. Assigned follows.
+message Placeable {
+  string drv_path = 1;
+}
+
+message SchedMsg {
+  oneof msg {
+    Assigned assigned = 1;
+    Cached cached = 2;
+    Unplaceable unplaceable = 3;
+    Restarting restarting = 4;
+    Placeable placeable = 5;
+  }
+}
+
+message PathSize {
+  string path = 1;
+  uint64 nar_size = 2;
+}
+
+message RunningBuild {
+  string drv_path = 1;
+  uint64 assign_id = 2;
+}
+
+message Hello {
+  string addr = 1;
+  repeated string systems = 2; // native first, then extra-platforms
+  repeated string features = 3;
+  uint32 max_jobs = 4;
+  // Builds a client came for, so a restarted scheduler neither double-assigns
+  // them nor counts their slots as free.
+  repeated RunningBuild running = 5;
+  // The builder's substituters, in its Nix settings' order, each reduced to
+  // scheme://host[:port]/path: no user, password, query or fragment, scheme
+  // and host in lower case, no trailing slash, at most 256 bytes. At most 32.
+  repeated string substituters = 6;
+  // nix-grpc-store version of the builder. Empty from builders older than
+  // this field, which send no build status, drain reason, disk or traffic.
+  string version = 7;
+  // --min-free in bytes. 0 = no threshold.
+  uint64 min_free_bytes = 8;
+}
+
+message Done {
+  enum Outcome {
+    BUILT = 0;
+    FAILED = 1;
+    CANCELLED = 2;
+    // Expect expired without a BuildDerivation arriving. Older builders;
+    // newer ones give it back as UNREACHABLE.
+    NO_SHOW = 3;
+    // The worker can't run it: place it elsewhere, here only as a last resort.
+    GIVEN_BACK = 4;
+  }
+  enum Reason {
+    REASON_UNSPECIFIED = 0;
+    DRAINING = 1;
+    PUBLISH_UNAVAILABLE = 2;
+    INPUT_UNAVAILABLE = 3;
+    UNREACHABLE = 4; // no client came for it
+    TRANSIENT_FAILURE = 5; // e.g. ENOSPC
+  }
+  // Nix's BuildResult status. Set with BUILT and FAILED by builders that
+  // report it. Values carry a prefix because they share the scope of
+  // Outcome and Reason.
+  enum Status {
+    STATUS_UNSPECIFIED = 0;
+    STATUS_BUILT = 1;
+    STATUS_SUBSTITUTED = 2;
+    STATUS_ALREADY_VALID = 3; // also ResolvesToAlreadyValid
+    STATUS_PERMANENT_FAILURE = 4;
+    STATUS_INPUT_REJECTED = 5;
+    STATUS_OUTPUT_REJECTED = 6; // also HashMismatch
+    STATUS_TRANSIENT_FAILURE = 7;
+    STATUS_CACHED_FAILURE = 8;
+    STATUS_TIMED_OUT = 9;
+    STATUS_MISC_FAILURE = 10;
+    STATUS_DEPENDENCY_FAILED = 11;
+    STATUS_LOG_LIMIT_EXCEEDED = 12;
+    STATUS_NOT_DETERMINISTIC = 13;
+    STATUS_NO_SUBSTITUTERS = 14;
+    // FAILED without a BuildResult: the builder or its nix-daemon failed
+    // before or while building. `error` says how.
+    STATUS_WORKER_ERROR = 15;
+  }
+  string drv_path = 1;
+  uint64 assign_id = 2;
+  Outcome outcome = 3;
+  repeated PathSize outputs = 4;
+  Reason reason = 5; // with GIVEN_BACK
+  Status status = 6;
+  // FAILED only: Nix's message, or the worker's error, with ANSI escapes
+  // removed and common secret shapes masked. At most 4096 bytes: the first
+  // two lines, then "[...]", then as much of the end as fits. Bytes, because
+  // build output need not be UTF-8.
+  bytes error = 7;
+}
+
+message Load {
+  bool draining = 1;
+  // When several hold, the first listed wins.
+  enum DrainReason {
+    DRAIN_REASON_UNSPECIFIED = 0;
+    DRAIN_REASON_STOPPING = 1;     // a stop signal
+    DRAIN_REASON_LOW_DISK = 2;     // free space below --min-free
+    DRAIN_REASON_LOCAL_DAEMON = 3; // the local nix-daemon does not answer
+  }
+  // While draining. A builder sends Load again when the reason changes.
+  DrainReason drain_reason = 2;
+}
+
+// Measurements a connected builder sends once the scheduler asked for them
+// with ReportsWanted on this session: the first on the builder's next tick,
+// then at most every 2 s, and only when something changed.
+message WorkerReport {
+  message Substituter {
+    string url = 1;            // reduced as in Hello.substituters
+    uint64 nar_bytes = 2;      // NAR bytes copied from it
+    uint64 download_bytes = 3; // bytes received, http and https only
+    uint64 paths = 4;          // NARs that arrived in full
+    uint64 failures = 5;       // substitutions that stopped before that
+  }
+  // Free (f_bavail) and total (f_blocks) bytes of the store's file system.
+  // Set in the first report of a session, and when free moved by at least
+  // max(256 MiB, 5% of the last value sent) or crossed min_free_bytes.
+  optional uint64 disk_free_bytes = 1;
+  optional uint64 disk_total_bytes = 2;
+  // Traffic since the last report this builder sent without a send error,
+  // on this session or an earlier one, per substituter, only those with
+  // traffic. At most 32.
+  repeated Substituter substituters = 3;
+  // Running builds here whose phase or start changed since the last report;
+  // every running build in the first report of a session. A build that ends
+  // needs no entry: its Done tells the scheduler.
+  repeated BuildProgress builds = 4;
+}
+
+// What a builder knows about one running build that the scheduler does not.
+message BuildProgress {
+  string drv_path = 1;          // base name
+  uint64 assign_id = 2;
+  string phase = 3;             // the last setPhase, such as "buildPhase"; empty before the first
+  uint64 started_ms = 4;        // when the build started here, Unix ms
+  uint64 phase_started_ms = 5;  // when this node saw that setPhase; 0 with no phase
+}
+
+message WorkerMsg {
+  oneof msg {
+    Hello hello = 1;
+    Done done = 2;
+    Load load = 3;
+    WorkerReport report = 4;
+  }
+}
+
+message Expect {
+  string drv_path = 1;
+  uint64 assign_id = 2;
+}
+
+message Revoke {
+  string drv_path = 1;
+}
+
+// The scheduler takes WorkerReports on this session. Sent once, after it
+// handled Hello. Older schedulers never send it, so builders send them no
+// reports.
+message ReportsWanted {}
+
+message SchedCmd {
+  oneof cmd {
+    Expect expect = 1;
+    Revoke revoke = 2;
+    Restarting restarting = 3;
+    ReportsWanted reports_wanted = 4;
+  }
+}
+
+// Each stream message carries a batch, applied in order; gRPC's per-message
+// cost dominates otherwise.
+message ClientMsgs { repeated ClientMsg msgs = 1; }
+message SchedMsgs { repeated SchedMsg msgs = 1; }
+message WorkerMsgs { repeated WorkerMsg msgs = 1; }
+message SchedCmds { repeated SchedCmd msgs = 1; }
+
+service Scheduler {
+  rpc Schedule(stream ClientMsgs) returns (stream SchedMsgs);
+  rpc WorkerSession(stream WorkerMsgs) returns (stream SchedCmds);
+}

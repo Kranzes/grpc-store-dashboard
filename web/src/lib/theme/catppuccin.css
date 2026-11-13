@@ -1,0 +1,199 @@
+/*
+ * Catppuccin, from the official @catppuccin/palette package.
+ * Latte for light mode, Macchiato for dark mode. The system preference decides
+ * unless <html data-theme="light|dark"> overrides it. light-dark() picks the
+ * flavor from the color-scheme. Only the colors the tokens below use are mapped.
+ */
+@import '@catppuccin/palette/css/catppuccin.css';
+
+:root {
+	color-scheme: light dark;
+	--ctp-rosewater: light-dark(var(--ctp-latte-rosewater), var(--ctp-macchiato-rosewater));
+	--ctp-pink: light-dark(var(--ctp-latte-pink), var(--ctp-macchiato-pink));
+	--ctp-mauve: light-dark(var(--ctp-latte-mauve), var(--ctp-macchiato-mauve));
+	--ctp-red: light-dark(var(--ctp-latte-red), var(--ctp-macchiato-red));
+	--ctp-peach: light-dark(var(--ctp-latte-peach), var(--ctp-macchiato-peach));
+	--ctp-yellow: light-dark(var(--ctp-latte-yellow), var(--ctp-macchiato-yellow));
+	--ctp-green: light-dark(var(--ctp-latte-green), var(--ctp-macchiato-green));
+	--ctp-teal: light-dark(var(--ctp-latte-teal), var(--ctp-macchiato-teal));
+	--ctp-sapphire: light-dark(var(--ctp-latte-sapphire), var(--ctp-macchiato-sapphire));
+	--ctp-blue: light-dark(var(--ctp-latte-blue), var(--ctp-macchiato-blue));
+	--ctp-lavender: light-dark(var(--ctp-latte-lavender), var(--ctp-macchiato-lavender));
+	--ctp-text: light-dark(var(--ctp-latte-text), var(--ctp-macchiato-text));
+	--ctp-subtext1: light-dark(var(--ctp-latte-subtext1), var(--ctp-macchiato-subtext1));
+	--ctp-subtext0: light-dark(var(--ctp-latte-subtext0), var(--ctp-macchiato-subtext0));
+	--ctp-overlay2: light-dark(var(--ctp-latte-overlay2), var(--ctp-macchiato-overlay2));
+	--ctp-overlay1: light-dark(var(--ctp-latte-overlay1), var(--ctp-macchiato-overlay1));
+	--ctp-surface2: light-dark(var(--ctp-latte-surface2), var(--ctp-macchiato-surface2));
+	--ctp-surface1: light-dark(var(--ctp-latte-surface1), var(--ctp-macchiato-surface1));
+	--ctp-surface0: light-dark(var(--ctp-latte-surface0), var(--ctp-macchiato-surface0));
+	--ctp-base: light-dark(var(--ctp-latte-base), var(--ctp-macchiato-base));
+	--ctp-mantle: light-dark(var(--ctp-latte-mantle), var(--ctp-macchiato-mantle));
+	--ctp-crust: light-dark(var(--ctp-latte-crust), var(--ctp-macchiato-crust));
+}
+
+:root[data-theme='light'] {
+	color-scheme: light;
+}
+
+:root[data-theme='dark'] {
+	color-scheme: dark;
+}
+
+/*
+ * Semantic tokens. Components use these, never raw palette names.
+ * light-dark() also picks a different palette color per flavor for the few
+ * tokens that need one (Latte's mid tones are too light for text).
+ */
+:root {
+	--bg: var(--ctp-base);
+	--bg-panel: var(--ctp-mantle);
+	--bg-sunken: var(--ctp-crust);
+	--bg-raised: var(--ctp-surface0);
+	--bg-node: var(--ctp-base);
+	/* Up to 60%, so --fg-muted text on it stays above 4.5:1 in Latte (4.61:1). */
+	--bg-hover: color-mix(in srgb, var(--ctp-surface0) 60%, transparent);
+	--border: var(--ctp-surface1);
+	--border-subtle: light-dark(
+		var(--ctp-surface0),
+		color-mix(in srgb, var(--ctp-surface0) 80%, var(--ctp-mantle))
+	);
+	--border-strong: var(--ctp-surface2);
+	--fg: var(--ctp-text);
+	/* Latte subtext0 is 4.4:1 on base, below AA, so light mode uses subtext1. */
+	--fg-muted: light-dark(var(--ctp-subtext1), var(--ctp-subtext0));
+	/* Icons, dots and decoration only: 3.49:1 on base in Latte, 4.14:1 in Macchiato. */
+	--fg-faint: light-dark(var(--ctp-overlay2), var(--ctp-overlay1));
+	--accent: var(--ctp-blue);
+	--accent-alt: var(--ctp-lavender);
+	/* Accent as text or as a filled button background with --fg-on-accent. */
+	--accent-strong: light-dark(
+		color-mix(in oklab, var(--ctp-blue) 82%, var(--ctp-text)),
+		var(--ctp-blue)
+	);
+	/* Catppuccin's style guide: Base for text on accent colors, in both flavors. */
+	--fg-on-accent: var(--ctp-base);
+	--accent-soft: color-mix(in srgb, var(--ctp-blue) 14%, transparent);
+	--focus-ring: var(--ctp-blue);
+	/* The style guide's selection, Overlay 2 at 20 to 30%, and its cursor, Rosewater. */
+	--selection: color-mix(in srgb, var(--ctp-overlay2) 25%, transparent);
+	/* Latte rosewater is 2.3:1 on base; mixed with text it reaches 3:1. */
+	--caret: light-dark(
+		color-mix(in oklab, var(--ctp-rosewater) 65%, var(--ctp-text)),
+		var(--ctp-rosewater)
+	);
+	--danger: var(--ctp-red);
+	--danger-fg: light-dark(color-mix(in oklab, var(--ctp-red) 85%, var(--ctp-text)), var(--ctp-red));
+	--danger-soft: color-mix(in srgb, var(--ctp-red) 12%, transparent);
+	--warn: var(--ctp-yellow);
+	/* Latte yellow turns grey before it reaches 4.5:1. Peach and text give a rust at 4.76:1. */
+	--warn-fg: light-dark(
+		color-mix(in srgb, var(--ctp-peach) 45%, var(--ctp-text)),
+		var(--ctp-yellow)
+	);
+	--warn-soft: color-mix(in srgb, var(--ctp-yellow) 16%, transparent);
+	--ok: var(--ctp-green);
+
+	--shadow-color: light-dark(
+		color-mix(in srgb, var(--ctp-text) 14%, transparent),
+		color-mix(in srgb, var(--ctp-crust) 70%, transparent)
+	);
+	--shadow-sm: 0 1px 2px var(--shadow-color);
+	--shadow-md: 0 1px 2px var(--shadow-color), 0 4px 12px var(--shadow-color);
+	--shadow-lg: 0 2px 6px var(--shadow-color), 0 12px 32px var(--shadow-color);
+	--scrim: light-dark(
+		color-mix(in srgb, var(--ctp-base) 72%, transparent),
+		color-mix(in srgb, var(--ctp-crust) 70%, transparent)
+	);
+
+	/* Build states */
+	--state-queued: var(--ctp-yellow);
+	--state-assigned: var(--ctp-sapphire);
+	--state-running: var(--ctp-blue);
+	--state-built: var(--ctp-green);
+	--state-cached: var(--ctp-teal);
+	--state-failed: var(--ctp-red);
+	--state-unplaceable: var(--ctp-peach);
+	--state-cancelled: var(--ctp-overlay1);
+
+	/* Flow edges */
+	--flow-request: var(--ctp-lavender);
+	--flow-assign: var(--ctp-blue);
+	--flow-hit: var(--ctp-teal);
+	--flow-publish: var(--ctp-green);
+	/*
+	 * Mauve, darker in OKLCH with its chroma and hue kept. Fetch runs 12 px
+	 * from assign on the buses and trunks, and plain mauve and blue looked
+	 * alike to color-blind readers (ΔE 1.0 in Latte, 1.2 in Macchiato). Latte's
+	 * is just outside sRGB, so an sRGB screen shows #6b00ca. chart-colors.test.ts
+	 * checks the buses' colors apart.
+	 */
+	--flow-fetch: light-dark(
+		oklch(from var(--ctp-latte-mauve) 0.45 c h),
+		oklch(from var(--ctp-macchiato-mauve) 0.62 c h)
+	);
+	/* Peach: the farthest from every other line and state color that passes the chart rule. */
+	--flow-substitute: var(--ctp-peach);
+	--flow-idle: light-dark(var(--ctp-surface1), var(--ctp-surface0));
+
+	/* Canvas */
+	--canvas-bg: light-dark(var(--ctp-mantle), var(--ctp-crust));
+	--canvas-dots: light-dark(var(--ctp-surface1), var(--ctp-surface0));
+
+	--conn-ok: var(--ctp-green);
+	--conn-warn: var(--ctp-yellow);
+	--conn-error: var(--ctp-red);
+	/* Paused by the user. Pink, a tone no other status uses. */
+	--conn-paused: var(--ctp-pink);
+	--paused-soft: color-mix(in srgb, var(--ctp-pink) 16%, transparent);
+	/* For the pause sign and its button. Latte pink is 2.3:1 on base, too faint for an icon. */
+	--paused-fg: light-dark(
+		color-mix(in oklab, var(--ctp-pink) 55%, var(--ctp-text)),
+		var(--ctp-pink)
+	);
+}
+
+/*
+ * Build logs. The background, and the 16 ANSI colors: each is Catppuccin's
+ * terminal port color through the log worker's adjust()
+ * (#lib/logs/contrast.ts), which keeps its hue and moves its lightness until
+ * it reaches 4.5:1 on the log background. A color that already passes stays
+ * as the port draws it. theme/contrast.test.ts computes them again from the
+ * port colors. Exact colors (256-color 16 to 255, truecolor) go through the
+ * same adjust() in the log worker. Colored text never sits on a tint.
+ */
+:root {
+	--log-bg: light-dark(var(--ctp-base), var(--ctp-crust));
+	/* black */
+	--ansi-0: light-dark(#5c5f77, #7c819a);
+	/* red */
+	--ansi-1: light-dark(#d20f39, #ed8796);
+	/* green */
+	--ansi-2: light-dark(#207f00, #a6da95);
+	/* yellow */
+	--ansi-3: light-dark(#9d6000, #eed49f);
+	/* blue */
+	--ansi-4: light-dark(#1b63f2, #8aadf4);
+	/* magenta */
+	--ansi-5: light-dark(#b24297, #f5bde6);
+	/* cyan */
+	--ansi-6: light-dark(#007a81, #8bd5ca);
+	/* white */
+	--ansi-7: light-dark(#6a6e7a, #a5adcb);
+	/* brblack */
+	--ansi-8: light-dark(#6a6d82, #7b819a);
+	/* brred */
+	--ansi-9: light-dark(#d61e38, #ec7486);
+	/* brgreen */
+	--ansi-10: light-dark(#138000, #8ccf7f);
+	/* bryellow */
+	--ansi-11: light-dark(#9a6200, #e1c682);
+	/* brblue */
+	--ansi-12: light-dark(#3a60f1, #78a1f6);
+	/* brmagenta */
+	--ansi-13: light-dark(#b44194, #f2a9dd);
+	/* brcyan */
+	--ansi-14: light-dark(#007a83, #63cbc0);
+	/* brwhite */
+	--ansi-15: light-dark(#6a6e79, #b8c0e0);
+}

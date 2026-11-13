@@ -1,0 +1,3621 @@
+From afee989f8f194fe7def2fcb5e7b8322fe1fd68b6 Mon Sep 17 00:00:00 2001
+From: Ilan Joselevich <personal@ilanjoselevich.com>
+Date: Tue, 10 Nov 2026 19:22:36 +0100
+Subject: [PATCH 05/12] scheduler: serve its state and every change as
+ Events.Watch
+
+A dashboard that draws a farm live, or anything else that follows the
+scheduler, needs its state and every change to it. The metrics are
+sampled and name no derivations.
+
+The Dispatcher now keeps a few facts it had no use for before: when an
+entry was placed, whether the cache was asked about it, where its
+inputs come from, and each Schedule caller's name and connect time.
+pick() scores the same workers in the same order.
+
+It builds events: the connected workers and clients, every queued or
+assigned derivation, and what happened to each (wanted, assigned,
+built, failed, answered from the cache, given back, requeued, dropped).
+Events say what happened, since a diff of the state loses outcomes.
+Dispatcher::watch() gets a snapshot, then one event per change, both
+built under the Dispatcher's mutex, so the first change carries the
+snapshot's seq plus one. It builds events only while someone watches.
+With nobody watching, dispatcher-bench firehose spends about 2% more
+time in the Dispatcher.
+
+The messages live in their own proto/events.proto, so clients vendor
+one file and nix_remote.proto stays untouched. The Events service sends
+them on one server stream, Watch. Only the active scheduler serves it,
+and it ends open streams with UNAVAILABLE when it steps down. It
+cancels a watcher that falls behind, with a bound that grows with the
+largest table the stream has seen. Watch needs the watch role and turns
+away anonymous callers, since the stream names clients and derivations.
+It allows 64 streams, 8 per caller.
+
+tests/events-test.cc runs a seeded random farm against one Dispatcher
+while a watcher rebuilds the state from the events. After every step
+that state must equal a fresh snapshot. events-grpc-test runs the
+service with certificates and bearer tokens.
+---
+ meson.build                     |   36 +-
+ nix/checks.nix                  |    2 +-
+ nix/packages/nix-grpc-store.nix |    3 +
+ proto/events.proto              |  208 ++++++
+ src/daemon/coordinator.cc       |    9 +-
+ src/daemon/coordinator.hh       |    2 +
+ src/daemon/dispatcher-events.cc |  431 +++++++++++++
+ src/daemon/dispatcher.cc        |  102 ++-
+ src/daemon/dispatcher.hh        |   96 ++-
+ src/daemon/events.cc            |   88 +++
+ src/daemon/events.hh            |   69 ++
+ src/daemon/main.cc              |    1 +
+ src/daemon/sched-reactor.hh     |  228 ++++++-
+ src/daemon/scheduler.hh         |   85 ++-
+ tests/events-grpc-test.cc       |  445 +++++++++++++
+ tests/events-test.cc            | 1058 +++++++++++++++++++++++++++++++
+ tests/scheduler-test.cc         |   42 ++
+ 17 files changed, 2854 insertions(+), 51 deletions(-)
+ create mode 100644 proto/events.proto
+ create mode 100644 src/daemon/dispatcher-events.cc
+ create mode 100644 src/daemon/events.cc
+ create mode 100644 src/daemon/events.hh
+ create mode 100644 tests/events-grpc-test.cc
+ create mode 100644 tests/events-test.cc
+
+diff --git a/meson.build b/meson.build
+index e8ea45a..f57f94c 100644
+--- a/meson.build
++++ b/meson.build
+@@ -121,6 +121,21 @@ if build_server
+     ],
+     depend_files : 'proto/eds.proto',
+   )
++  events_gen = custom_target('events_proto',
++    output : [
++      'events.pb.cc',        'events.pb.h',
++      'events.grpc.pb.cc',   'events.grpc.pb.h',
++    ],
++    command : [
++      protoc,
++      '--proto_path=' + proto_dir,
++      '--cpp_out=@OUTDIR@',
++      '--grpc_out=@OUTDIR@',
++      '--plugin=protoc-gen-grpc=' + grpc_cpp_plugin.full_path(),
++      'events.proto',
++    ],
++    depend_files : 'proto/events.proto',
++  )
+ endif
+ 
+ gen_inc = include_directories('.')
+@@ -184,13 +199,13 @@ if build_server
+   # The scheduler and the worker's side of its protocol, without gRPC. The
+   # daemon, the tests and dispatcher-bench share it.
+   dispatcher_lib = static_library('nix-grpc-dispatcher',
+-    sources : ['src/daemon/dispatcher.cc', 'src/daemon/builder.cc', gen[0], gen[1]],
++    sources : ['src/daemon/dispatcher.cc', 'src/daemon/builder.cc', 'src/daemon/dispatcher-events.cc', gen[0], gen[1], events_gen[0], events_gen[1]],
+     include_directories : [gen_inc, src_inc],
+     dependencies : [protobuf_dep, nix_util_dep] + prometheus_dep + absl_dep,
+   )
+   dispatcher_dep = declare_dependency(
+     link_with : dispatcher_lib,
+-    sources : [gen[1]],  # users include nix_remote.pb.h, order them after protoc
++    sources : [gen[1], events_gen[1]],  # users include the .pb.h files, order them after protoc
+     include_directories : [gen_inc, src_inc, include_directories('src/daemon')],
+     dependencies : [protobuf_dep, nix_util_dep] + prometheus_dep + absl_dep,
+   )
+@@ -203,12 +218,13 @@ if build_server
+     'src/daemon/backend.cc',
+     'src/daemon/coordinator.cc',
+     'src/daemon/eds.cc',
++    'src/daemon/events.cc',
+     'src/daemon/options.cc',
+     {'darwin': 'src/daemon/sandbox-darwin.cc', 'linux': 'src/daemon/sandbox-linux.cc'}.get(host_machine.system(), 'src/daemon/sandbox-unsupported.cc'),
+   ] + (host_machine.system() == 'darwin' ? ['src/daemon/sbpl.cc'] : [])
+ 
+   executable('nix-grpc-daemon',
+-    sources : daemon_sources + [gen, eds_gen],
++    sources : daemon_sources + [gen, eds_gen, events_gen],
+     include_directories : [gen_inc, src_inc],
+     cpp_pch : do_pch ? ['pch/daemon_pch.hh'] : [],
+     cpp_args : nix_compat_args + ['-DNIX_GRPC_VERSION="' + meson.project_version() + '"'],
+@@ -290,6 +306,20 @@ if build_server
+     cpp_args : ['-UNDEBUG'],
+   ))
+ 
++  test('events', executable('events-test',
++    sources : ['tests/events-test.cc'],
++    dependencies : [dispatcher_dep],
++    cpp_args : ['-UNDEBUG'],
++  ), timeout : 120)
++
++  # Events.Watch over loopback gRPC, with the real service's auth checks.
++  events_grpc_test = executable('events-grpc-test',
++    sources : ['tests/events-grpc-test.cc', 'src/daemon/events.cc', 'src/daemon/auth.cc', events_gen[2], events_gen[3]],
++    dependencies : [dispatcher_dep, grpc_dep, nix_store_dep, curl_dep, json_dep, openssl_dep],
++    cpp_args : ['-UNDEBUG'],
++  )
++  test('events-grpc', events_grpc_test, timeout : 60)
++
+   test('sbpl', executable('sbpl-test',
+     sources : ['tests/sbpl-test.cc', 'src/daemon/sbpl.cc'],
+     include_directories : [src_inc, include_directories('src/daemon')],
+diff --git a/nix/checks.nix b/nix/checks.nix
+index 18bcf9d..16f1482 100644
+--- a/nix/checks.nix
++++ b/nix/checks.nix
+@@ -54,7 +54,7 @@ lib.filterAttrs (name: _: lib.hasPrefix "plugin-" name) packages
+     # Meson generates a clang-tidy target from .clang-tidy. The generated
+     # protobuf headers must exist before it runs.
+     buildPhase = ''
+-      ninja nix_remote.pb.h nix_remote.grpc.pb.h eds.pb.h eds.grpc.pb.h
++      ninja nix_remote.pb.h nix_remote.grpc.pb.h eds.pb.h eds.grpc.pb.h events.pb.h events.grpc.pb.h
+       ninja clang-tidy
+     '';
+     installPhase = "touch $out";
+diff --git a/nix/packages/nix-grpc-store.nix b/nix/packages/nix-grpc-store.nix
+index 367ddd0..42016cb 100644
+--- a/nix/packages/nix-grpc-store.nix
++++ b/nix/packages/nix-grpc-store.nix
+@@ -53,6 +53,7 @@ stdenv.mkDerivation {
+       ++ lib.optionals server [
+         ../../pch/daemon_pch.hh
+         ../../proto/eds.proto
++        ../../proto/events.proto
+         ../../src
+         ../../fuzz
+         ../../tests/.clang-tidy
+@@ -83,6 +84,8 @@ stdenv.mkDerivation {
+         ../../tests/scheduler-test.cc
+         ../../tests/dispatcher-test.cc
+         ../../tests/http-test.cc
++        ../../tests/events-test.cc
++        ../../tests/events-grpc-test.cc
+         ../../tests/dispatcher-bench.cc
+         ../../tests/scheduler-grpc-bench.cc
+       ]
+diff --git a/proto/events.proto b/proto/events.proto
+new file mode 100644
+index 0000000..eeb0600
+--- /dev/null
++++ b/proto/events.proto
+@@ -0,0 +1,208 @@
++syntax = "proto3";
++
++package nix.remote;
++
++// The scheduler's events: a read-only live view of the active scheduler,
++// for anything that follows a farm as it runs, such as a dashboard or a
++// script.
++//
++// Watch sends a snapshot of the scheduler's state, then one event per change.
++// A snapshot starts with Reset and ends with SnapshotDone, and every event in
++// it carries Reset's seq. Each event after the snapshot has seq one higher
++// than the one before. A client that sees any other seq drops its state and
++// reconnects for a fresh snapshot. The server cancels a watcher that falls
++// too far behind instead of skipping events.
++//
++// Only the active scheduler serves Watch. A passive node answers UNAVAILABLE,
++// and the active node ends open streams with UNAVAILABLE when it steps down,
++// so clients reconnect through the balancer and reach the new leader. A
++// stream with a write still in flight is cancelled instead, so a client that
++// stopped reading cannot hold it open.
++//
++// Callers need the `watch` role or higher. For a bearer token that is an
++// --oidc-config rule with scopes ["watch"], not an OAuth scope. Anonymous
++// callers are refused even where the anonymous role would allow it, because
++// the stream names clients and derivations. A scheduler serves at most 64
++// streams, 8 per caller, and answers RESOURCE_EXHAUSTED beyond that.
++//
++// Kept self-contained (no imports) so clients can vendor this one file.
++service Events {
++  rpc Watch(WatchRequest) returns (stream WatchEvents);
++}
++
++message WatchRequest {}
++
++// Events are batched per stream message, like the scheduler's other streams.
++message WatchEvents {
++  repeated WatchEvent msgs = 1;
++}
++
++message WatchEvent {
++  uint64 seq = 1;
++  // When the event happened, Unix ms: the scheduler's wall clock at process
++  // start plus monotonic time since. It never goes backwards within one
++  // instance and does not follow later system clock steps. Every *_ms field
++  // uses this clock.
++  uint64 time_ms = 2;
++  oneof event {
++    Reset reset = 3;
++    SnapshotDone snapshot_done = 4;
++    WorkerState worker = 5;
++    ClientState client = 6;
++    ClientGone client_gone = 7;
++    DrvState drv = 8;
++    DrvGone drv_gone = 9;
++    DrvCached cached = 10;
++  }
++}
++
++// First event of every snapshot: drop all state.
++message Reset {
++  // Random per scheduler process. seq restarts with every new instance.
++  string instance = 1;
++  // nix-grpc-store version of the scheduler.
++  string version = 3;
++  // The system the scheduler assumes for derivations that name none.
++  string default_system = 4;
++  // niks3 server the scheduler asks for cache hits. Empty without a cache.
++  string cache_url = 5;
++}
++
++message SnapshotDone {}
++
++// A builder's session. Upsert keyed by addr, sent in the snapshot (connected
++// workers only) and on Hello, Load and disconnect. A worker that went away
++// stays known with up = false until it says Hello again.
++message WorkerState {
++  // The address the balancer reaches it at (its --advertise).
++  string addr = 1;
++  // Native system first, then extra platforms.
++  repeated string systems = 2;
++  repeated string features = 3;
++  uint32 max_jobs = 4;
++  bool up = 5;
++  // Stopping, or low on disk. The scheduler cannot tell which.
++  bool draining = 6;
++}
++
++// One Schedule stream: a build client. Hook-mode builds open one per
++// derivation, so group clients by identity for display.
++message ClientState {
++  uint64 id = 1;
++  // Certificate CN, "oidc:<provider>:<sub>" for a bearer token, or "-" for
++  // an anonymous caller.
++  string identity = 2;
++  uint64 connected_ms = 3;
++}
++
++message ClientGone {
++  uint64 id = 1;
++}
++
++// A derivation the scheduler is tracking: queued or assigned. Upsert keyed by
++// drv_path. Removed by DrvGone.
++message DrvState {
++  enum Phase {
++    PHASE_QUEUED = 0;
++    // No connected worker offers its system and features. Still queued.
++    PHASE_UNPLACEABLE = 1;
++    // Sent to a worker. Covers the client's upload, input fetching, the
++    // build and publishing outputs: the scheduler does not see a build start.
++    PHASE_ASSIGNED = 2;
++  }
++  // What made the scheduler send this update.
++  enum Cause {
++    CAUSE_SNAPSHOT = 0;
++    // No entry existed: the first Want for it. `cache_checked` tells whether
++    // the cache was asked first and missed.
++    CAUSE_WANTED = 1;
++    // A Want for a drv already tracked (by another client, by the same
++    // client again, or its first Want after a worker's Hello reported it),
++    // or a client cancelled or left and the drv stays. An assigned drv stays
++    // with empty client_ids after its last client leaves, until its worker
++    // reports an outcome.
++    CAUSE_FOLLOWERS = 2;
++    CAUSE_ASSIGNED = 3;
++    // A worker's Hello reported it as running: after a scheduler restart,
++    // when a worker reconnects or says Hello again, or when it takes over a
++    // drv queued here or placed on another worker (superseded).
++    CAUSE_ADOPTED = 4;
++    // Back in the queue: given back, never claimed, or its worker
++    // disconnected or reconnected without it. `reason` says which. Also sent,
++    // with reason "the worker's stream broke", for a drv whose Expect could
++    // not be delivered, which was never shown as ASSIGNED. A drv another
++    // worker reports as running comes as CAUSE_ADOPTED.
++    CAUSE_REQUEUED = 5;
++    // `phase` switched between PHASE_QUEUED and PHASE_UNPLACEABLE.
++    CAUSE_PLACEABILITY = 6;
++  }
++  string drv_path = 1; // base name, "<hash>-<name>.drv"
++  Phase phase = 2;
++  Cause cause = 3;
++  // Required system and features. Empty for a drv only known from a
++  // worker's Hello.
++  string system = 4;
++  repeated string features = 5;
++  // Schedule streams waiting for it.
++  repeated uint64 client_ids = 6;
++  // First Want, Unix ms. 0 when unknown (adopted after a restart).
++  uint64 queued_ms = 7;
++  // Remaining critical path the clients reported, ms. Higher goes first.
++  uint64 cp_hint_ms = 8;
++  // Number of input paths (sources and input drv outputs).
++  uint32 inputs = 9;
++  bool cache_checked = 10;
++  // UNPLACEABLE: why. REQUEUED: why it came back.
++  string reason = 11;
++
++  // ASSIGNED only.
++  string worker_addr = 12;
++  uint64 assign_id = 13;
++  uint64 assigned_ms = 14;
++  // Where the inputs are, from what the scheduler remembers about recent
++  // builds: one entry per worker that built some of them. Inputs built on the
++  // assigned worker are local. Inputs built elsewhere come through the cache.
++  // Inputs nobody here built (sources, uploads, older cache content) count in
++  // inputs_unknown.
++  repeated InputSource input_sources = 15;
++  uint32 inputs_unknown = 16;
++}
++
++message InputSource {
++  string worker_addr = 1;
++  uint32 paths = 2;
++  uint64 nar_bytes = 3;
++}
++
++// A derivation left the scheduler.
++message DrvGone {
++  enum Outcome {
++    BUILT = 0;
++    FAILED = 1;
++    // The worker reported the build as cancelled.
++    CANCELLED = 2;
++    // Nobody wants it any more: every client cancelled or left a queued drv,
++    // or its worker gave it back, went away or reconnected without it while
++    // no client was waiting.
++    DROPPED = 3;
++  }
++  string drv_path = 1;
++  Outcome outcome = 2;
++  // The worker it was assigned to, if any.
++  string worker_addr = 3;
++  // BUILT only. These have been published to the cache.
++  repeated Output outputs = 4;
++}
++
++message Output {
++  string path = 1;
++  uint64 nar_size = 2;
++}
++
++// A Want answered from the cache: all outputs were already there. The
++// scheduler keeps no entry for it.
++message DrvCached {
++  string drv_path = 1;
++  string system = 2;
++  uint64 client_id = 3;
++}
+diff --git a/src/daemon/coordinator.cc b/src/daemon/coordinator.cc
+index fcfbb33..5a5550e 100644
+--- a/src/daemon/coordinator.cc
++++ b/src/daemon/coordinator.cc
+@@ -86,7 +86,7 @@ auto SchedulerService::Schedule(grpc::CallbackServerContext * context)
+     if (auto const status = auth->authorize(caller, "Schedule", Role::write); !status.ok()) {
+         return new RejectReactor<ClientMsgs, SchedMsgs>(status); // NOLINT(cppcoreguidelines-owning-memory)
+     }
+-    return new ScheduleReactor(context, *dispatcher, *idle); // NOLINT(cppcoreguidelines-owning-memory)
++    return new ScheduleReactor(context, *dispatcher, *idle, caller.name); // NOLINT(cppcoreguidelines-owning-memory)
+ }
+ 
+ auto SchedulerService::WorkerSession(grpc::CallbackServerContext * context)
+@@ -152,6 +152,7 @@ void Coordinator::setSchedulerActive(bool active)
+     }
+     scheduler->setActive(active);
+     eds->setActive(active);
++    events->setActive(active);
+     if (active) {
+         dispatcher->serving(); // NOLINT(bugprone-unchecked-optional-access): set iff scheduler
+     } else {
+@@ -197,10 +198,13 @@ Coordinator::Coordinator(const Options & options, Auth & auth, Metrics & metrics
+                 .present = std::move(present),
+                 .lookupThreads =
+                     options.lookupThreads != 0 ? options.lookupThreads : Dispatcher::Config::defaultLookupThreads,
+-                .logLevel = options.logLevel},
++                .logLevel = options.logLevel,
++                .version = NIX_GRPC_VERSION,
++                .cacheUrl = options.niks3.url},
+             metrics);
+         scheduler = std::make_unique<SchedulerService>(*dispatcher, auth, idle);
+         eds = std::make_unique<EdsService>(*dispatcher, auth, idle);
++        events = std::make_unique<EventsService>(*dispatcher, auth, idle);
+     }
+     if (builder && dispatcher && options.schedulerAddr.empty()) {
+         auto const worker = dispatcher->loopbackWorker([this](const SchedCmd & cmd) -> void {
+@@ -235,6 +239,7 @@ Coordinator::~Coordinator()
+     if (builder) {
+         builder->setSend(nullptr);
+     }
++    events.reset();
+     eds.reset();
+     scheduler.reset();
+     dispatcher.reset();
+diff --git a/src/daemon/coordinator.hh b/src/daemon/coordinator.hh
+index f3062d1..f5bb1cf 100644
+--- a/src/daemon/coordinator.hh
++++ b/src/daemon/coordinator.hh
+@@ -22,6 +22,7 @@
+ #include "dispatcher.hh"
+ #include "eds.hh"
+ #include "elector.hh"
++#include "events.hh"
+ #include "idle.hh"
+ #include "metrics.hh"
+ #include "nix_remote.grpc.pb.h"
+@@ -75,6 +76,7 @@ public:
+     std::optional<Dispatcher> dispatcher;
+     std::unique_ptr<SchedulerService> scheduler;
+     std::unique_ptr<EdsService> eds;
++    std::unique_ptr<EventsService> events;
+     // NOLINTEND(*-non-private-member-variables-in-classes)
+ 
+     void start(grpc::Server & server);
+diff --git a/src/daemon/dispatcher-events.cc b/src/daemon/dispatcher-events.cc
+new file mode 100644
+index 0000000..458f82c
+--- /dev/null
++++ b/src/daemon/dispatcher-events.cc
+@@ -0,0 +1,431 @@
++// The Dispatcher's side of Events.Watch (proto/events.proto): the
++// snapshot and one event per change. Everything here runs under
++// Dispatcher::mutex. Events are built only while someone watches.
++
++#include "dispatcher.hh"
++
++#include <algorithm>
++#include <chrono>
++#include <cstddef>
++#include <cstdint>
++#include <format>
++#include <functional>
++#include <iterator>
++#include <map>
++#include <optional>
++#include <random>
++#include <ratio>
++#include <set>
++#include <span>
++#include <string>
++#include <utility>
++#include <vector>
++
++#include "events.pb.h"
++#include "nix_remote.pb.h"
++#include "scheduler.hh"
++
++namespace nixgrpc {
++
++using nix::remote::Done;
++using nix::remote::DrvGone;
++using nix::remote::DrvState;
++using nix::remote::WatchEvent;
++
++namespace {
++
++auto giveBackReason(const Done & done) -> std::string
++{
++    if (done.outcome() == Done::NO_SHOW) {
++        return "no client came for it";
++    }
++    switch (done.reason()) {
++    case Done::DRAINING:
++        return "the worker is draining";
++    case Done::PUBLISH_UNAVAILABLE:
++        return "the worker cannot reach the cache";
++    case Done::INPUT_UNAVAILABLE:
++        return "the worker cannot fetch its inputs";
++    case Done::UNREACHABLE:
++        return "no client came for it";
++    case Done::TRANSIENT_FAILURE:
++        return "a transient failure on the worker";
++    default:
++        return "the worker gave it back";
++    }
++}
++
++} // namespace
++
++auto Dispatcher::newInstance() -> std::string
++{
++    std::random_device rnd;
++    return std::format("{:08x}{:08x}{:08x}{:08x}", rnd(), rnd(), rnd(), rnd());
++}
++
++auto Dispatcher::unixMs() -> double
++{
++    return std::chrono::duration<double, std::milli>(std::chrono::system_clock::now().time_since_epoch()).count();
++}
++
++auto Dispatcher::wallMs(double steadyMs) const -> uint64_t
++{
++    return static_cast<uint64_t>(wallEpochMs + steadyMs);
++}
++
++auto Dispatcher::watch(WatchSend send, std::function<void()> end) -> std::optional<uint64_t>
++{
++    const Lock lock(*this);
++    if (lettingGo || !snapshotLocked(send)) {
++        return std::nullopt;
++    }
++    auto const watcher = nextEventWatcher++;
++    eventWatchers.emplace(watcher, Watcher{.send = std::move(send), .end = std::move(end)});
++    return watcher;
++}
++
++void Dispatcher::unwatch(uint64_t watcher)
++{
++    const Lock lock(*this);
++    eventWatchers.erase(watcher);
++}
++
++void Dispatcher::emitLocked(WatchEvent event)
++{
++    event.set_seq(++eventSeq);
++    event.set_time_ms(wallMs(nowMs()));
++    // False: the watcher fell behind and is being cancelled. The last watcher
++    // gets the event itself and the others get copies, so one watcher costs
++    // no copy.
++    if (eventWatchers.empty()) {
++        return;
++    }
++    auto const last = std::prev(eventWatchers.end());
++    for (auto iter = eventWatchers.begin(); iter != last;) {
++        auto const next = std::next(iter);
++        if (!iter->second.send(WatchEvent(event))) {
++            eventWatchers.erase(iter);
++        }
++        iter = next;
++    }
++    if (!last->second.send(std::move(event))) {
++        eventWatchers.erase(last);
++    }
++}
++
++// Every event carries the seq of the last change, so the first change after
++// it is one higher.
++auto Dispatcher::snapshotLocked(const WatchSend & send) -> bool
++{
++    auto const seq = eventSeq;
++    auto const now = wallMs(nowMs());
++    auto const stamped = [&](WatchEvent event) -> bool {
++        event.set_seq(seq);
++        event.set_time_ms(now);
++        return send(std::move(event));
++    };
++    WatchEvent reset;
++    auto & rst = *reset.mutable_reset();
++    rst.set_instance(instance);
++    rst.set_version(config.version);
++    rst.set_default_system(config.defaultSystem);
++    rst.set_cache_url(config.cacheUrl);
++    if (!stamped(std::move(reset))) {
++        return false;
++    }
++    for (size_t wid = 0; wid < core.workerCount(); wid++) {
++        auto const worker = static_cast<sched::WorkerId>(wid);
++        if (core.worker(worker).up && !stamped(workerEventLocked(worker))) {
++            return false;
++        }
++    }
++    for (const auto & [cid, client] : clients) {
++        if (!stamped(clientEventLocked(*client))) {
++            return false;
++        }
++    }
++    // unplaceableReason() checks every worker, and its result is the same for
++    // every drv with one system and feature set.
++    std::map<std::pair<std::string, std::vector<std::string>>, std::string> reasons;
++    for (size_t idx = 0; idx < core.entryCount(); idx++) {
++        const auto & ent = core.entry(static_cast<sched::DrvId>(idx));
++        if (!ent) {
++            continue;
++        }
++        std::string reason;
++        if (ent->unplaceable && ent->worker == sched::noWorker) {
++            auto [iter, fresh] = reasons.try_emplace({ent->system, ent->features});
++            if (fresh) {
++                iter->second = unplaceableReason(*ent);
++            }
++            reason = iter->second;
++        }
++        if (!stamped(drvEventLocked(*ent, DrvState::CAUSE_SNAPSHOT, std::move(reason)))) {
++            return false;
++        }
++    }
++    WatchEvent done;
++    done.mutable_snapshot_done();
++    return stamped(std::move(done));
++}
++
++// Stepping down: watchers reconnect through the balancer to the new leader.
++void Dispatcher::endEventWatchersLocked()
++{
++    for (auto & [key, watcher] : std::exchange(eventWatchers, {})) {
++        watcher.end();
++    }
++}
++
++auto Dispatcher::drvEventLocked(const sched::Entry & ent, DrvState::Cause cause, std::string reason) const
++    -> WatchEvent
++{
++    WatchEvent event;
++    auto & out = *event.mutable_drv();
++    out.set_drv_path(ent.drvPath);
++    out.set_cause(cause);
++    out.set_system(ent.system);
++    for (const auto & feat : ent.features) {
++        out.add_features(feat);
++    }
++    for (auto const cid : ent.followers) {
++        out.add_client_ids(cid);
++    }
++    out.set_queued_ms(ent.enqMs > 0 ? wallMs(ent.enqMs) : 0);
++    out.set_cp_hint_ms(static_cast<uint64_t>(ent.cpHint));
++    out.set_inputs(static_cast<uint32_t>(ent.inputs.size()));
++    out.set_cache_checked(ent.cacheChecked);
++    if (ent.worker == sched::noWorker) {
++        out.set_phase(ent.unplaceable ? DrvState::PHASE_UNPLACEABLE : DrvState::PHASE_QUEUED);
++        if (ent.unplaceable && reason.empty()) {
++            reason = unplaceableReason(ent);
++        }
++        out.set_reason(std::move(reason));
++        return event;
++    }
++    out.set_phase(DrvState::PHASE_ASSIGNED);
++    out.set_reason(std::move(reason));
++    out.set_worker_addr(core.worker(ent.worker).addr);
++    out.set_assign_id(ent.assignId);
++    out.set_assigned_ms(ent.assignMs > 0 ? wallMs(ent.assignMs) : 0);
++    uint32_t known = 0;
++    for (const auto & src : ent.sources) {
++        auto & source = *out.add_input_sources();
++        source.set_worker_addr(core.worker(src.worker).addr);
++        source.set_paths(src.paths);
++        source.set_nar_bytes(src.narBytes);
++        known += src.paths;
++    }
++    out.set_inputs_unknown(static_cast<uint32_t>(ent.inputs.size()) - known);
++    return event;
++}
++
++auto Dispatcher::workerEventLocked(sched::WorkerId wid) const -> WatchEvent
++{
++    WatchEvent event;
++    const auto & wkr = core.worker(wid);
++    auto & out = *event.mutable_worker();
++    out.set_addr(wkr.addr);
++    for (const auto & system : wkr.systems) {
++        out.add_systems(system);
++    }
++    for (const auto & feat : wkr.features) {
++        out.add_features(feat);
++    }
++    out.set_max_jobs(static_cast<uint32_t>(wkr.maxJobs));
++    out.set_up(wkr.up);
++    out.set_draining(wkr.draining);
++    return event;
++}
++
++auto Dispatcher::clientEventLocked(const Client & client) const -> WatchEvent
++{
++    WatchEvent event;
++    auto & out = *event.mutable_client();
++    out.set_id(client.id);
++    out.set_identity(client.identity);
++    out.set_connected_ms(wallMs(client.connectedMs));
++    return event;
++}
++
++void Dispatcher::drvChangedLocked(sched::DrvId drv, DrvState::Cause cause, std::string reason)
++{
++    if (const auto & ent = core.entry(drv); ent && !eventWatchers.empty()) {
++        emitLocked(drvEventLocked(*ent, cause, std::move(reason)));
++    }
++}
++
++void Dispatcher::drvGoneLocked(std::string drvPath, DrvGone::Outcome outcome, sched::WorkerId wid, const Done * done)
++{
++    if (eventWatchers.empty()) {
++        return;
++    }
++    WatchEvent event;
++    auto & gone = *event.mutable_drv_gone();
++    gone.set_drv_path(std::move(drvPath));
++    gone.set_outcome(outcome);
++    if (wid != sched::noWorker) {
++        gone.set_worker_addr(core.worker(wid).addr);
++    }
++    if (outcome == DrvGone::BUILT && done != nullptr) {
++        for (const auto & output : done->outputs()) {
++            auto & out = *gone.add_outputs();
++            out.set_path(output.path());
++            out.set_nar_size(output.nar_size());
++        }
++    }
++    emitLocked(std::move(event));
++}
++
++void Dispatcher::workerChangedLocked(sched::WorkerId wid)
++{
++    if (!eventWatchers.empty()) {
++        emitLocked(workerEventLocked(wid));
++    }
++}
++
++void Dispatcher::clientConnectedLocked(const Client & client)
++{
++    if (!eventWatchers.empty()) {
++        emitLocked(clientEventLocked(client));
++    }
++}
++
++void Dispatcher::clientLeftLocked(sched::ClientId cid)
++{
++    if (!eventWatchers.empty()) {
++        WatchEvent event;
++        event.mutable_client_gone()->set_id(cid);
++        emitLocked(std::move(event));
++    }
++}
++
++void Dispatcher::wantedLocked(const sched::Core::WantResult & res)
++{
++    drvChangedLocked(res.drv, res.fresh ? DrvState::CAUSE_WANTED : DrvState::CAUSE_FOLLOWERS);
++}
++
++void Dispatcher::cachedLocked(const Client & client, const nix::remote::Want & want)
++{
++    if (eventWatchers.empty()) {
++        return;
++    }
++    WatchEvent event;
++    auto & hit = *event.mutable_cached();
++    hit.set_drv_path(want.drv_path());
++    if (want.system().size() <= maxSystemLen) {
++        hit.set_system(std::string(systemFor(want.system())));
++    }
++    hit.set_client_id(client.id);
++    emitLocked(std::move(event));
++}
++
++auto Dispatcher::heldLocked(sched::WorkerId wid) const -> std::vector<Tracked>
++{
++    std::vector<Tracked> held;
++    for (auto const drv : core.worker(wid).running) {
++        if (drv >= core.entryCount()) {
++            continue;
++        }
++        if (const auto & ent = core.entry(drv); ent && ent->worker == wid) {
++            held.push_back({.drv = drv, .path = ent->drvPath, .worker = wid});
++        }
++    }
++    return held;
++}
++
++auto Dispatcher::followedLocked(sched::ClientId cid, std::span<const sched::DrvId> wanted) const
++    -> std::vector<Tracked>
++{
++    if (eventWatchers.empty()) {
++        return {};
++    }
++    std::vector<sched::DrvId> drvs(wanted.begin(), wanted.end());
++    std::ranges::sort(drvs);
++    auto const dups = std::ranges::unique(drvs);
++    drvs.erase(dups.begin(), dups.end());
++    std::vector<Tracked> followed;
++    for (auto const drv : drvs) {
++        if (drv >= core.entryCount()) {
++            continue;
++        }
++        if (const auto & ent = core.entry(drv); ent && std::ranges::contains(ent->followers, cid)) {
++            followed.push_back({.drv = drv, .path = ent->drvPath, .worker = ent->worker});
++        }
++    }
++    return followed;
++}
++
++void Dispatcher::settledLocked(const std::vector<Tracked> & tracked, DrvState::Cause cause, const std::string & reason)
++{
++    for (const auto & was : tracked) {
++        const auto & ent = core.entry(was.drv);
++        // Within one Hello a retired id may be reused already, and the drv
++        // may be back under another id, which adoptedLocked reports.
++        if (!ent || ent->drvPath != was.path) {
++            if (!core.findDrv(was.path)) {
++                drvGoneLocked(was.path, DrvGone::DROPPED, was.worker);
++            }
++            continue;
++        }
++        if (cause == DrvState::CAUSE_REQUEUED && ent->worker != sched::noWorker) {
++            continue; // reported again by the same Hello, adoptedLocked tells
++        }
++        drvChangedLocked(was.drv, cause, reason);
++    }
++}
++
++void Dispatcher::workerGoneLocked(sched::WorkerId wid, const std::string & reason)
++{
++    bool const wasUp = core.worker(wid).up;
++    auto const held = heldLocked(wid);
++    core.workerGone(wid);
++    settledLocked(held, DrvState::CAUSE_REQUEUED, reason);
++    if (wasUp) {
++        workerChangedLocked(wid);
++    }
++}
++
++// After Hello: what the worker stopped reporting since its last Hello on an
++// open session, the worker itself, then what it reports now. The worker goes
++// first so that no drv is ever assigned to a worker the watchers have not seen.
++void Dispatcher::adoptedLocked(sched::WorkerId wid, const nix::remote::Hello & hel, const std::vector<Tracked> & before)
++{
++    settledLocked(before, DrvState::CAUSE_REQUEUED, "the worker reconnected without it");
++    workerChangedLocked(wid);
++    std::set<sched::DrvId> reported;
++    for (const auto & run : hel.running()) {
++        auto const drv = core.findDrv(run.drv_path());
++        if (drv && reported.insert(*drv).second) {
++            drvChangedLocked(*drv, DrvState::CAUSE_ADOPTED);
++        }
++    }
++}
++
++void Dispatcher::doneLocked(sched::WorkerId wid, const Done & done, bool assigned)
++{
++    if (!assigned) {
++        return; // stale: not this worker's
++    }
++    switch (done.outcome()) {
++    case Done::GIVEN_BACK:
++    case Done::NO_SHOW:
++        // Back in the queue, or retired when no client follows it.
++        if (auto const drv = core.findDrv(done.drv_path())) {
++            drvChangedLocked(*drv, DrvState::CAUSE_REQUEUED, giveBackReason(done));
++        } else {
++            drvGoneLocked(done.drv_path(), DrvGone::DROPPED, wid);
++        }
++        break;
++    case Done::BUILT:
++        drvGoneLocked(done.drv_path(), DrvGone::BUILT, wid, &done);
++        break;
++    case Done::FAILED:
++        drvGoneLocked(done.drv_path(), DrvGone::FAILED, wid);
++        break;
++    default:
++        drvGoneLocked(done.drv_path(), DrvGone::CANCELLED, wid);
++    }
++}
++
++} // namespace nixgrpc
+diff --git a/src/daemon/dispatcher.cc b/src/daemon/dispatcher.cc
+index a42bb51..4006b48 100644
+--- a/src/daemon/dispatcher.cc
++++ b/src/daemon/dispatcher.cc
+@@ -11,6 +11,7 @@
+ #include <initializer_list>
+ #include <optional>
+ #include <ratio>
++#include <span>
+ #include <string>
+ #include <string_view>
+ #include <utility>
+@@ -23,6 +24,7 @@
+ #include <nix/util/strings.hh>
+ #include <nix/util/types.hh>
+ 
++#include "events.pb.h"
+ #include "logfmt.hh"
+ #include "metrics.hh"
+ #include "nix_remote.pb.h"
+@@ -34,7 +36,6 @@ using nix::remote::SchedCmd;
+ using nix::remote::SchedMsg;
+ 
+ namespace {
+-constexpr size_t maxSystemLen = 64;
+ constexpr double statsEveryMs = 1000;
+ constexpr double msPerSecond = 1000;
+ // A client whose stream broke reconnects within its backoff and Wants its
+@@ -299,9 +300,9 @@ auto Dispatcher::wantsLookup(const nix::remote::Want & want) -> bool
+     return want.build_mode() == 0 && !want.out_keys().empty() && !want.drv_path().empty();
+ }
+ 
+-auto Dispatcher::lookup(const nix::remote::ClientMsgs & msgs) const -> std::vector<bool>
++auto Dispatcher::lookup(const nix::remote::ClientMsgs & msgs) const -> std::vector<Lookup>
+ {
+-    std::vector<bool> cached(static_cast<size_t>(msgs.msgs_size()), false);
++    std::vector<Lookup> cached(static_cast<size_t>(msgs.msgs_size()), Lookup::skipped);
+     std::vector<std::string> keys;
+     for (const auto & msg : msgs.msgs()) {
+         if (msg.has_want() && wantsLookup(msg.want())) {
+@@ -316,10 +317,14 @@ auto Dispatcher::lookup(const nix::remote::ClientMsgs & msgs) const -> std::vect
+         metrics.lookupSize(keys.size(), have.size());
+         for (int i = 0; i < msgs.msgs_size(); i++) {
+             const auto & msg = msgs.msgs(i);
++            if (!msg.has_want() || !wantsLookup(msg.want())) {
++                continue;
++            }
+             cached.at(static_cast<size_t>(i)) =
+-                msg.has_want() && wantsLookup(msg.want())
+-                && std::ranges::all_of(
+-                    msg.want().out_keys(), [&](const std::string & key) -> bool { return have.contains(key); });
++                std::ranges::all_of(
++                    msg.want().out_keys(), [&](const std::string & key) -> bool { return have.contains(key); })
++                ? Lookup::present
++                : Lookup::missing;
+         }
+     } catch (std::exception & err) {
+         logLine(LogLevel::info, {{"event", "present_failed"}, {"error", err.what()}});
+@@ -352,9 +357,9 @@ auto Dispatcher::dispatchOnceLocked() -> bool
+         cmd.mutable_expect()->set_assign_id(asg.assignId);
+         auto const wit = workers.find(asg.worker);
+         if (wit == workers.end() || !wit->second->send(cmd)) {
+-            // Worker stream died under us.
++            // Worker stream died under us; requeue and let the next event retry.
+             dropped = true;
+-            core.workerGone(asg.worker);
++            workerGoneLocked(asg.worker, "the worker's stream broke");
+             membershipChangedLocked();
+             untrackLocked(asg.worker);
+             metrics.event("expect_undeliverable");
+@@ -363,7 +368,10 @@ auto Dispatcher::dispatchOnceLocked() -> bool
+         }
+         sendToFollowers(asg.drv, assignedMsg(asg.drv));
+         assignedCtr.Increment();
+-        metrics.queueWait(ent->system, (nowMs() - ent->enqMs) / msPerSecond);
++        auto const now = nowMs();
++        core.markPlaced(asg.drv, now);
++        drvChangedLocked(asg.drv, nix::remote::DrvState::CAUSE_ASSIGNED);
++        metrics.queueWait(ent->system, (now - ent->enqMs) / msPerSecond);
+         debugLog(
+             {{"event", "assigned"},
+              {"drv", ent->drvPath},
+@@ -470,16 +478,20 @@ auto Dispatcher::assignedMsg(sched::DrvId drv) const -> SchedMsg
+     return msg;
+ }
+ 
+-auto Dispatcher::unplaceableMsg(const sched::Entry & ent) const -> SchedMsg
++auto Dispatcher::unplaceableReason(const sched::Entry & ent) const -> std::string
+ {
+     auto const join = [](const auto & feats) -> std::string {
+         return nix::concatStringsSep(",", nix::Strings(feats.begin(), feats.end()));
+     };
++    return "no connected, non-draining worker for system '" + ent.system + "' offers features {" + join(ent.features)
++           + "}, the workers offer {" + join(core.offeredFeatures(ent.system)) + "}";
++}
++
++auto Dispatcher::unplaceableMsg(const sched::Entry & ent) const -> SchedMsg
++{
+     SchedMsg msg;
+     msg.mutable_unplaceable()->set_drv_path(ent.drvPath);
+-    msg.mutable_unplaceable()->set_reason(
+-        "no connected, non-draining worker for system '" + ent.system + "' offers features {" + join(ent.features)
+-        + "}, the workers offer {" + join(core.offeredFeatures(ent.system)) + "}");
++    msg.mutable_unplaceable()->set_reason(unplaceableReason(ent));
+     return msg;
+ }
+ 
+@@ -491,7 +503,7 @@ void Dispatcher::sendToFollowers(sched::DrvId drv, const SchedMsg & msg)
+     }
+     for (auto const cid : ent->followers) {
+         if (auto const cit = clients.find(cid); cit != clients.end()) {
+-            cit->second(msg);
++            cit->second->send(msg);
+         }
+     }
+ }
+@@ -514,21 +526,28 @@ void Dispatcher::placeabilityChangedLocked()
+             msg.mutable_placeable()->set_drv_path(ent->drvPath);
+         }
+         sendToFollowers(drv, msg);
++        // Senders copy what they queue, so the reason can move into the event.
++        drvChangedLocked(
++            drv, nix::remote::DrvState::CAUSE_PLACEABILITY,
++            ent->unplaceable ? std::move(*msg.mutable_unplaceable()->mutable_reason()) : std::string());
+     }
+ }
+ 
+ // ------------------------------------------------------------------ clients
+ 
+-auto Dispatcher::connectClient(ClientSend send, std::function<void()> abort) -> ClientPtr
++auto Dispatcher::connectClient(ClientSend send, std::function<void()> abort, std::string identity) -> ClientPtr
+ {
+     metrics.schedClients(1);
+     auto client = std::make_shared<Client>();
+     client->id = nextClient++;
+     client->send = std::move(send);
+     client->abort = std::move(abort);
++    client->identity = std::move(identity);
++    client->connectedMs = nowMs();
+     // Known from the start, so restarting() reaches clients that only got Cached so far.
+     const Lock lock(*this);
+-    clients.emplace(client->id, client->send);
++    clients.emplace(client->id, client);
++    clientConnectedLocked(*client);
+     return client;
+ }
+ 
+@@ -545,12 +564,13 @@ void Dispatcher::restarting()
+     lettingGo = true;
+     metrics.schedLeader(false);
+     wakeWatchersLocked();
++    endEventWatchersLocked();
+     SchedMsg msg;
+     msg.mutable_restarting();
+     SchedCmd cmd;
+     cmd.mutable_restarting();
+-    for (auto & [cid, send] : clients) {
+-        send(msg);
++    for (auto & [cid, client] : clients) {
++        client->send(msg);
+     }
+     for (auto & [wid, wkr] : workers) {
+         wkr->send(cmd);
+@@ -572,7 +592,7 @@ void Dispatcher::clientMsgs(const ClientPtr & client, const nix::remote::ClientM
+ }
+ 
+ void Dispatcher::applyClientMsgs(
+-    Client & client, const nix::remote::ClientMsgs & msgs, const std::vector<bool> & cached)
++    Client & client, const nix::remote::ClientMsgs & msgs, const std::vector<Lookup> & cached)
+ {
+     // The lock is released between chunks so a large batch does not stall everyone else.
+     static constexpr int chunk = 256;
+@@ -593,7 +613,7 @@ void Dispatcher::applyClientMsgs(
+ }
+ 
+ // Under the lock.
+-void Dispatcher::onWant(Client & client, const nix::remote::Want & want, bool cached)
++void Dispatcher::onWant(Client & client, const nix::remote::Want & want, Lookup cache)
+ {
+     if (want.drv_path().empty()) {
+         return;
+@@ -602,7 +622,7 @@ void Dispatcher::onWant(Client & client, const nix::remote::Want & want, bool ca
+         {{"event", "want"},
+          {"client", std::to_string(client.id)},
+          {"drv", want.drv_path()},
+-         {"cached", cached ? "1" : "0"}});
++         {"cached", cache == Lookup::present ? "1" : "0"}});
+     SchedMsg reply;
+     if (lettingGo) {
+         // Yielded while this batch waited for its lookup: go to the new leader.
+@@ -610,10 +630,11 @@ void Dispatcher::onWant(Client & client, const nix::remote::Want & want, bool ca
+         client.send(reply);
+         return;
+     }
+-    if (cached) {
++    if (cache == Lookup::present) {
+         reply.mutable_cached()->set_drv_path(want.drv_path());
+         client.send(reply);
+         metrics.event("cached");
++        cachedLocked(client, want);
+         return;
+     }
+     if (want.system().size() > maxSystemLen) {
+@@ -632,6 +653,9 @@ void Dispatcher::onWant(Client & client, const nix::remote::Want & want, bool ca
+     if (auto const wid = core.refuse(client.id, want.drv_path(), want.refused())) {
+         revokeOn(*wid, want.drv_path());
+         metrics.event("refused");
++        if (auto const drv = core.findDrv(want.drv_path())) {
++            drvChangedLocked(*drv, nix::remote::DrvState::CAUSE_REQUEUED, "its client could not use the assignment");
++        }
+     }
+     auto res = core.want(
+         client.id,
+@@ -639,8 +663,10 @@ void Dispatcher::onWant(Client & client, const nix::remote::Want & want, bool ca
+          .inputs = {want.inputs().begin(), want.inputs().end()}, // string_views into `want`
+          .system = system,
+          .features = {want.required_features().begin(), want.required_features().end()},
+-         .cpHintMs = static_cast<double>(want.cp_hint_ms())},
++         .cpHintMs = static_cast<double>(want.cp_hint_ms()),
++         .cacheChecked = cache == Lookup::missing},
+         nowMs());
++    wantedLocked(res);
+     if (res.assigned) {
+         client.send(assignedMsg(res.drv));
+         return;
+@@ -650,8 +676,15 @@ void Dispatcher::onWant(Client & client, const nix::remote::Want & want, bool ca
+     if (ent && ent->worker == sched::noWorker && !core.placeable(res.drv)) {
+         // Keep the Want: right after a (re)start no worker has said Hello yet.
+         // placeabilityChangedLocked() tells the followers once one has.
++        bool const flipped = !ent->unplaceable;
+         core.markUnplaceable(res.drv, true);
+-        client.send(unplaceableMsg(*ent));
++        reply = unplaceableMsg(*ent);
++        client.send(reply);
++        if (flipped) {
++            drvChangedLocked(
++                res.drv, nix::remote::DrvState::CAUSE_PLACEABILITY,
++                std::move(*reply.mutable_unplaceable()->mutable_reason()));
++        }
+         exportStats(false);
+     }
+ }
+@@ -659,9 +692,15 @@ void Dispatcher::onWant(Client & client, const nix::remote::Want & want, bool ca
+ // Under the lock.
+ void Dispatcher::onCancel(Client & client, const nix::remote::Cancel & cancel)
+ {
+-    if (auto wid = core.cancel(client.id, cancel.drv_path())) {
++    auto const drv = core.findDrv(cancel.drv_path());
++    if (!drv) {
++        return;
++    }
++    auto const tracked = followedLocked(client.id, std::span(&*drv, 1));
++    if (auto wid = core.cancel(client.id, *drv)) {
+         revokeOn(*wid, cancel.drv_path());
+     }
++    settledLocked(tracked, nix::remote::DrvState::CAUSE_FOLLOWERS, {});
+ }
+ 
+ void Dispatcher::clientGone(const ClientPtr & clientPtr)
+@@ -670,6 +709,7 @@ void Dispatcher::clientGone(const ClientPtr & clientPtr)
+     const Lock lock(*this);
+     client.gone = true;
+     clients.erase(client.id);
++    auto const tracked = followedLocked(client.id, core.wanted(client.id));
+     std::vector<std::pair<sched::DrvId, sched::WorkerId>> revokes;
+     core.clientGone(client.id, revokes);
+     for (auto [drv, wid] : revokes) {
+@@ -677,6 +717,8 @@ void Dispatcher::clientGone(const ClientPtr & clientPtr)
+             orphans.push_back({.drv = drv, .assignId = ent->assignId, .dueMs = nowMs() + orphanGraceMs});
+         }
+     }
++    settledLocked(tracked, nix::remote::DrvState::CAUSE_FOLLOWERS, {});
++    clientLeftLocked(client.id);
+     metrics.schedClients(-1);
+     exportStats(false);
+ }
+@@ -722,6 +764,8 @@ void Dispatcher::onHello(Worker & worker, const nix::remote::Hello & hel)
+     if (auto const old = workers.find(wid); old != workers.end() && old->second != &worker) {
+         untrackLocked(wid);
+     }
++    // Hello first drops what the worker ran; watchers hear what it no longer reports.
++    auto const before = heldLocked(wid);
+     std::vector<sched::Core::Superseded> superseded;
+     worker.id = core.hello(
+         {.addr = hel.addr(),
+@@ -731,6 +775,7 @@ void Dispatcher::onHello(Worker & worker, const nix::remote::Hello & hel)
+          .running = std::move(running)},
+         superseded);
+     workers[*worker.id] = &worker;
++    adoptedLocked(*worker.id, hel, before);
+     membershipChangedLocked();
+     for (auto const sup : superseded) {
+         supersede(sup.drv, sup.loser);
+@@ -780,6 +825,7 @@ void Dispatcher::onDone(sched::WorkerId wid, const nix::remote::Done & done)
+             }
+         }
+         metrics.event("given_back_" + nix::remote::Done::Reason_Name(done.reason()));
++        doneLocked(wid, done, held);
+         placeabilityChangedLocked(); // its followers may have no worker left
+         return;
+     }
+@@ -789,7 +835,8 @@ void Dispatcher::onDone(sched::WorkerId wid, const nix::remote::Done & done)
+             outputs.emplace_back(out.path(), out.nar_size());
+         }
+     }
+-    core.done(lease, outputs);
++    bool const assigned = core.done(lease, outputs);
++    doneLocked(wid, done, assigned);
+ }
+ 
+ void Dispatcher::workerMsgLocked(Worker & worker, const nix::remote::WorkerMsg & msg)
+@@ -802,6 +849,7 @@ void Dispatcher::workerMsgLocked(Worker & worker, const nix::remote::WorkerMsg &
+         onDone(*worker.id, msg.done());
+     } else if (msg.has_load()) {
+         core.setDraining(*worker.id, msg.load().draining());
++        workerChangedLocked(*worker.id);
+         membershipChangedLocked();
+         placeabilityChangedLocked();
+     }
+@@ -814,7 +862,7 @@ void Dispatcher::workerGone(Worker & worker)
+         return;
+     }
+     logLine(LogLevel::info, {{"event", "worker_gone"}, {"addr", core.worker(*worker.id).addr}});
+-    core.workerGone(*worker.id);
++    workerGoneLocked(*worker.id, "the worker disconnected");
+     workers.erase(*worker.id);
+     membershipChangedLocked();
+     dispatchLocked();
+diff --git a/src/daemon/dispatcher.hh b/src/daemon/dispatcher.hh
+index 43d52e6..1f73bb7 100644
+--- a/src/daemon/dispatcher.hh
++++ b/src/daemon/dispatcher.hh
+@@ -19,6 +19,7 @@
+ #include <initializer_list>
+ #include <memory>
+ #include <optional>
++#include <span>
+ #include <string>
+ #include <string_view>
+ #include <unordered_map>
+@@ -29,6 +30,7 @@
+ #include <prometheus/counter.h>
+ #include <prometheus/gauge.h>
+ 
++#include "events.pb.h"
+ #include "logfmt.hh"
+ #include "metrics.hh"
+ #include "nix_remote.pb.h"
+@@ -41,6 +43,7 @@ class Dispatcher
+ public:
+     using ClientSend = std::function<bool(const nix::remote::SchedMsg &)>;
+     using WorkerSend = std::function<bool(const nix::remote::SchedCmd &)>;
++    using WatchSend = std::function<bool(nix::remote::WatchEvent &&)>;
+     // Subset of `outKeys` the shared cache has. May block (HTTP).
+     using PresentFn = std::function<std::unordered_set<std::string>(const std::vector<std::string> & outKeys)>;
+ 
+@@ -56,6 +59,9 @@ public:
+         // Unset: the steady clock, and the dispatcher calls tick() itself
+         // every second. Set: the caller owns time and calls tick().
+         std::function<double()> nowMs;
++        // For the event stream (Reset).
++        std::string version;
++        std::string cacheUrl;
+     };
+ 
+     Dispatcher(Config config, Metrics & metrics);
+@@ -72,11 +78,13 @@ public:
+         ClientSend send;
+         std::function<void()> abort; // ends the stream; for errors off its thread
+         bool gone = false;  // under Dispatcher::mutex
++        std::string identity; // the caller, shown in events
++        double connectedMs = 0;
+     };
+ 
+     using ClientPtr = std::shared_ptr<Client>;
+ 
+-    auto connectClient(ClientSend send, std::function<void()> abort) -> ClientPtr;
++    auto connectClient(ClientSend send, std::function<void()> abort, std::string identity = {}) -> ClientPtr;
+     // May hand the batch to the lookup pool; `client` is kept alive until applied.
+     void clientMsgs(const ClientPtr & client, const nix::remote::ClientMsgs & msgs);
+     void clientGone(const ClientPtr & client);
+@@ -125,6 +133,18 @@ public:
+     auto watchMembership(std::function<void()> wake) -> uint64_t;
+     void unwatchMembership(uint64_t watcher);
+ 
++    // Events.Watch (events.proto): a snapshot through `send`, then
++    // every change, under one lock so the watcher misses none. `end` closes
++    // the stream when this node stops serving. Both run under the mutex like
++    // the other send closures. nullopt: not serving, or `send` refused.
++    auto watch(WatchSend send, std::function<void()> end) -> std::optional<uint64_t>;
++    void unwatch(uint64_t watcher);
++    // Drvs queued or assigned now, for a WatchSend sizing its backlog.
++    [[nodiscard]] ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) auto trackedLocked() const -> size_t
++    {
++        return core.liveEntries();
++    }
++
+ private:
+     // Scoped lock that runs the afterUnlock queue on release.
+     class ABSL_SCOPED_LOCKABLE Lock
+@@ -142,6 +162,8 @@ private:
+     };
+ 
+     using Clock = std::chrono::steady_clock;
++    // Longer is not a system: onWant and onHello refuse it, cachedLocked leaves it out.
++    static constexpr size_t maxSystemLen = 64;
+     Config config;
+     Metrics & metrics;
+     prometheus::Counter & assignedCtr;
+@@ -149,7 +171,7 @@ private:
+     absl::Mutex mutex;
+     std::vector<std::function<void()>> deferred ABSL_GUARDED_BY(mutex);
+     sched::Core core ABSL_GUARDED_BY(mutex);
+-    std::unordered_map<sched::ClientId, ClientSend> clients ABSL_GUARDED_BY(mutex);
++    std::unordered_map<sched::ClientId, ClientPtr> clients ABSL_GUARDED_BY(mutex);
+     // The live session of each worker. A stale one, replaced by a re-Hello, is not here.
+     std::unordered_map<sched::WorkerId, Worker *> workers ABSL_GUARDED_BY(mutex);
+     bool lettingGo ABSL_GUARDED_BY(mutex) = false;
+@@ -188,13 +210,38 @@ private:
+     bool statsStop ABSL_GUARDED_BY(mutex) = false;
+     std::thread statsThread;
+ 
++    // Watchers of the event stream, see dispatcher-events.cc. Events are
++    // only built while someone watches.
++    struct Watcher
++    {
++        WatchSend send;
++        std::function<void()> end;
++    };
++    std::map<uint64_t, Watcher> eventWatchers ABSL_GUARDED_BY(mutex);
++    uint64_t nextEventWatcher ABSL_GUARDED_BY(mutex) = 1;
++    uint64_t eventSeq ABSL_GUARDED_BY(mutex) = 0;
++    const std::string instance = newInstance();
++    // Unix ms at `epoch`. Event times are this plus steady time, so they
++    // stay consistent within one process when the system clock moves.
++    const double wallEpochMs = unixMs();
++
++    // A drv a Core call may change or retire, as it was before.
++    struct Tracked
++    {
++        sched::DrvId drv;
++        std::string path;
++        sched::WorkerId worker;
++    };
++
+     [[nodiscard]] auto nowMs() const -> double;
+     void debugLog(std::initializer_list<LogField> fields) const;
+     [[nodiscard]] auto systemFor(std::string_view system) const -> std::string_view;
+     [[nodiscard]] static auto wantsLookup(const nix::remote::Want & want) -> bool;
+-    // One present() call for all Wants in `msgs`; which of them are cached.
+-    [[nodiscard]] auto lookup(const nix::remote::ClientMsgs & msgs) const -> std::vector<bool>;
+-    void applyClientMsgs(Client & client, const nix::remote::ClientMsgs & msgs, const std::vector<bool> & cached);
++    // What the shared cache said about one Want.
++    enum class Lookup : uint8_t { skipped, missing, present };
++    // One present() call for all Wants in `msgs`.
++    [[nodiscard]] auto lookup(const nix::remote::ClientMsgs & msgs) const -> std::vector<Lookup>;
++    void applyClientMsgs(Client & client, const nix::remote::ClientMsgs & msgs, const std::vector<Lookup> & cached);
+     void lookupLoop();
+     void statsLoop();
+     // Run dispatch and deliver Expect (first) and Assigned.
+@@ -211,14 +258,51 @@ private:
+     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void placeabilityChangedLocked();
+     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void sendToFollowers(sched::DrvId drv, const nix::remote::SchedMsg & msg);
+     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) auto assignedMsg(sched::DrvId drv) const -> nix::remote::SchedMsg;
++    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) auto unplaceableReason(const sched::Entry & ent) const -> std::string;
+     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) auto unplaceableMsg(const sched::Entry & ent) const -> nix::remote::SchedMsg;
+     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void supersede(sched::DrvId drv, sched::WorkerId loser);
+     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void onDone(sched::WorkerId wid, const nix::remote::Done & done);
+     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void untrackLocked(sched::WorkerId wid);
+     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void onHello(Worker & worker, const nix::remote::Hello & hel);
+     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void workerMsgLocked(Worker & worker, const nix::remote::WorkerMsg & msg);
+-    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void onWant(Client & client, const nix::remote::Want & want, bool cached);
++    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void onWant(Client & client, const nix::remote::Want & want, Lookup cache);
+     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void onCancel(Client & client, const nix::remote::Cancel & cancel);
++
++    // The event stream, in dispatcher-events.cc. The *Locked hooks emit an
++    // event if anyone watches.
++    [[nodiscard]] static auto newInstance() -> std::string;
++    [[nodiscard]] static auto unixMs() -> double;
++    [[nodiscard]] auto wallMs(double steadyMs) const -> uint64_t;
++    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void emitLocked(nix::remote::WatchEvent event);
++    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) auto snapshotLocked(const WatchSend & send) -> bool;
++    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void endEventWatchersLocked();
++    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) auto drvEventLocked(
++        const sched::Entry & ent, nix::remote::DrvState::Cause cause, std::string reason = {}) const
++        -> nix::remote::WatchEvent;
++    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) auto workerEventLocked(sched::WorkerId wid) const -> nix::remote::WatchEvent;
++    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) auto clientEventLocked(const Client & client) const -> nix::remote::WatchEvent;
++    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void drvChangedLocked(
++        sched::DrvId drv, nix::remote::DrvState::Cause cause, std::string reason = {});
++    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void drvGoneLocked(
++        std::string drvPath, nix::remote::DrvGone::Outcome outcome, sched::WorkerId wid, const nix::remote::Done * done = nullptr);
++    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void workerChangedLocked(sched::WorkerId wid);
++    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void clientConnectedLocked(const Client & client);
++    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void clientLeftLocked(sched::ClientId cid);
++    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void wantedLocked(const sched::Core::WantResult & res);
++    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void cachedLocked(const Client & client, const nix::remote::Want & want);
++    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) auto heldLocked(sched::WorkerId wid) const -> std::vector<Tracked>;
++    // Of `drvs`, those `cid` follows. Empty unless someone watches.
++    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) auto followedLocked(sched::ClientId cid, std::span<const sched::DrvId> drvs) const
++        -> std::vector<Tracked>;
++    // After the Core call: retired ones are DROPPED, the rest get `cause`.
++    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void settledLocked(
++        const std::vector<Tracked> & tracked, nix::remote::DrvState::Cause cause, const std::string & reason);
++    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void workerGoneLocked(sched::WorkerId wid, const std::string & reason);
++    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void adoptedLocked(
++        sched::WorkerId wid, const nix::remote::Hello & hel, const std::vector<Tracked> & before);
++    // `assigned`: the Core call found the drv on `wid` and changed it.
++    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void doneLocked(
++        sched::WorkerId wid, const nix::remote::Done & done, bool assigned);
+ };
+ 
+ } // namespace nixgrpc
+diff --git a/src/daemon/events.cc b/src/daemon/events.cc
+new file mode 100644
+index 0000000..1d5758a
+--- /dev/null
++++ b/src/daemon/events.cc
+@@ -0,0 +1,88 @@
++// Events.Watch: auth and the stream caps. WatchReactor does the rest.
++
++#include "events.hh"
++
++#include <absl/synchronization/mutex.h>
++#include <string>
++#include <utility>
++
++#include <grpcpp/server_context.h>
++#include <grpcpp/support/server_callback.h>
++#include <grpcpp/support/status.h>
++
++#include "acl.hh"
++#include "auth.hh"
++#include "dispatcher.hh"
++#include "events.pb.h"
++#include "idle.hh"
++#include "logfmt.hh"
++#include "sched-reactor.hh"
++
++namespace nixgrpc {
++
++EventsService::EventsService(Dispatcher & dispatcher, Auth & auth, IdleTracker & idle)
++    : dispatcher(&dispatcher)
++    , auth(&auth)
++    , idle(&idle)
++{
++}
++
++auto StreamLimit::acquire(const std::string & caller) -> bool
++{
++    const absl::MutexLock lock(mutex);
++    auto const iter = byCaller.find(caller);
++    if (open >= total || (iter != byCaller.end() && iter->second >= perCaller)) {
++        return false;
++    }
++    open++;
++    byCaller[caller]++;
++    return true;
++}
++
++void StreamLimit::release(const std::string & caller)
++{
++    const absl::MutexLock lock(mutex);
++    auto const iter = byCaller.find(caller);
++    if (iter == byCaller.end()) {
++        return;
++    }
++    open--;
++    if (--iter->second == 0) {
++        byCaller.erase(iter);
++    }
++}
++
++auto EventsService::Watch(grpc::CallbackServerContext * context, const nix::remote::WatchRequest * /*request*/)
++    -> grpc::ServerWriteReactor<nix::remote::WatchEvents> *
++{
++    using Reject = RejectWriter<nix::remote::WatchEvents>;
++    if (!active_) {
++        return new Reject(WatchReactor::passive()); // NOLINT(cppcoreguidelines-owning-memory): deletes itself in OnDone
++    }
++    auto const caller = auth->identify(*context);
++    // The stream names clients and derivations: never for anonymous callers,
++    // whatever --allow-anonymous grants.
++    if (caller.kind == Caller::Kind::anonymous) {
++        if (auth->metrics != nullptr) {
++            auth->metrics->countDenied("Watch", "anonymous");
++        }
++        logLine(LogLevel::info, {{"event", "denied"}, {"method", "Watch"}, {"cn", caller.name}, {"role", "anonymous"}});
++        return new Reject({grpc::StatusCode::UNAUTHENTICATED, "Watch requires a TLS client certificate or bearer token"}); // NOLINT(cppcoreguidelines-owning-memory)
++    }
++    if (auto const status = auth->authorize(caller, "Watch", Role::watch); !status.ok()) {
++        return new Reject(status); // NOLINT(cppcoreguidelines-owning-memory)
++    }
++    if (!streams.acquire(caller.name)) {
++        logLine(LogLevel::info, {{"event", "watch_stream_refused"}, {"cn", caller.name}});
++        return new Reject({grpc::StatusCode::RESOURCE_EXHAUSTED, "too many Watch streams, for this caller or in all"}); // NOLINT(cppcoreguidelines-owning-memory)
++    }
++    auto peer = context->peer();
++    logLine(LogLevel::info, {{"event", "watch_stream_open"}, {"cn", caller.name}, {"peer", peer}});
++    return new WatchReactor( // NOLINT(cppcoreguidelines-owning-memory): deletes itself in OnDone
++        context, *dispatcher, *idle, [this, name = caller.name, peer = std::move(peer)] -> void {
++            streams.release(name);
++            logLine(LogLevel::info, {{"event", "watch_stream_closed"}, {"cn", name}, {"peer", peer}});
++        });
++}
++
++} // namespace nixgrpc
+diff --git a/src/daemon/events.hh b/src/daemon/events.hh
+new file mode 100644
+index 0000000..43309f1
+--- /dev/null
++++ b/src/daemon/events.hh
+@@ -0,0 +1,69 @@
++#pragma once
++// Events.Watch: a read-only live view of the active scheduler
++// (proto/events.proto). Served next to the Scheduler service.
++
++#include <absl/base/thread_annotations.h>
++#include <absl/synchronization/mutex.h>
++#include <atomic>
++#include <map>
++#include <string>
++
++#include <grpcpp/server_context.h>
++#include <grpcpp/support/server_callback.h>
++
++#include "auth.hh"
++#include "dispatcher.hh"
++#include "events.grpc.pb.h"
++#include "events.pb.h"
++#include "idle.hh"
++
++namespace nixgrpc {
++
++// Open streams, in total and per caller, so one caller cannot take them all.
++class StreamLimit
++{
++public:
++    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters): in all, then per caller.
++    StreamLimit(unsigned total, unsigned perCaller)
++        : total(total)
++        , perCaller(perCaller)
++    {
++    }
++
++    [[nodiscard]] auto acquire(const std::string & caller) -> bool;
++    void release(const std::string & caller);
++
++private:
++    const unsigned total;
++    const unsigned perCaller;
++    absl::Mutex mutex;
++    unsigned open ABSL_GUARDED_BY(mutex) = 0;
++    std::map<std::string, unsigned> byCaller ABSL_GUARDED_BY(mutex);
++};
++
++class EventsService final : public nix::remote::Events::CallbackService
++{
++public:
++    // As EdsService: each stream holds a snapshot's worth of memory.
++    static constexpr unsigned maxStreams = 64;
++    static constexpr unsigned maxStreamsPerCaller = 8;
++
++    EventsService(Dispatcher & dispatcher, Auth & auth, IdleTracker & idle);
++
++    auto Watch(grpc::CallbackServerContext * context, const nix::remote::WatchRequest * request)
++        -> grpc::ServerWriteReactor<nix::remote::WatchEvents> * override;
++
++    void setActive(bool active)
++    {
++        active_ = active;
++    }
++
++private:
++    Dispatcher * dispatcher;
++    Auth * auth;
++    IdleTracker * idle;
++    std::atomic<bool> active_{true};
++    StreamLimit streams{maxStreams, maxStreamsPerCaller};
++};
++
++} // namespace nixgrpc
+diff --git a/src/daemon/main.cc b/src/daemon/main.cc
+index 617c604..9f63c83 100644
+--- a/src/daemon/main.cc
++++ b/src/daemon/main.cc
+@@ -1442,6 +1442,7 @@ try {
+     if (coord.scheduler) {
+         builder.RegisterService(coord.scheduler.get());
+         builder.RegisterService(coord.eds.get());
++        builder.RegisterService(coord.events.get());
+     }
+ 
+     auto server = builder.BuildAndStart();
+diff --git a/src/daemon/sched-reactor.hh b/src/daemon/sched-reactor.hh
+index 1163956..1635e0e 100644
+--- a/src/daemon/sched-reactor.hh
++++ b/src/daemon/sched-reactor.hh
+@@ -1,13 +1,17 @@
+ #pragma once
+-// Callback reactors for the Schedule and WorkerSession streams. Reads go to
+-// the Dispatcher. Its send() only enqueues, and the reactor writes the queue
+-// out in batches, so no I/O happens under the Dispatcher mutex and a peer
+-// that stops reading is cancelled once its queue is full.
++// Callback reactors for the Schedule, WorkerSession and Watch streams. Reads
++// go to the Dispatcher. Its send() only enqueues, and the reactor writes the
++// queue out in batches, so no I/O happens under the Dispatcher mutex and a
++// peer that stops reading is cancelled once its queue is full.
+ 
++#include <algorithm>
+ #include <cstddef>
++#include <cstdint>
+ #include <deque>
+ #include <exception>
++#include <functional>
+ #include <memory>
++#include <optional>
+ #include <absl/base/thread_annotations.h>
+ #include <absl/synchronization/mutex.h>
+ #include <string>
+@@ -18,6 +22,7 @@
+ #include <grpcpp/support/status.h>
+ 
+ #include "dispatcher.hh"
++#include "events.pb.h"
+ #include "idle.hh"
+ #include "logfmt.hh"
+ #include "nix_remote.pb.h"
+@@ -204,11 +209,11 @@ class ScheduleReactor final
+     : public SchedReactorBase<nix::remote::ClientMsgs, nix::remote::SchedMsg, nix::remote::SchedMsgs>
+ {
+ public:
+-    ScheduleReactor(grpc::CallbackServerContext * ctx, Dispatcher & disp, IdleTracker & idle)
++    ScheduleReactor(grpc::CallbackServerContext * ctx, Dispatcher & disp, IdleTracker & idle, std::string identity = {})
+         : SchedReactorBase(ctx)
+         , active(idle)
+         , disp(disp)
+-        , client(disp.connectClient(sender(disp), [ctx] -> void { ctx->TryCancel(); }))
++        , client(disp.connectClient(sender(disp), [ctx] -> void { ctx->TryCancel(); }, std::move(identity)))
+     {
+         start();
+     }
+@@ -261,6 +266,201 @@ private:
+     Dispatcher::Worker worker;
+ };
+ 
++// Events.Watch: the Dispatcher's snapshot, then its events. Ends when the
++// client cancels, falls too far behind after the snapshot, or the node stops
++// serving (UNAVAILABLE, so the client goes back through the balancer).
++class WatchReactor final : public grpc::ServerWriteReactor<nix::remote::WatchEvents>
++{
++public:
++    struct Queue : SendQueue<nix::remote::WatchEvent, nix::remote::WatchEvents>
++    {
++        // Events queued after SnapshotDone. They sit behind the snapshot's.
++        size_t deltas ABSL_GUARDED_BY(mutex) = 0;
++    };
++
++    // `done` runs last, in OnDone.
++    WatchReactor(
++        grpc::CallbackServerContext * ctx, Dispatcher & disp, IdleTracker & idle, std::function<void()> done)
++        : active(idle)
++        , ctx(ctx)
++        , disp(disp)
++        , sendq(std::make_shared<Queue>())
++        , done(std::move(done))
++    {
++        watcher = disp.watch(sender(), ender());
++        if (!watcher) {
++            {
++                const absl::MutexLock lock(sendq->mutex);
++                sendq->closed = true;
++                status = passive();
++            }
++            maybeDone();
++        }
++    }
++
++    static auto passive() -> grpc::Status
++    {
++        return {grpc::StatusCode::UNAVAILABLE, "scheduler passive, another node serves"};
++    }
++
++    void OnWriteDone(bool isOk) override
++    {
++        if (!isOk) {
++            {
++                const absl::MutexLock lock(sendq->mutex);
++                sendq->closed = true;
++                sendq->writing = false;
++            }
++            ctx->TryCancel();
++            maybeDone();
++            return;
++        }
++        writeNext();
++    }
++
++    // Must not take the Dispatcher mutex: the sender cancels under it.
++    void OnCancel() override
++    {
++        {
++            const absl::MutexLock lock(sendq->mutex);
++            sendq->closed = true;
++        }
++        maybeDone();
++    }
++
++    void OnDone() override
++    {
++        // After this the Dispatcher calls neither closure again.
++        if (watcher) {
++            disp.unwatch(*watcher);
++        }
++        done();
++        delete this; // NOLINT(cppcoreguidelines-owning-memory): created by EventsService::Watch
++    }
++
++private:
++    // Runs under the Dispatcher mutex. The snapshot may be any size and does
++    // not count. Writes start only once the mutex is released, and one change
++    // can emit one or two events per tracked drv (a client with many leaving,
++    // a system losing its last worker). So a client counts as stuck only when
++    // it is behind by `limit` events plus two per drv of the largest table it
++    // has seen.
++    auto sender() -> Dispatcher::WatchSend
++    {
++        return [this, sendq = sendq](nix::remote::WatchEvent && event)
++                   ABSL_EXCLUSIVE_LOCKS_REQUIRED(disp.sendLock()) -> bool {
++            peak = std::max(peak, disp.trackedLocked());
++            bool kick = false;
++            bool fits = false;
++            {
++                const absl::MutexLock lock(sendq->mutex);
++                if (sendq->closed) {
++                    return false;
++                }
++                fits = !live || sendq->deltas < Queue::limit + (2 * peak);
++                if (fits) {
++                    sendq->deltas += live ? 1 : 0;
++                    live = live || event.has_snapshot_done();
++                    sendq->queue.push_back(std::move(event));
++                    kick = !sendq->writing;
++                    sendq->writing = true;
++                } else {
++                    sendq->closed = true;
++                }
++            }
++            if (!fits) {
++                ctx->TryCancel();
++                return false;
++            }
++            if (kick) {
++                // `writing` is set, so OnDone cannot fire before this runs.
++                disp.afterUnlock([this] -> void { writeNext(); });
++            }
++            return true;
++        };
++    }
++
++    // Under the Dispatcher mutex too.
++    auto ender() -> std::function<void()>
++    {
++        return [this] ABSL_EXCLUSIVE_LOCKS_REQUIRED(disp.sendLock()) -> void {
++            end({grpc::StatusCode::UNAVAILABLE, "scheduler stopped serving, reconnect"});
++        };
++    }
++
++    // Ends the stream with `fin`. Claims the writer like a send, so Finish
++    // waits for the kick. A write still in flight is cancelled: a client
++    // that stopped reading must not keep the stream and its queue alive on
++    // a node that no longer serves.
++    ABSL_EXCLUSIVE_LOCKS_REQUIRED(disp.sendLock()) void end(grpc::Status fin)
++    {
++        bool kick = false;
++        {
++            const absl::MutexLock lock(sendq->mutex);
++            if (sendq->closed) {
++                return;
++            }
++            sendq->closed = true;
++            status = std::move(fin);
++            kick = !sendq->writing;
++            sendq->writing = true;
++        }
++        if (kick) {
++            disp.afterUnlock([this] -> void { writeNext(); });
++        } else {
++            ctx->TryCancel();
++        }
++    }
++
++    // Caller has set `writing`.
++    void writeNext()
++    {
++        bool have = false;
++        {
++            const absl::MutexLock lock(sendq->mutex);
++            have = !sendq->closed && sendq->fill(out);
++            sendq->deltas = std::min(sendq->deltas, sendq->queue.size());
++            if (!have) {
++                sendq->writing = false;
++            }
++        }
++        if (have) {
++            StartWrite(&out);
++        } else {
++            maybeDone();
++        }
++    }
++
++    // Finish once, when closed and no Write is in flight.
++    void maybeDone()
++    {
++        std::optional<grpc::Status> fin;
++        {
++            const absl::MutexLock lock(sendq->mutex);
++            if (sendq->closed && !sendq->writing && !finished) {
++                finished = true;
++                fin = status;
++            }
++        }
++        if (fin) {
++            Finish(*fin);
++        }
++    }
++
++    IdleTracker::Guard active;
++    grpc::CallbackServerContext * ctx;
++    Dispatcher & disp;
++    std::shared_ptr<Queue> sendq;
++    std::function<void()> done;
++    std::optional<uint64_t> watcher;
++    nix::remote::WatchEvents out;
++    // Only the sender, under the Dispatcher mutex.
++    bool live = false; // SnapshotDone is queued
++    size_t peak = 0;   // most drvs tracked while this stream was open
++    bool finished ABSL_GUARDED_BY(sendq->mutex) = false;
++    grpc::Status status ABSL_GUARDED_BY(sendq->mutex) = grpc::Status::OK;
++};
++
+ // Turns a stream away with a status, without touching the Dispatcher.
+ template<typename In, typename Out>
+ class RejectReactor final : public grpc::ServerBidiReactor<In, Out>
+@@ -277,4 +477,20 @@ public:
+     }
+ };
+ 
++// The same for server streams.
++template<typename Out>
++class RejectWriter final : public grpc::ServerWriteReactor<Out>
++{
++public:
++    explicit RejectWriter(const grpc::Status & status)
++    {
++        this->Finish(status);
++    }
++
++    void OnDone() override
++    {
++        delete this;
++    }
++};
++
+ } // namespace nixgrpc
+diff --git a/src/daemon/scheduler.hh b/src/daemon/scheduler.hh
+index 39a7533..28c7757 100644
+--- a/src/daemon/scheduler.hh
++++ b/src/daemon/scheduler.hh
+@@ -15,6 +15,7 @@
+ #include <map>
+ #include <optional>
+ #include <set>
++#include <span>
+ #include <string>
+ #include <string_view>
+ #include <unordered_map>
+@@ -333,6 +334,14 @@ struct Assign
+     std::vector<ClientId> clients;
+ };
+ 
++// Inputs of an assigned drv that `worker` built last.
++struct InputSource
++{
++    WorkerId worker = noWorker;
++    uint32_t paths = 0;
++    uint64_t narBytes = 0;
++};
++
+ struct Entry
+ {
+     std::string drvPath;
+@@ -347,6 +356,10 @@ struct Entry
+     double cpHint = 0;
+     bool unplaceable = false; // as last told to the followers
+     std::vector<WorkerId> givers; // could not run it, latest last
++    // Only the event stream reads these.
++    double assignMs = 0;              // placed at; 0 if a Hello reported someone else's assignment
++    bool cacheChecked = false;        // a Want for it was looked up in the cache and missed
++    std::vector<InputSource> sources; // where its inputs were when placed
+ };
+ 
+ // What a give-back says: the worker takes no builds at all right now, or it
+@@ -458,10 +471,29 @@ public:
+         return workers.size();
+     }
+ 
++    // Upper bound for entry(); retired slots read as nullopt.
++    [[nodiscard]] auto entryCount() const -> size_t
++    {
++        return entries.size();
++    }
++
++    [[nodiscard]] auto liveEntries() const -> size_t
++    {
++        return drvIds.size();
++    }
++
++    // What `client` wanted. May hold stale and repeated ids: check followers.
++    [[nodiscard]] auto wanted(ClientId client) const -> std::span<const DrvId>
++    {
++        auto const iter = follows.find(client);
++        return iter == follows.end() ? std::span<const DrvId>{} : std::span(iter->second);
++    }
++
+     struct WantResult
+     {
+         DrvId drv = 0;
+         std::optional<std::pair<WorkerId, uint64_t>> assigned;
++        bool fresh = false; // no entry before
+     };
+ 
+     struct WantInfo
+@@ -471,6 +503,7 @@ public:
+         std::string_view system;
+         std::vector<std::string> features;
+         double cpHintMs = 0;
++        bool cacheChecked = false;
+     };
+ 
+     // Caller handled the cache-hit case already.
+@@ -479,6 +512,7 @@ public:
+         auto const drv = drvId(info.drvPath);
+         auto const cpHintMs = info.cpHintMs;
+         auto & slot = entries.at(drv);
++        bool const fresh = !slot;
+         if (!slot) {
+             slot = Entry{
+                 .drvPath = std::string(info.drvPath),
+@@ -502,11 +536,12 @@ public:
+             follows[client].push_back(drv);
+         }
+         slot->cpHint = std::max(slot->cpHint, cpHintMs);
++        slot->cacheChecked = slot->cacheChecked || info.cacheChecked;
+         if (slot->worker != noWorker) {
+-            return {.drv = drv, .assigned = std::pair(slot->worker, slot->assignId)};
++            return {.drv = drv, .assigned = std::pair(slot->worker, slot->assignId), .fresh = fresh};
+         }
+         enqueue(drv);
+-        return {.drv = drv};
++        return {.drv = drv, .fresh = fresh};
+     }
+ 
+     // The drv's only client could not use its assignment: the drv is placed
+@@ -628,8 +663,12 @@ public:
+             } else if (slot->worker == noWorker && !slot->followers.empty()) {
+                 superseded.push_back({.drv = drv});
+             }
++            if (slot->assignId != assignId) {
++                slot->assignMs = 0; // another assignment, placed at an unknown time
++            }
+             slot->worker = wid;
+             slot->assignId = assignId;
++            slot->sources = inputSources(*slot);
+             sys(slot->system).queue.erase(drv, slot->featureKey);
+             if (std::ranges::find(wkr.running, drv) == wkr.running.end()) {
+                 wkr.running.push_back(drv);
+@@ -648,15 +687,19 @@ public:
+         uint64_t assignId;
+     };
+ 
+-    void done(Lease lease, const std::vector<std::pair<std::string_view, uint64_t>> & outputs)
++    // False if the lease is over.
++    auto done(Lease lease, const std::vector<std::pair<std::string_view, uint64_t>> & outputs) -> bool
+     {
+         for (auto [path, size] : outputs) {
+             rememberBuilder(path, lease.worker, size);
+         }
+-        if (auto const drv = release(lease)) {
+-            workers.at(lease.worker).failures = 0;
+-            retire(*drv);
++        auto const drv = release(lease);
++        if (!drv) {
++            return false;
+         }
++        workers.at(lease.worker).failures = 0;
++        retire(*drv);
++        return true;
+     }
+ 
+     // The worker can't run it after all: place it elsewhere. False if the
+@@ -812,6 +855,14 @@ public:
+         return slot && placeable(*slot);
+     }
+ 
++    // When the Expect went out, for the event stream.
++    void markPlaced(DrvId drv, double nowMs) // NOLINT(bugprone-easily-swappable-parameters)
++    {
++        if (auto & slot = entries.at(drv)) {
++            slot->assignMs = nowMs;
++        }
++    }
++
+     // What a follower was last told about a queued entry.
+     void markUnplaceable(DrvId drv, bool unplaceable)
+     {
+@@ -1077,6 +1128,7 @@ private:
+         }
+         slot->worker = *wid;
+         slot->assignId = ++lastAssignId;
++        slot->sources = inputSources(*slot);
+         workers.at(*wid).running.push_back(drv);
+         refreshFree(*wid);
+         out.push_back(Assign{.drv = drv, .worker = *wid, .assignId = slot->assignId, .clients = slot->followers});
+@@ -1180,6 +1232,27 @@ private:
+         return latest;
+     }
+ 
++    // Inputs by who built them last.
++    [[nodiscard]] auto inputSources(const Entry & ent) const -> std::vector<InputSource>
++    {
++        std::vector<InputSource> sources;
++        for (const auto & input : ent.inputs) {
++            auto const iter = lastBuilder.find(input);
++            if (iter == lastBuilder.end()) {
++                continue;
++            }
++            auto [wid, size] = iter->second;
++            auto const src = std::ranges::find(sources, wid, &InputSource::worker);
++            if (src == sources.end()) {
++                sources.push_back({.worker = wid, .paths = 1, .narBytes = size});
++            } else {
++                src->paths++;
++                src->narBytes += size;
++            }
++        }
++        return sources;
++    }
++
+     [[nodiscard]] auto pick(const Entry & ent) const -> std::optional<WorkerId>
+     {
+         auto best = emptiestFor(ent);
+diff --git a/tests/events-grpc-test.cc b/tests/events-grpc-test.cc
+new file mode 100644
+index 0000000..e21dd1b
+--- /dev/null
++++ b/tests/events-grpc-test.cc
+@@ -0,0 +1,445 @@
++// Events.Watch over a loopback gRPC server: WatchReactor delivers the
++// snapshot and the events, keeps up with large tables, ends on cancel and on
++// a leader change, and EventsService turns away passive nodes, anonymous
++// callers and callers with too many streams.
++
++#include <atomic>
++#include <cassert>
++#include <chrono>
++#include <cstddef>
++#include <cstdlib>
++#include <exception>
++#include <format>
++#include <functional>
++#include <iostream>
++#include <memory>
++#include <optional>
++#include <string>
++#include <thread>
++#include <utility>
++#include <vector>
++
++#include <openssl/asn1.h>
++#include <openssl/bio.h>
++#include <openssl/ec.h>
++#include <openssl/evp.h>
++#include <openssl/obj_mac.h>
++#include <openssl/pem.h>
++#include <openssl/types.h>
++#include <openssl/x509.h>
++#include <openssl/x509v3.h>
++
++#include <grpc/grpc_security_constants.h>
++#include <grpc/impl/channel_arg_names.h>
++#include <grpcpp/client_context.h>
++#include <grpcpp/create_channel.h>
++#include <grpcpp/security/credentials.h>
++#include <grpcpp/security/server_credentials.h>
++#include <grpcpp/server.h>
++#include <grpcpp/server_builder.h>
++#include <grpcpp/support/channel_arguments.h>
++#include <grpcpp/support/server_callback.h>
++#include <grpcpp/support/status.h>
++#include <grpcpp/support/sync_stream.h>
++
++#include "acl.hh"
++#include "auth.hh"
++#include "dispatcher.hh"
++#include "events.grpc.pb.h"
++#include "events.hh"
++#include "events.pb.h"
++#include "idle.hh"
++#include "metrics.hh"
++#include "nix_remote.pb.h"
++#include "oidc.hh"
++#include "sched-reactor.hh"
++
++using namespace nixgrpc;
++namespace rpc = nix::remote;
++
++// NOLINTBEGIN(*-magic-numbers, bugprone-unchecked-optional-access, cppcoreguidelines-owning-memory, misc-use-internal-linkage): test setup.
++namespace {
++
++// A Dispatcher with no cache, and clients that take every message.
++struct Farm
++{
++    Metrics metrics{""};
++    Dispatcher disp{{.defaultSystem = "x86_64-linux", .lookupThreads = 0}, metrics};
++
++    auto client(std::string identity) -> Dispatcher::ClientPtr
++    {
++        return disp.connectClient([](const rpc::SchedMsg &) -> bool { return true; }, [] -> void {}, std::move(identity));
++    }
++};
++
++// EventsService without auth, to reach the reactor.
++class Open final : public rpc::Events::CallbackService
++{
++public:
++    explicit Open(Dispatcher & disp)
++        : disp(disp)
++    {
++    }
++
++    auto Watch(grpc::CallbackServerContext * ctx, const rpc::WatchRequest * /*request*/)
++        -> grpc::ServerWriteReactor<rpc::WatchEvents> * override
++    {
++        return new WatchReactor(ctx, disp, idle, [this] -> void { done++; });
++    }
++
++    // Streams that reached OnDone.
++    [[nodiscard]] auto finished() const -> int
++    {
++        return done;
++    }
++
++private:
++    Dispatcher & disp;
++    IdleTracker idle;
++    std::atomic<int> done{0};
++};
++
++// PEM text from an OpenSSL writer.
++auto pem(const std::function<int(BIO *)> & write) -> std::string
++{
++    std::unique_ptr<BIO, decltype(&BIO_free_all)> const bio(BIO_new(BIO_s_mem()), BIO_free_all);
++    assert(bio && write(bio.get()) == 1);
++    char * data = nullptr;
++    auto const len = BIO_get_mem_data(bio.get(), &data); // NOLINT(cppcoreguidelines-pro-type-cstyle-cast): macro
++    return {data, static_cast<size_t>(len)};
++}
++
++auto privatePem(EVP_PKEY * key) -> std::string
++{
++    return pem([&](BIO * bio) -> int { return PEM_write_bio_PrivateKey(bio, key, nullptr, nullptr, 0, nullptr, nullptr); });
++}
++
++using Key = std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)>;
++
++// A self-signed certificate with CN `name`. It is the server's
++// certificate, the client's and the CA for both.
++struct Tls
++{
++    std::string name;
++    std::string key;
++    std::string cert;
++
++    explicit Tls(std::string commonName)
++        : name(std::move(commonName))
++    {
++        Key const pkey(EVP_EC_gen("P-256"), EVP_PKEY_free); // NOLINT(cppcoreguidelines-pro-type-vararg)
++        std::unique_ptr<X509, decltype(&X509_free)> const x509(X509_new(), X509_free);
++        assert(pkey && x509);
++        X509_set_version(x509.get(), 2);
++        ASN1_INTEGER_set(X509_get_serialNumber(x509.get()), 1);
++        X509_gmtime_adj(X509_getm_notBefore(x509.get()), -3600);
++        X509_gmtime_adj(X509_getm_notAfter(x509.get()), 3600);
++        X509_set_pubkey(x509.get(), pkey.get());
++        auto * subject = X509_get_subject_name(x509.get());
++        X509_NAME_add_entry_by_txt(
++            subject, "CN", MBSTRING_ASC,
++            reinterpret_cast<const unsigned char *>(name.c_str()), // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
++            -1, -1, 0);
++        X509_set_issuer_name(x509.get(), subject);
++        X509V3_CTX extCtx{};
++        X509V3_set_ctx(&extCtx, x509.get(), x509.get(), nullptr, nullptr, 0);
++        auto * ext = X509V3_EXT_conf_nid(nullptr, &extCtx, NID_basic_constraints, "critical,CA:TRUE");
++        X509_add_ext(x509.get(), ext, -1);
++        X509_EXTENSION_free(ext);
++        assert(X509_sign(x509.get(), pkey.get(), EVP_sha256()) > 0);
++        key = privatePem(pkey.get());
++        cert = pem([&](BIO * bio) -> int { return PEM_write_bio_X509(bio, x509.get()); });
++    }
++};
++
++struct Server
++{
++    std::unique_ptr<grpc::Server> server;
++    std::unique_ptr<rpc::Events::Stub> stub;
++    // Over TLS with `tls` as the client certificate, if given.
++    std::unique_ptr<rpc::Events::Stub> certStub;
++
++    explicit Server(grpc::Service & service, const std::optional<Tls> & tls = std::nullopt)
++    {
++        grpc::ServerBuilder builder;
++        int port = 0;
++        int tlsPort = 0;
++        builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &port);
++        if (tls) {
++            grpc::SslServerCredentialsOptions opts(GRPC_SSL_REQUEST_AND_REQUIRE_CLIENT_CERTIFICATE_AND_VERIFY);
++            opts.pem_root_certs = tls->cert;
++            opts.pem_key_cert_pairs.push_back({.private_key = tls->key, .cert_chain = tls->cert});
++            builder.AddListeningPort("127.0.0.1:0", grpc::SslServerCredentials(opts), &tlsPort);
++        }
++        builder.RegisterService(&service);
++        server = builder.BuildAndStart();
++        assert(server && port > 0);
++        // A fixed, small window, so a client that does not read holds up the
++        // server's writes at once.
++        grpc::ChannelArguments args;
++        args.SetInt(GRPC_ARG_HTTP2_BDP_PROBE, 0);
++        args.SetInt(GRPC_ARG_HTTP2_STREAM_LOOKAHEAD_BYTES, 64 * 1024);
++        stub = rpc::Events::NewStub(grpc::CreateCustomChannel(
++            "127.0.0.1:" + std::to_string(port), grpc::InsecureChannelCredentials(), args));
++        if (tls) {
++            assert(tlsPort > 0);
++            args.SetSslTargetNameOverride(tls->name);
++            auto const creds = grpc::SslCredentials(
++                {.pem_root_certs = tls->cert, .pem_private_key = tls->key, .pem_cert_chain = tls->cert});
++            certStub = rpc::Events::NewStub(
++                grpc::CreateCustomChannel("127.0.0.1:" + std::to_string(tlsPort), creds, args));
++        }
++    }
++};
++
++struct Stream
++{
++    grpc::ClientContext ctx;
++    std::unique_ptr<grpc::ClientReader<rpc::WatchEvents>> reader;
++    std::vector<rpc::WatchEvent> events;
++
++    explicit Stream(rpc::Events::Stub & stub, const std::string & token = "")
++    {
++        ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(20));
++        if (!token.empty()) {
++            ctx.AddMetadata("authorization", "Bearer " + token);
++        }
++        reader = stub.Watch(&ctx, rpc::WatchRequest{});
++    }
++
++    // Reads until `stop` holds for the last event; false if the stream ended.
++    auto readUntil(const std::function<bool(const rpc::WatchEvent &)> & stop) -> bool
++    {
++        rpc::WatchEvents batch;
++        while (reader->Read(&batch)) {
++            for (const auto & event : batch.msgs()) {
++                events.push_back(event);
++                if (stop(event)) {
++                    return true;
++                }
++            }
++        }
++        return false;
++    }
++};
++
++auto wait(const std::function<bool()> & cond) -> bool
++{
++    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
++    while (!cond()) {
++        if (std::chrono::steady_clock::now() > deadline) {
++            return false;
++        }
++        std::this_thread::sleep_for(std::chrono::milliseconds(10));
++    }
++    return true;
++}
++
++void testStream()
++{
++    Farm farm;
++    Dispatcher::Worker worker{.send = [](const rpc::SchedCmd &) -> bool { return true; }};
++    rpc::WorkerMsgs hello;
++    auto * hel = hello.add_msgs()->mutable_hello();
++    hel->set_addr("10.0.0.1:50051");
++    hel->add_systems("x86_64-linux");
++    hel->set_max_jobs(1);
++    farm.disp.workerMsgs(worker, hello);
++    auto const client = farm.client("ci-1");
++    rpc::ClientMsgs want;
++    want.add_msgs()->mutable_want()->set_drv_path("a.drv");
++    farm.disp.clientMsgs(client, want);
++
++    Open open(farm.disp);
++    Server srv(open);
++    Stream stream(*srv.stub);
++    assert(stream.readUntil([](const rpc::WatchEvent & event) -> bool { return event.has_snapshot_done(); }));
++    const auto & first = stream.events.front();
++    assert(first.has_reset() && first.time_ms() > 0);
++    size_t drvs = 0;
++    for (const auto & event : stream.events) {
++        assert(event.seq() == first.seq());
++        drvs += event.has_drv() && event.drv().phase() == rpc::DrvState::PHASE_ASSIGNED ? 1 : 0;
++    }
++    assert(stream.events.size() == 5 && drvs == 1); // reset, worker, client, drv, done
++
++    // The next change is the next seq.
++    auto const other = farm.client("ci-2");
++    auto const snapshotEvents = stream.events.size();
++    assert(stream.readUntil([&](const rpc::WatchEvent & event) -> bool {
++        return event.has_client() && event.client().id() == other->id;
++    }));
++    for (size_t idx = snapshotEvents; idx < stream.events.size(); idx++) {
++        assert(stream.events.at(idx).seq() == first.seq() + 1 + (idx - snapshotEvents));
++    }
++
++    // A client that cancels is let go.
++    {
++        Stream gone(*srv.stub);
++        assert(gone.readUntil([](const rpc::WatchEvent & event) -> bool { return event.has_snapshot_done(); }));
++        gone.ctx.TryCancel();
++        assert(wait([&] -> bool { return open.finished() == 1; }));
++    }
++
++    // Stepping down ends the stream, and a passive node opens none.
++    farm.disp.restarting();
++    assert(!stream.readUntil([](const rpc::WatchEvent &) -> bool { return false; }));
++    auto status = stream.reader->Finish();
++    assert(status.error_code() == grpc::StatusCode::UNAVAILABLE);
++    Stream passive(*srv.stub);
++    assert(!passive.readUntil([](const rpc::WatchEvent &) -> bool { return true; }));
++    status = passive.reader->Finish();
++    assert(status.error_code() == grpc::StatusCode::UNAVAILABLE);
++    assert(wait([&] -> bool { return open.finished() == 3; }));
++    srv.server->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds(1));
++}
++
++// `count` queued drvs, all wanted by one client.
++auto wantMany(Farm & farm, size_t count) -> Dispatcher::ClientPtr
++{
++    auto client = farm.client("ci-big");
++    rpc::ClientMsgs msgs;
++    for (size_t idx = 0; idx < count; idx++) {
++        msgs.add_msgs()->mutable_want()->set_drv_path(std::format("{:032}-d.drv", idx));
++    }
++    farm.disp.clientMsgs(client, msgs);
++    return client;
++}
++
++// The snapshot does not count against the queue limit, and neither does one
++// change that emits more events than the limit at once.
++void testBacklog()
++{
++    Farm farm;
++    constexpr size_t drvs = 80'000; // more than SendQueue::limit
++    auto const big = wantMany(farm, drvs);
++    Open open(farm.disp);
++    Server srv(open);
++    Stream stream(*srv.stub);
++    // The whole snapshot is queued before the first write. Change something
++    // while nearly all of it still waits.
++    rpc::WatchEvents batch;
++    assert(stream.reader->Read(&batch));
++    auto const other = farm.client("ci-2");
++    assert(stream.readUntil([&](const rpc::WatchEvent & event) -> bool {
++        return event.has_client() && event.client().id() == other->id;
++    }));
++    // Caught up. One DROPPED per drv, all under one lock.
++    farm.disp.clientGone(big);
++    size_t dropped = 0;
++    bool const left = stream.readUntil([&](const rpc::WatchEvent & event) -> bool {
++        dropped += event.has_drv_gone() ? 1 : 0;
++        return event.has_client_gone() && event.client_gone().id() == big->id;
++    });
++    assert(left && dropped == drvs);
++    stream.ctx.TryCancel();
++    assert(wait([&] -> bool { return open.finished() == 1; }));
++    srv.server->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds(1));
++}
++
++// A client that stopped reading does not keep its stream on a node that
++// stepped down: the write in flight is cancelled.
++void testStalledStepDown()
++{
++    Farm farm;
++    // Far more than the client's window, well below the queue limit.
++    auto const big = wantMany(farm, 20'000);
++    Open open(farm.disp);
++    Server srv(open);
++    Stream stalled(*srv.stub);
++    rpc::WatchEvents batch;
++    assert(stalled.reader->Read(&batch));
++    // Let the writer fill the flow control window.
++    std::this_thread::sleep_for(std::chrono::milliseconds(200));
++    farm.disp.restarting();
++    assert(wait([&] -> bool { return open.finished() == 1; }));
++    stalled.ctx.TryCancel();
++    assert(!stalled.reader->Finish().ok());
++    srv.server->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds(1));
++}
++
++// One caller cannot take every stream.
++void testLimit()
++{
++    StreamLimit limit(3, 2);
++    assert(limit.acquire("alice") && limit.acquire("alice"));
++    assert(!limit.acquire("alice")); // her share
++    assert(limit.acquire("bob"));
++    assert(!limit.acquire("carol")); // all three
++    limit.release("alice");
++    assert(limit.acquire("carol"));
++    limit.release("bob");
++    limit.release("carol");
++    assert(limit.acquire("alice"));
++    assert(!limit.acquire("alice"));
++    limit.release("nobody"); // never acquired: no effect
++    assert(limit.acquire("bob") && !limit.acquire("carol"));
++}
++
++// The service's own checks: anonymous callers and passive nodes are turned
++// away, the watch role is enough, and a caller gets only its share of the
++// streams.
++void testService()
++{
++    Farm farm;
++    std::optional<oidc::Verifier> verifier;
++    Tls const tls("dash-viewer");
++    Auth auth{.oidc = &verifier};
++    auth.acl.addRule(tls.name + "=watch");
++    auth.acl.allowAnonymous(Role::write);
++    IdleTracker idle;
++    EventsService service(farm.disp, auth, idle);
++    Server srv(service, tls);
++    auto const any = [](const rpc::WatchEvent &) -> bool { return true; };
++    auto const synced = [](const rpc::WatchEvent & event) -> bool { return event.has_snapshot_done(); };
++    // Anonymous callers get write here, and are still refused.
++    {
++        Stream anon(*srv.stub);
++        assert(!anon.readUntil(any));
++        assert(anon.reader->Finish().error_code() == grpc::StatusCode::UNAUTHENTICATED);
++    }
++    std::vector<std::unique_ptr<Stream>> mine;
++    for (unsigned idx = 0; idx < EventsService::maxStreamsPerCaller; idx++) {
++        mine.push_back(std::make_unique<Stream>(*srv.certStub));
++        assert(mine.back()->readUntil(synced));
++    }
++    {
++        Stream extra(*srv.certStub);
++        assert(!extra.readUntil(any));
++        assert(extra.reader->Finish().error_code() == grpc::StatusCode::RESOURCE_EXHAUSTED);
++    }
++    for (auto & stream : mine) {
++        stream->ctx.TryCancel();
++        assert(!stream->reader->Finish().ok());
++    }
++    service.setActive(false);
++    {
++        Stream passive(*srv.stub);
++        assert(!passive.readUntil(any));
++        assert(passive.reader->Finish().error_code() == grpc::StatusCode::UNAVAILABLE);
++    }
++    srv.server->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds(1));
++}
++
++
++} // namespace
++// NOLINTEND(*-magic-numbers, bugprone-unchecked-optional-access, cppcoreguidelines-owning-memory, misc-use-internal-linkage)
++
++auto main() -> int
++try {
++    testStream();
++    testBacklog();
++    testStalledStepDown();
++    testLimit();
++    testService();
++    // gRPC frees TLS endpoints on EventEngine threads that can outlive the
++    // servers and channels, which races OpenSSL's atexit cleanup (see
++    // retainGrpcRuntime in src/client/channel.hh). Every test passed, so
++    // skip the exit handlers.
++    std::cout.flush();
++    std::cerr.flush();
++    std::_Exit(0);
++} catch (std::exception & err) {
++    std::cerr << err.what() << "\n";
++    return 1;
++}
+diff --git a/tests/events-test.cc b/tests/events-test.cc
+new file mode 100644
+index 0000000..56c1371
+--- /dev/null
++++ b/tests/events-test.cc
+@@ -0,0 +1,1058 @@
++// Events.Watch at the Dispatcher, without gRPC. A seeded random farm of
++// clients and workers runs against one Dispatcher while a watcher rebuilds
++// the state from the snapshot and the events, as a dashboard does. After
++// every step that state must equal a fresh snapshot, and the events must
++// match what the step did.
++
++#include <algorithm>
++#include <array>
++#include <cassert>
++#include <cstddef>
++#include <cstdint>
++#include <exception>
++#include <format>
++#include <functional>
++#include <iostream>
++#include <iterator>
++#include <map>
++#include <memory>
++#include <mutex>
++#include <optional>
++#include <random>
++#include <set>
++#include <string>
++#include <string_view>
++#include <unordered_set>
++#include <utility>
++#include <vector>
++
++#include "dispatcher.hh"
++#include "events.pb.h"
++#include "metrics.hh"
++#include "nix_remote.pb.h"
++
++using namespace nixgrpc;
++namespace rpc = nix::remote;
++
++// NOLINTBEGIN(*-magic-numbers, *-avoid-unchecked-container-access, bugprone-unchecked-optional-access, readability-identifier-length, cert-msc32-c, cert-msc51-cpp, bugprone-random-generator-seed, misc-use-internal-linkage): test vectors, seeded on purpose.
++namespace {
++
++// What the Dispatcher sends one watcher. Closures may run on its stats thread.
++struct Sink
++{
++    std::mutex mutex;
++    std::vector<rpc::WatchEvent> events;
++    bool ended = false;
++
++    auto send() -> Dispatcher::WatchSend
++    {
++        return [this](rpc::WatchEvent && event) -> bool {
++            const std::scoped_lock lock(mutex);
++            events.push_back(std::move(event));
++            return true;
++        };
++    }
++
++    auto end() -> std::function<void()>
++    {
++        return [this] -> void {
++            const std::scoped_lock lock(mutex);
++            ended = true;
++        };
++    }
++
++    auto take() -> std::vector<rpc::WatchEvent>
++    {
++        const std::scoped_lock lock(mutex);
++        return std::exchange(events, {});
++    }
++};
++
++// A watcher's state, rebuilt from the stream.
++struct Model
++{
++    std::optional<uint64_t> seq;
++    bool live = false;
++    rpc::Reset reset;
++    std::map<std::string, rpc::WorkerState> workers;
++    std::map<uint64_t, rpc::ClientState> clients;
++    std::map<std::string, rpc::DrvState> drvs;
++};
++
++// Which kinds of event the random runs produced, to know they covered all.
++std::map<std::string, size_t> seen; // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
++
++void count(const rpc::WatchEvent & event)
++{
++    if (event.has_drv()) {
++        const auto & drv = event.drv();
++        seen[rpc::DrvState::Cause_Name(drv.cause())]++;
++        if (drv.phase() == rpc::DrvState::PHASE_UNPLACEABLE) {
++            seen["unplaceable"]++;
++        }
++        if (drv.reason() == "the worker's stream broke") {
++            seen["undeliverable"]++;
++        }
++    } else if (event.has_drv_gone()) {
++        seen[rpc::DrvGone::Outcome_Name(event.drv_gone().outcome())]++;
++    } else {
++        seen[std::to_string(event.event_case())]++;
++    }
++}
++
++// "path:CAUSE" or "path:OUTCOME" for drv events, else the kind.
++auto label(const rpc::WatchEvent & event) -> std::string
++{
++    if (event.has_drv()) {
++        return event.drv().drv_path() + ":" + rpc::DrvState::Cause_Name(event.drv().cause());
++    }
++    if (event.has_drv_gone()) {
++        return event.drv_gone().drv_path() + ":" + rpc::DrvGone::Outcome_Name(event.drv_gone().outcome());
++    }
++    if (event.has_worker()) {
++        return "worker";
++    }
++    return event.has_client() ? "client" : "other";
++}
++
++// Applies one event as a client must: seq checks, then upserts and removals.
++void apply(Model & model, const rpc::WatchEvent & event)
++{
++    if (event.has_reset()) {
++        model = Model{.seq = event.seq(), .reset = event.reset()};
++        return;
++    }
++    assert(model.seq);
++    if (!model.live) {
++        assert(event.seq() == *model.seq);
++    } else {
++        assert(event.seq() == *model.seq + 1);
++        model.seq = event.seq();
++    }
++    switch (event.event_case()) {
++    case rpc::WatchEvent::kSnapshotDone:
++        assert(!model.live);
++        model.live = true;
++        break;
++    case rpc::WatchEvent::kWorker:
++        model.workers[event.worker().addr()] = event.worker();
++        break;
++    case rpc::WatchEvent::kClient:
++        model.clients[event.client().id()] = event.client();
++        break;
++    case rpc::WatchEvent::kClientGone:
++        assert(model.clients.erase(event.client_gone().id()) == 1);
++        break;
++    case rpc::WatchEvent::kDrv: {
++        const auto & drv = event.drv();
++        assert(model.live == (drv.cause() != rpc::DrvState::CAUSE_SNAPSHOT));
++        // Every event leaves a consistent state, not just the last one.
++        if (drv.phase() == rpc::DrvState::PHASE_ASSIGNED) {
++            assert(model.workers.contains(drv.worker_addr()) && model.workers.at(drv.worker_addr()).up());
++        }
++        for (auto const cid : drv.client_ids()) {
++            assert(model.clients.contains(cid));
++        }
++        model.drvs[drv.drv_path()] = drv;
++        break;
++    }
++    case rpc::WatchEvent::kDrvGone:
++        assert(model.drvs.erase(event.drv_gone().drv_path()) == 1);
++        break;
++    case rpc::WatchEvent::kCached:
++        assert(model.live);
++        break;
++    default:
++        assert(false && "unknown event");
++    }
++}
++
++// The parts a snapshot reproduces: cause and reason belong to one event.
++auto normal(const Model & model) -> std::map<std::string, std::string>
++{
++    std::map<std::string, std::string> out;
++    for (const auto & [addr, wkr] : model.workers) {
++        if (wkr.up()) {
++            out["worker " + addr] = wkr.DebugString();
++        }
++    }
++    for (const auto & [cid, client] : model.clients) {
++        out["client " + std::to_string(cid)] = client.DebugString();
++    }
++    for (const auto & [path, drv] : model.drvs) {
++        auto copy = drv;
++        copy.clear_cause();
++        copy.clear_reason();
++        out["drv " + path] = copy.DebugString();
++        for (auto const cid : drv.client_ids()) {
++            assert(model.clients.contains(cid));
++        }
++        if (drv.phase() == rpc::DrvState::PHASE_ASSIGNED) {
++            assert(model.workers.contains(drv.worker_addr()) && model.workers.at(drv.worker_addr()).up());
++        } else {
++            assert(drv.worker_addr().empty() && drv.input_sources().empty());
++        }
++    }
++    return out;
++}
++
++auto snapshot(Dispatcher & disp) -> Model
++{
++    Sink sink;
++    auto const watcher = disp.watch(sink.send(), sink.end());
++    assert(watcher);
++    disp.unwatch(*watcher);
++    Model model;
++    for (const auto & event : sink.take()) {
++        apply(model, event);
++    }
++    assert(model.live);
++    return model;
++}
++
++void assertSame(const Model & got, const Model & want)
++{
++    auto const lhs = normal(got);
++    auto const rhs = normal(want);
++    if (lhs == rhs) {
++        return;
++    }
++    for (const auto & [key, val] : lhs) {
++        if (!rhs.contains(key) || rhs.at(key) != val) {
++            std::cerr << "events: " << key << " " << val << "\nsnapshot: " << (rhs.contains(key) ? rhs.at(key) : "-")
++                      << "\n";
++        }
++    }
++    for (const auto & [key, val] : rhs) {
++        if (!lhs.contains(key)) {
++            std::cerr << "only in snapshot: " << key << " " << val << "\n";
++        }
++    }
++    assert(false && "events and snapshot disagree");
++}
++
++// ------------------------------------------------------------------ the farm
++
++constexpr size_t drvCount = 30;
++constexpr std::string_view x86 = "x86_64-linux";
++
++auto drvPath(size_t idx) -> std::string
++{
++    return std::format("{:032}-d{}.drv", idx, idx);
++}
++
++auto outPath(size_t idx) -> std::string
++{
++    return std::format("/nix/store/o{:031}-d{}", idx, idx);
++}
++
++// The cache key of its output.
++auto outKey(size_t idx) -> std::string
++{
++    return outPath(idx).substr(11, 32) + ".narinfo";
++}
++
++auto drvIndex(const std::string & path) -> size_t
++{
++    return std::stoul(path.substr(0, 32));
++}
++
++auto outSize(size_t idx) -> uint64_t
++{
++    return (idx + 1) * 1000;
++}
++
++// Fixed per drv, so every Want for it says the same.
++auto inputsOf(size_t idx) -> std::vector<std::string>
++{
++    std::mt19937 rng(static_cast<unsigned>(idx));
++    std::vector<std::string> inputs{std::format("/nix/store/s{:031}-src", idx)};
++    for (size_t dep = 0; dep < idx; dep++) {
++        if (rng() % 4 == 0) {
++            inputs.push_back(outPath(dep));
++        }
++    }
++    return inputs;
++}
++
++auto systemOf(size_t idx) -> std::string
++{
++    if (idx % 7 == 6) {
++        return "riscv64-linux"; // nobody offers it
++    }
++    if (idx % 5 == 4) {
++        return "aarch64-linux";
++    }
++    return idx % 3 == 0 ? "" : std::string(x86); // "" is the default system
++}
++
++auto featuresOf(size_t idx) -> std::vector<std::string>
++{
++    if (idx % 6 == 5) {
++        return {"kvm"};
++    }
++    if (idx % 11 == 10) {
++        return {"big"};
++    }
++    return {};
++}
++
++struct SimWorker
++{
++    std::string addr;
++    std::vector<std::string> systems;
++    std::vector<std::string> features;
++    bool varyJobs = false; // max_jobs 0..3, else 2
++    std::unique_ptr<Dispatcher::Worker> session;
++    std::mutex mutex; // the stats thread sends too (orphan Revokes)
++    std::vector<rpc::SchedCmd> cmds;
++    bool broken = false;  // sends fail, as on a dead stream
++    bool aborted = false; // the scheduler ended the session, so its stream is over
++    std::map<std::string, uint64_t> running; // drv -> assign id, kept across sessions like a builder
++};
++
++class Sim
++{
++public:
++    // Unwatched, the same steps run blind and only the late watcher's
++    // snapshot is checked.
++    Sim(unsigned seed, bool watched)
++        : watched(watched)
++        , rng(seed)
++        , disp(
++              Dispatcher::Config{
++                  .defaultSystem = std::string(x86),
++                  .present = [this](const std::vector<std::string> & keys) -> std::unordered_set<std::string> {
++                      std::unordered_set<std::string> have;
++                      for (const auto & key : keys) {
++                          if (cache.contains(key)) {
++                              have.insert(key);
++                          }
++                      }
++                      return have;
++                  },
++                  .lookupThreads = 0,
++                  .version = "test",
++                  .cacheUrl = "http://cache"},
++              metrics)
++    {
++        auto const add = [&](std::string addr, std::vector<std::string> systems, std::vector<std::string> features)
++            -> SimWorker * {
++            auto & wkr = *workers.emplace_back(std::make_unique<SimWorker>());
++            wkr.addr = std::move(addr);
++            wkr.systems = std::move(systems);
++            wkr.features = std::move(features);
++            return &wkr;
++        };
++        add("10.0.0.1:50051", {std::string(x86)}, {});
++        add("10.0.0.2:50051", {std::string(x86), "i686-linux"}, {"kvm"});
++        add("10.0.0.3:50051", {"aarch64-linux"}, {"big", "kvm"});
++        add("10.0.0.4:50051", {std::string(x86)}, {})->varyJobs = true;
++        if (watched) {
++            watchA();
++        }
++    }
++
++    void run(size_t steps)
++    {
++        for (size_t step = 0; step < steps; step++) {
++            before = model;
++            randomStep();
++            if (settle()) {
++                assertSame(model, snapshot(disp));
++            }
++        }
++        if (!watched) {
++            watched = true;
++            watchA();
++        }
++        checkRestart();
++    }
++
++private:
++    bool watched;
++    std::mt19937 rng;
++    Metrics metrics{""};
++    std::set<std::string> cache; // out keys the stub cache has
++    std::vector<std::unique_ptr<SimWorker>> workers;
++    std::map<uint64_t, Dispatcher::ClientPtr> clients;
++    std::unique_ptr<Sink> sinkA;
++    uint64_t watcherA = 0;
++    Model model;
++    Model before;
++    std::vector<rpc::WatchEvent> step; // this step's events
++    std::map<std::string, std::pair<std::string, uint64_t>> lastBuilder; // output -> worker, size
++    // Last, so its stats thread stops before the sessions and sinks it calls into go.
++    Dispatcher disp;
++
++    auto pick(size_t bound) -> size_t
++    {
++        return std::uniform_int_distribution<size_t>(0, bound - 1)(rng);
++    }
++
++    auto chance(double prob) -> bool
++    {
++        return std::bernoulli_distribution(prob)(rng);
++    }
++
++    void watchA()
++    {
++        sinkA = std::make_unique<Sink>();
++        auto const watcher = disp.watch(sinkA->send(), sinkA->end());
++        assert(watcher);
++        watcherA = *watcher;
++        model = Model{};
++        settle();
++        assert(model.live && model.reset.instance().size() == 32 && model.reset.version() == "test");
++        assert(model.reset.cache_url() == "http://cache" && model.reset.default_system() == x86);
++    }
++
++    // Apply what watcher A got since the last call. False when blind.
++    auto settle() -> bool
++    {
++        step.clear();
++        if (!watched) {
++            return false;
++        }
++        for (auto & event : sinkA->take()) {
++            apply(model, event);
++            if (!model.live || event.has_snapshot_done()) {
++                continue;
++            }
++            count(event);
++            checkSources(event);
++            step.push_back(std::move(event));
++        }
++        return true;
++    }
++
++    // Where the inputs of a just assigned drv come from, by our own record of
++    // who built what.
++    void checkSources(const rpc::WatchEvent & event)
++    {
++        if (!event.has_drv() || event.drv().phase() != rpc::DrvState::PHASE_ASSIGNED) {
++            return;
++        }
++        const auto & drv = event.drv();
++        auto const cause = drv.cause();
++        if (cause != rpc::DrvState::CAUSE_ASSIGNED && cause != rpc::DrvState::CAUSE_ADOPTED) {
++            return;
++        }
++        std::map<std::string, std::pair<uint32_t, uint64_t>> want;
++        uint32_t unknown = 0;
++        if (drv.inputs() > 0) {
++            auto const inputs = inputsOf(drvIndex(drv.drv_path()));
++            assert(drv.inputs() == inputs.size());
++            for (const auto & input : inputs) {
++                if (auto const iter = lastBuilder.find(input); iter != lastBuilder.end()) {
++                    want[iter->second.first].first++;
++                    want[iter->second.first].second += iter->second.second;
++                } else {
++                    unknown++;
++                }
++            }
++        }
++        std::map<std::string, std::pair<uint32_t, uint64_t>> got;
++        for (const auto & src : drv.input_sources()) {
++            got[src.worker_addr()] = {src.paths(), src.nar_bytes()};
++        }
++        assert(got == want && drv.inputs_unknown() == unknown);
++    }
++
++    auto events(const std::string & drv) const -> std::vector<const rpc::WatchEvent *>
++    {
++        std::vector<const rpc::WatchEvent *> out;
++        for (const auto & event : step) {
++            if ((event.has_drv() && event.drv().drv_path() == drv) || (event.has_drv_gone() && event.drv_gone().drv_path() == drv)
++                || (event.has_cached() && event.cached().drv_path() == drv)) {
++                out.push_back(&event);
++            }
++        }
++        return out;
++    }
++
++    auto gone(const std::string & drv) const -> const rpc::DrvGone *
++    {
++        for (const auto * event : events(drv)) {
++            if (event->has_drv_gone()) {
++                return &event->drv_gone();
++            }
++        }
++        return nullptr;
++    }
++
++    auto changed(const std::string & drv, rpc::DrvState::Cause cause) const -> const rpc::DrvState *
++    {
++        for (const auto * event : events(drv)) {
++            if (event->has_drv() && event->drv().cause() == cause) {
++                return &event->drv();
++            }
++        }
++        return nullptr;
++    }
++
++    // A drv that leaves `clients`: what the events must say about it.
++    void checkLeft(const std::string & path, const rpc::DrvState & was, uint64_t cid)
++    {
++        if (std::ranges::find(was.client_ids(), cid) == was.client_ids().end()) {
++            return;
++        }
++        if (was.client_ids_size() == 1 && was.phase() != rpc::DrvState::PHASE_ASSIGNED) {
++            const auto * out = gone(path);
++            assert(out && out->outcome() == rpc::DrvGone::DROPPED && out->worker_addr().empty());
++            return;
++        }
++        const auto * now = changed(path, rpc::DrvState::CAUSE_FOLLOWERS);
++        assert(now && std::ranges::find(now->client_ids(), cid) == now->client_ids().end());
++        assert(now->client_ids_size() == was.client_ids_size() - 1);
++    }
++
++    // A worker the scheduler took for gone is not in a later snapshot.
++    [[nodiscard]] auto up(const SimWorker & wkr) const -> bool
++    {
++        auto const iter = model.workers.find(wkr.addr);
++        return iter != model.workers.end() && iter->second.up();
++    }
++
++    [[nodiscard]] auto anyBroken() const -> bool
++    {
++        return std::ranges::any_of(workers, [](const auto & wkr) -> bool { return wkr->session && wkr->broken; });
++    }
++
++    void randomStep()
++    {
++        auto const roll = pick(100);
++        if (roll < 8) {
++            connect();
++        } else if (roll < 35) {
++            want();
++        } else if (roll < 42) {
++            cancel();
++        } else if (roll < 47) {
++            leave();
++        } else if (roll < 57) {
++            hello(*workers.at(pick(workers.size())));
++        } else if (roll < 85) {
++            done(*workers.at(pick(workers.size())));
++        } else if (roll < 91) {
++            load(*workers.at(pick(workers.size())));
++        } else if (roll < 96) {
++            workerGone(*workers.at(pick(workers.size())));
++        } else if (roll < 97) {
++            auto & wkr = *workers.at(pick(workers.size()));
++            const std::scoped_lock lock(wkr.mutex);
++            wkr.broken = true; // the next Expect to it fails
++        } else if (watched) {
++            disp.unwatch(watcherA);
++            watchA();
++        }
++    }
++
++    void connect()
++    {
++        static constexpr std::array<std::string_view, 3> identities{"ci-1", "oidc:dex:alice", "oidc:dex:bob"};
++        std::string const identity(identities.at(pick(identities.size())));
++        auto client = disp.connectClient([](const rpc::SchedMsg &) -> bool { return true; }, [] -> void {}, identity);
++        auto const cid = client->id;
++        clients.emplace(cid, std::move(client));
++        if (!settle()) {
++            return;
++        }
++        assert(step.size() == 1 && step[0].has_client() && step[0].client().id() == cid);
++        assert(step[0].client().identity() == identity && step[0].client().connected_ms() > 0);
++    }
++
++    auto anyClient() -> Dispatcher::ClientPtr
++    {
++        if (clients.empty()) {
++            return nullptr;
++        }
++        auto iter = clients.begin();
++        std::advance(iter, static_cast<std::ptrdiff_t>(pick(clients.size())));
++        return iter->second;
++    }
++
++    void want()
++    {
++        auto const client = anyClient();
++        if (client == nullptr) {
++            return;
++        }
++        rpc::ClientMsgs msgs;
++        struct Sent
++        {
++            std::string path;
++            bool cached;
++            bool checked;
++        };
++        std::vector<Sent> sent;
++        std::set<std::string> known;
++        for (const auto & [path, drv] : model.drvs) {
++            known.insert(path);
++        }
++        for (size_t n = 1 + pick(3); n > 0; n--) {
++            auto const idx = pick(drvCount);
++            auto * want = msgs.add_msgs()->mutable_want();
++            want->set_drv_path(drvPath(idx));
++            want->add_out_keys(outKey(idx));
++            for (const auto & input : inputsOf(idx)) {
++                want->add_inputs(input);
++            }
++            want->set_system(systemOf(idx));
++            for (const auto & feat : featuresOf(idx)) {
++                want->add_required_features(feat);
++            }
++            // Far apart, so the time a step takes never reorders the queue.
++            want->set_cp_hint_ms(pick(3) * 10'000'000);
++            want->set_build_mode(chance(0.15) ? 1 : 0);
++            bool const checked = want->build_mode() == 0;
++            bool const cached = checked && cache.contains(want->out_keys(0));
++            sent.push_back({.path = want->drv_path(), .cached = cached, .checked = checked && !cached});
++        }
++        disp.clientMsgs(client, msgs);
++        if (!settle()) {
++            return;
++        }
++        for (const auto & want : sent) {
++            if (want.cached) {
++                auto const hits = events(want.path);
++                assert(std::ranges::any_of(hits, [&](const rpc::WatchEvent * event) -> bool {
++                    return event->has_cached() && event->cached().client_id() == client->id
++                           && event->cached().system() == (systemOf(drvIndex(want.path)).empty() ? std::string(x86) : systemOf(drvIndex(want.path)));
++                }));
++            } else if (known.insert(want.path).second) {
++                const auto * fresh = changed(want.path, rpc::DrvState::CAUSE_WANTED);
++                assert(fresh && fresh->cache_checked() == want.checked && fresh->queued_ms() > 0);
++                assert(fresh->client_ids_size() == 1 && fresh->client_ids(0) == client->id);
++            }
++        }
++    }
++
++    void cancel()
++    {
++        auto const client = anyClient();
++        if (client == nullptr) {
++            return;
++        }
++        auto const path = drvPath(pick(drvCount));
++        rpc::ClientMsgs msgs;
++        msgs.add_msgs()->mutable_cancel()->set_drv_path(path);
++        disp.clientMsgs(client, msgs);
++        if (!settle()) {
++            return;
++        }
++        if (auto const was = before.drvs.find(path); was != before.drvs.end()) {
++            checkLeft(path, was->second, client->id);
++        } else {
++            assert(events(path).empty());
++        }
++    }
++
++    void leave()
++    {
++        auto const client = anyClient();
++        if (client == nullptr) {
++            return;
++        }
++        auto const cid = client->id;
++        disp.clientGone(client);
++        clients.erase(cid);
++        if (!settle()) {
++            return;
++        }
++        for (const auto & [path, was] : before.drvs) {
++            checkLeft(path, was, cid);
++        }
++        assert(!step.empty() && step.back().has_client_gone() && step.back().client_gone().id() == cid);
++    }
++
++    auto send(SimWorker & wkr, const rpc::WorkerMsg & msg) -> void
++    {
++        rpc::WorkerMsgs msgs;
++        *msgs.add_msgs() = msg;
++        disp.workerMsgs(*wkr.session, msgs);
++        const std::scoped_lock lock(wkr.mutex);
++        for (const auto & cmd : std::exchange(wkr.cmds, {})) {
++            if (cmd.has_expect()) {
++                wkr.running[cmd.expect().drv_path()] = cmd.expect().assign_id();
++            }
++        }
++    }
++
++    void hello(SimWorker & wkr)
++    {
++        std::unique_ptr<Dispatcher::Worker> old;
++        bool endedFirst = false; // the old session went before the Hello
++        bool aborted = false;
++        {
++            const std::scoped_lock lock(wkr.mutex);
++            aborted = std::exchange(wkr.aborted, false);
++        }
++        if (!wkr.session || aborted || chance(0.5)) {
++            // A new session; an old one closes after the new Hello, as a half-open stream does.
++            old = std::exchange(wkr.session, std::make_unique<Dispatcher::Worker>());
++            wkr.session->send = [&wkr](const rpc::SchedCmd & cmd) -> bool {
++                const std::scoped_lock lock(wkr.mutex);
++                wkr.cmds.push_back(cmd);
++                return !wkr.broken;
++            };
++            wkr.session->abort = [&wkr] -> void {
++                const std::scoped_lock lock(wkr.mutex);
++                wkr.aborted = true;
++            };
++            bool broken = false;
++            {
++                const std::scoped_lock lock(wkr.mutex);
++                broken = std::exchange(wkr.broken, false);
++            }
++            if (old && (broken || aborted)) {
++                // A stream that died ends before its worker reconnects.
++                disp.workerGone(*old);
++                old.reset();
++                endedFirst = true;
++            }
++        }
++        // Some builds finished while it was away, one comes from before a restart.
++        std::erase_if(wkr.running, [&](const auto &) -> bool { return chance(0.2); });
++        if (chance(0.1)) {
++            wkr.running[drvPath(pick(drvCount))] = 1'000'000 + pick(1000);
++        }
++        rpc::WorkerMsg msg;
++        auto * hel = msg.mutable_hello();
++        hel->set_addr(wkr.addr);
++        for (const auto & system : wkr.systems) {
++            hel->add_systems(system);
++        }
++        for (const auto & feat : wkr.features) {
++            hel->add_features(feat);
++        }
++        hel->set_max_jobs(wkr.varyJobs ? static_cast<uint32_t>(pick(4)) : 2);
++        auto const reported = wkr.running;
++        for (const auto & [path, assignId] : reported) {
++            auto * run = hel->add_running();
++            run->set_drv_path(path);
++            run->set_assign_id(assignId);
++        }
++        send(wkr, msg);
++        if (old) {
++            disp.workerGone(*old); // replaced: a no-op
++        }
++        if (!settle()) {
++            return;
++        }
++        for (const auto & [path, assignId] : reported) {
++            const auto * adopted = changed(path, rpc::DrvState::CAUSE_ADOPTED);
++            assert(adopted && adopted->worker_addr() == wkr.addr && adopted->assign_id() == assignId);
++            // Still running there, so not gone, unless a session ended in this step.
++            assert(endedFirst || anyBroken() || !gone(path));
++        }
++        // Assigned here before, not reported now: back in the queue or gone.
++        for (const auto & [path, was] : before.drvs) {
++            if (was.worker_addr() != wkr.addr || reported.contains(path)) {
++                continue;
++            }
++            assert(gone(path) || changed(path, rpc::DrvState::CAUSE_REQUEUED));
++        }
++        assert(up(wkr) || anyBroken());
++    }
++
++    // An aborted session is over, as its stream would be. The builder
++    // reconnects with a Hello later.
++    auto live(SimWorker & wkr) -> bool
++    {
++        if (!wkr.session) {
++            return false;
++        }
++        bool aborted = false;
++        {
++            const std::scoped_lock lock(wkr.mutex);
++            aborted = std::exchange(wkr.aborted, false);
++        }
++        if (aborted) {
++            disp.workerGone(*wkr.session);
++            wkr.session.reset();
++            return false;
++        }
++        return true;
++    }
++
++    void done(SimWorker & wkr)
++    {
++        if (!live(wkr)) {
++            return;
++        }
++        std::string path;
++        uint64_t assignId = 0;
++        if (!wkr.running.empty() && chance(0.85)) {
++            auto iter = wkr.running.begin();
++            std::advance(iter, static_cast<std::ptrdiff_t>(pick(wkr.running.size())));
++            path = iter->first;
++            assignId = iter->second;
++        } else {
++            path = drvPath(pick(drvCount)); // stale or unknown
++            assignId = pick(4);             // rarely the current assignment
++        }
++        static constexpr std::array outcomes{
++            rpc::Done::BUILT, rpc::Done::BUILT, rpc::Done::BUILT, rpc::Done::FAILED, rpc::Done::CANCELLED,
++            rpc::Done::GIVEN_BACK, rpc::Done::NO_SHOW};
++        rpc::WorkerMsg msg;
++        auto * done = msg.mutable_done();
++        done->set_drv_path(path);
++        done->set_assign_id(assignId);
++        done->set_outcome(outcomes.at(pick(outcomes.size())));
++        done->set_reason(static_cast<rpc::Done::Reason>(pick(6)));
++        auto const idx = drvIndex(path);
++        if (done->outcome() == rpc::Done::BUILT) {
++            auto * out = done->add_outputs();
++            out->set_path(outPath(idx));
++            out->set_nar_size(outSize(idx));
++            lastBuilder[outPath(idx)] = {wkr.addr, outSize(idx)};
++            if (chance(0.7)) {
++                cache.insert(outKey(idx));
++            }
++        }
++        wkr.running.erase(path);
++        bool const strict = !anyBroken(); // else dispatching may requeue or drop anything
++        send(wkr, msg);
++        if (!settle()) {
++            return;
++        }
++        auto const was = before.drvs.find(path);
++        // A Done ends only the assignment it names.
++        bool const mine = was != before.drvs.end() && was->second.phase() == rpc::DrvState::PHASE_ASSIGNED
++                          && was->second.worker_addr() == wkr.addr && was->second.assign_id() == assignId;
++        const auto * out = gone(path);
++        if (!mine) {
++            assert(!strict || (!out && !changed(path, rpc::DrvState::CAUSE_REQUEUED)));
++            return;
++        }
++        switch (done->outcome()) {
++        case rpc::Done::GIVEN_BACK:
++        case rpc::Done::NO_SHOW:
++            if (was->second.client_ids_size() == 0) {
++                assert(out && out->outcome() == rpc::DrvGone::DROPPED && out->worker_addr() == wkr.addr);
++            } else {
++                const auto * back = changed(path, rpc::DrvState::CAUSE_REQUEUED);
++                assert(!out && back && !back->reason().empty());
++            }
++            break;
++        default:
++            assert(out && out->worker_addr() == wkr.addr);
++            assert(static_cast<int>(out->outcome()) == static_cast<int>(done->outcome()));
++            assert(out->outputs_size() == (done->outcome() == rpc::Done::BUILT ? 1 : 0));
++        }
++    }
++
++    void load(SimWorker & wkr)
++    {
++        if (!live(wkr)) {
++            return;
++        }
++        rpc::WorkerMsg msg;
++        msg.mutable_load()->set_draining(chance(0.5));
++        send(wkr, msg);
++        if (!settle()) {
++            return;
++        }
++        assert(!up(wkr) || model.workers.at(wkr.addr).draining() == msg.load().draining());
++    }
++
++    void workerGone(SimWorker & wkr)
++    {
++        if (!wkr.session) {
++            return;
++        }
++        disp.workerGone(*wkr.session);
++        wkr.session.reset();
++        if (!settle()) {
++            return;
++        }
++        assert(!up(wkr));
++        for (const auto & [path, was] : before.drvs) {
++            if (was.worker_addr() != wkr.addr) {
++                continue;
++            }
++            if (was.client_ids_size() == 0) {
++                const auto * out = gone(path);
++                assert(out && out->outcome() == rpc::DrvGone::DROPPED);
++            } else {
++                assert(changed(path, rpc::DrvState::CAUSE_REQUEUED));
++            }
++        }
++    }
++
++    // Yielding ends every stream.
++    void checkRestart()
++    {
++        disp.restarting();
++        {
++            const std::scoped_lock lock(sinkA->mutex);
++            assert(sinkA->ended);
++        }
++        Sink passive;
++        assert(!disp.watch(passive.send(), passive.end()));
++        disp.serving();
++        auto const fresh = snapshot(disp);
++        assert(fresh.reset.instance() == model.reset.instance());
++    }
++};
++
++// One drv end to end, with the fields a dashboard shows.
++void testLifecycle()
++{
++    Metrics metrics("");
++    Dispatcher disp({.defaultSystem = std::string(x86), .lookupThreads = 0}, metrics);
++    Sink sink;
++    auto const watcher = disp.watch(sink.send(), sink.end());
++    assert(watcher);
++    std::vector<rpc::SchedCmd> cmds;
++    std::mutex mutex;
++    Dispatcher::Worker wkr{.send = [&](const rpc::SchedCmd & cmd) -> bool {
++        const std::scoped_lock lock(mutex);
++        cmds.push_back(cmd);
++        return true;
++    }};
++    auto const hello = [&](const std::string & addr, Dispatcher::Worker & session) -> void {
++        rpc::WorkerMsgs msgs;
++        auto * hel = msgs.add_msgs()->mutable_hello();
++        hel->set_addr(addr);
++        hel->add_systems(std::string(x86));
++        hel->set_max_jobs(1);
++        disp.workerMsgs(session, msgs);
++    };
++    hello("w1", wkr);
++    // dep.drv is built on w1 first, so app.drv's input is local there.
++    auto client = disp.connectClient([](const rpc::SchedMsg &) -> bool { return true; }, [] -> void {}, "oidc:dex:alice");
++    rpc::ClientMsgs msgs;
++    auto * dep = msgs.add_msgs()->mutable_want();
++    dep->set_drv_path("dep.drv");
++    disp.clientMsgs(client, msgs);
++    rpc::WorkerMsgs done;
++    auto * out = done.add_msgs()->mutable_done();
++    out->set_drv_path("dep.drv");
++    {
++        const std::scoped_lock lock(mutex);
++        out->set_assign_id(cmds.back().expect().assign_id());
++    }
++    out->set_outcome(rpc::Done::BUILT);
++    auto * path = out->add_outputs();
++    path->set_path("/nix/store/dep-out");
++    path->set_nar_size(4096);
++    disp.workerMsgs(wkr, done);
++    msgs.Clear();
++    auto * app = msgs.add_msgs()->mutable_want();
++    app->set_drv_path("app.drv");
++    app->add_inputs("/nix/store/dep-out");
++    app->add_inputs("/nix/store/src");
++    disp.clientMsgs(client, msgs);
++
++    Model model;
++    std::vector<std::string> kinds;
++    for (const auto & event : sink.take()) {
++        apply(model, event);
++        if (model.live && !event.has_snapshot_done()) {
++            kinds.push_back(label(event));
++        }
++    }
++    assert(
++        (kinds
++         == std::vector<std::string>{
++             "worker", "client", "dep.drv:CAUSE_WANTED", "dep.drv:CAUSE_ASSIGNED", "dep.drv:BUILT",
++             "app.drv:CAUSE_WANTED", "app.drv:CAUSE_ASSIGNED"}));
++    const auto & assigned = model.drvs.at("app.drv");
++    assert(assigned.phase() == rpc::DrvState::PHASE_ASSIGNED && assigned.worker_addr() == "w1");
++    assert(assigned.queued_ms() > 0 && assigned.assigned_ms() >= assigned.queued_ms());
++    assert(assigned.system() == x86 && assigned.inputs() == 2 && assigned.inputs_unknown() == 1);
++    assert(assigned.input_sources_size() == 1 && assigned.input_sources(0).worker_addr() == "w1");
++    assert(assigned.input_sources(0).nar_bytes() == 4096 && !assigned.cache_checked());
++    assert(model.clients.at(client->id).identity() == "oidc:dex:alice");
++    // A watcher that refuses its snapshot is not kept.
++    Sink stuck;
++    assert(!disp.watch([](const rpc::WatchEvent &) -> bool { return false; }, stuck.end()));
++    disp.unwatch(*watcher);
++}
++
++// A worker says Hello on a new session while the old one still looks open,
++// reporting two drvs no client waits for. Hello retires them first and adopts
++// them again under swapped ids. They are still running: not dropped.
++void testRehello()
++{
++    Metrics metrics("");
++    Dispatcher disp({.defaultSystem = std::string(x86), .lookupThreads = 0}, metrics);
++    auto const hello = [&](Dispatcher::Worker & session) -> void {
++        rpc::WorkerMsgs msgs;
++        auto * hel = msgs.add_msgs()->mutable_hello();
++        hel->set_addr("10.0.0.1:50051");
++        hel->add_systems(std::string(x86));
++        hel->set_max_jobs(4);
++        uint64_t assignId = 1;
++        for (auto const * path : {"aaaa-a.drv", "bbbb-b.drv"}) {
++            auto * run = hel->add_running();
++            run->set_drv_path(path);
++            run->set_assign_id(assignId++);
++        }
++        disp.workerMsgs(session, msgs);
++    };
++    auto const send = [](const rpc::SchedCmd &) -> bool { return true; };
++    Dispatcher::Worker first{.send = send, .abort = [] -> void {}};
++    Dispatcher::Worker second{.send = send, .abort = [] -> void {}};
++    hello(first);
++    Sink sink;
++    auto const watcher = disp.watch(sink.send(), sink.end());
++    assert(watcher);
++    Model model;
++    for (const auto & event : sink.take()) {
++        apply(model, event);
++    }
++    assert(model.live && model.drvs.size() == 2);
++    hello(second);
++    std::vector<std::string> kinds;
++    for (const auto & event : sink.take()) {
++        apply(model, event);
++        kinds.push_back(label(event));
++    }
++    assert((kinds == std::vector<std::string>{"worker", "aaaa-a.drv:CAUSE_ADOPTED", "bbbb-b.drv:CAUSE_ADOPTED"}));
++    assert(model.drvs.size() == 2);
++    for (const auto & [path, drv] : model.drvs) {
++        assert(drv.phase() == rpc::DrvState::PHASE_ASSIGNED && drv.worker_addr() == "10.0.0.1:50051");
++    }
++    disp.unwatch(*watcher);
++}
++
++void testRandom()
++{
++    for (unsigned seed = 1; seed <= 8; seed++) {
++        Sim(seed, true).run(1500);
++    }
++    // Without a watcher, other code paths run. A watcher that comes last
++    // still gets a snapshot that agrees with the scheduler.
++    for (unsigned seed = 11; seed <= 13; seed++) {
++        Sim(seed, false).run(1500);
++    }
++    for (const auto & [kind, times] : seen) {
++        std::cerr << "seen " << kind << " " << times << "\n";
++    }
++    for (auto const * kind :
++         {"CAUSE_WANTED", "CAUSE_FOLLOWERS", "CAUSE_ASSIGNED", "CAUSE_ADOPTED", "CAUSE_REQUEUED", "CAUSE_PLACEABILITY",
++          "unplaceable", "undeliverable", "BUILT", "FAILED", "CANCELLED", "DROPPED"}) {
++        assert(seen[kind] > 0);
++    }
++    for (auto const kind :
++         {rpc::WatchEvent::kWorker, rpc::WatchEvent::kClient, rpc::WatchEvent::kClientGone, rpc::WatchEvent::kCached}) {
++        assert(seen[std::to_string(kind)] > 0);
++    }
++}
++
++} // namespace
++// NOLINTEND(*-magic-numbers, *-avoid-unchecked-container-access, bugprone-unchecked-optional-access, readability-identifier-length, cert-msc32-c, cert-msc51-cpp, bugprone-random-generator-seed, misc-use-internal-linkage)
++
++auto main() -> int
++try {
++    testLifecycle();
++    testRehello();
++    testRandom();
++    return 0;
++} catch (std::exception & err) {
++    std::cerr << err.what() << "\n";
++    return 1;
++}
+diff --git a/tests/scheduler-test.cc b/tests/scheduler-test.cc
+index 96937fa..2dd3a7f 100644
+--- a/tests/scheduler-test.cc
++++ b/tests/scheduler-test.cc
+@@ -583,6 +583,47 @@ void testRunningFollowsTheWorker()
+     assert(stat().free == 0 && stat().running == 1);
+ }
+ 
++// What an entry keeps besides what placing it needs: whether the cache was
++// asked, where its inputs are, and when it was placed.
++void testEntryBookkeeping()
++{
++    Core shard;
++    std::vector<Assign> out;
++    auto const w0 = hello(shard, "w0", 4);
++    auto const w1 = hello(shard, "w1", 4);
++    shard.done(lease(shard, w0, "x.drv"), {{"/nix/store/x", 100}});
++    shard.done(lease(shard, w1, "y.drv"), {{"/nix/store/y", 200}, {"/nix/store/z", 300}});
++    std::vector<std::string_view> const inputs{"/nix/store/x", "/nix/store/y", "/nix/store/src", "/nix/store/z"};
++    // One Want the cache was asked about is enough.
++    shard.want(1, {.drvPath = "a.drv", .inputs = inputs, .system = "x", .features = {}, .cpHintMs = 0, .cacheChecked = true}, 0);
++    shard.want(2, {.drvPath = "a.drv", .inputs = inputs, .system = "x", .features = {}, .cpHintMs = 0}, 0);
++    shard.want(1, {.drvPath = "b.drv", .inputs = {}, .system = "x", .features = {}, .cpHintMs = 0}, 0);
++    shard.dispatch(out);
++    assert(out.size() == 2);
++    auto const drv = *shard.findDrv("a.drv");
++    const auto & ent = shard.entry(drv);
++    assert(ent && ent->cacheChecked && !shard.entry(*shard.findDrv("b.drv"))->cacheChecked);
++    // By who built them last, in the order the inputs name them. Nobody
++    // here built the source. w1 has more of them, so it builds a.drv.
++    assert(ent->worker == w1 && ent->sources.size() == 2);
++    assert(ent->sources[0].worker == w0 && ent->sources[0].paths == 1 && ent->sources[0].narBytes == 100);
++    assert(ent->sources[1].worker == w1 && ent->sources[1].paths == 2 && ent->sources[1].narBytes == 500);
++    // Placed once the Expect is out. A Hello that reports the same
++    // assignment keeps that time, another one makes it unknown.
++    assert(ent->assignMs == 0);
++    shard.markPlaced(drv, 1234);
++    std::vector<Core::Superseded> superseded;
++    auto const again = [&](uint64_t assignId) -> void {
++        shard.hello(
++            {.addr = "w1", .systems = {"x"}, .features = {}, .maxJobs = 4, .running = {{"a.drv", assignId}}},
++            superseded);
++    };
++    again(ent->assignId);
++    assert(shard.entry(drv)->assignMs == 1234 && shard.entry(drv)->sources.size() == 2);
++    again(ent->assignId + 100);
++    assert(shard.entry(drv)->assignMs == 0 && shard.entry(drv)->worker == w1);
++}
++
+ } // namespace
+ // NOLINTEND(*-magic-numbers, *-avoid-unchecked-container-access, bugprone-unchecked-optional-access, readability-identifier-length)
+ 
+@@ -612,6 +653,7 @@ try {
+     testPlaceabilityFlips();
+     testNoSlotsRunsNothing();
+     testStaleDoneAndUnknown();
++    testEntryBookkeeping();
+     return 0;
+ } catch (std::exception & err) {
+     std::cerr << err.what() << "\n";
+-- 
+2.56.0
+

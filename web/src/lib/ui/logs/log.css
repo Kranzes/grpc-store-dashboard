@@ -1,0 +1,121 @@
+/*
+ * The log's styles from the fixed table (#lib/logs/ansi.ts): the 16 ANSI
+ * colors as text, as tints with the text forced to --fg, and the SGR
+ * attributes. Exact colors come inline.
+ */
+.af0 {
+	color: var(--ansi-0);
+}
+.af1 {
+	color: var(--ansi-1);
+}
+.af2 {
+	color: var(--ansi-2);
+}
+.af3 {
+	color: var(--ansi-3);
+}
+.af4 {
+	color: var(--ansi-4);
+}
+.af5 {
+	color: var(--ansi-5);
+}
+.af6 {
+	color: var(--ansi-6);
+}
+.af7 {
+	color: var(--ansi-7);
+}
+.af8 {
+	color: var(--ansi-8);
+}
+.af9 {
+	color: var(--ansi-9);
+}
+.af10 {
+	color: var(--ansi-10);
+}
+.af11 {
+	color: var(--ansi-11);
+}
+.af12 {
+	color: var(--ansi-12);
+}
+.af13 {
+	color: var(--ansi-13);
+}
+.af14 {
+	color: var(--ansi-14);
+}
+.af15 {
+	color: var(--ansi-15);
+}
+.ab0 {
+	background: color-mix(in srgb, var(--ansi-0) 22%, transparent);
+}
+.ab1 {
+	background: color-mix(in srgb, var(--ansi-1) 22%, transparent);
+}
+.ab2 {
+	background: color-mix(in srgb, var(--ansi-2) 22%, transparent);
+}
+.ab3 {
+	background: color-mix(in srgb, var(--ansi-3) 22%, transparent);
+}
+.ab4 {
+	background: color-mix(in srgb, var(--ansi-4) 22%, transparent);
+}
+.ab5 {
+	background: color-mix(in srgb, var(--ansi-5) 22%, transparent);
+}
+.ab6 {
+	background: color-mix(in srgb, var(--ansi-6) 22%, transparent);
+}
+.ab7 {
+	background: color-mix(in srgb, var(--ansi-7) 22%, transparent);
+}
+.ab8 {
+	background: color-mix(in srgb, var(--ansi-8) 22%, transparent);
+}
+.ab9 {
+	background: color-mix(in srgb, var(--ansi-9) 22%, transparent);
+}
+.ab10 {
+	background: color-mix(in srgb, var(--ansi-10) 22%, transparent);
+}
+.ab11 {
+	background: color-mix(in srgb, var(--ansi-11) 22%, transparent);
+}
+.ab12 {
+	background: color-mix(in srgb, var(--ansi-12) 22%, transparent);
+}
+.ab13 {
+	background: color-mix(in srgb, var(--ansi-13) 22%, transparent);
+}
+.ab14 {
+	background: color-mix(in srgb, var(--ansi-14) 22%, transparent);
+}
+.ab15 {
+	background: color-mix(in srgb, var(--ansi-15) 22%, transparent);
+}
+/* Text on a tint is the foreground color, never a color on a color. */
+.abg {
+	color: var(--fg);
+}
+.adim {
+	color: var(--fg-muted);
+}
+.abold {
+	font-weight: 700;
+}
+.aital {
+	font-style: italic;
+}
+.aul {
+	text-decoration: underline;
+}
+/* A bidi control, shown as ⟨U+202E⟩. */
+.abidi {
+	color: var(--fg-muted);
+}

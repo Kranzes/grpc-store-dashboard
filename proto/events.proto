@@ -1,0 +1,422 @@
+syntax = "proto3";
+
+package nix.remote;
+
+// The scheduler's events: a read-only live view of the active scheduler,
+// for anything that follows a farm as it runs, such as a dashboard, a script
+// or `nix-grpc-daemon watch --json`.
+//
+// Watch sends a snapshot of the scheduler's state, then one event per change.
+// A snapshot starts with Reset and ends with SnapshotDone, and every event in
+// it carries Reset's seq. Each event after the snapshot has seq one higher
+// than the one before. A client that sees any other seq drops its state and
+// reconnects for a fresh snapshot. The server cancels a watcher that falls
+// too far behind instead of skipping events.
+//
+// Only the active scheduler serves Watch. A passive node answers UNAVAILABLE,
+// and the active node ends open streams with UNAVAILABLE when it steps down,
+// so clients reconnect through the balancer and reach the new leader. A
+// stream with a write still in flight is cancelled instead, so a client that
+// stopped reading cannot hold it open.
+//
+// A stream opened with a bearer token ends with UNAUTHENTICATED ("bearer
+// token expired") once the scheduler would refuse that token: one minute
+// after its exp, the clock skew the scheduler allows. The check runs with
+// each event, and Stats come once a second, so the end comes at most a
+// second later. The client renews the token and reconnects. A write still
+// in flight is cancelled here too. Streams of certificate callers do not
+// end this way.
+//
+// A failed build's DrvGone carries the end of its error text, up to 4 KiB,
+// which can hold whatever the build printed. A stream with more than 4 MiB
+// of it queued is cancelled like one that falls behind, and a WatchEvents
+// message stops after 1 MiB of it, so messages stay under gRPC's default
+// 4 MiB receive limit.
+//
+// Callers need the `watch` role or higher. For a bearer token that is an
+// --oidc-config rule with scopes ["watch"], not an OAuth scope. Anonymous
+// callers are refused even where the anonymous role would allow it, because
+// the stream names clients and derivations. A scheduler serves at most 64
+// streams, 8 per caller, and answers RESOURCE_EXHAUSTED beyond that.
+//
+// Kept self-contained (no imports) so clients can vendor this one file.
+service Events {
+  rpc Watch(WatchRequest) returns (stream WatchEvents);
+  // Builds that finished on a builder while this scheduler was active, newest
+  // first, in batches. Same role and anonymous rule as Watch. At most 4 calls
+  // per caller and 16 in all at once; RESOURCE_EXHAUSTED beyond that. A
+  // passive node answers UNAVAILABLE.
+  rpc RecentBuilds(RecentBuildsRequest) returns (stream RecentBuildsBatch);
+}
+
+message WatchRequest {}
+
+// The scheduler keeps two rings, both emptied when it becomes the active
+// scheduler: the last 10,000 builds that finished on a builder (BUILT,
+// FAILED, CANCELLED, and DROPPED after an assignment), without error text,
+// and the last 2,000 FAILED ones, with it.
+message RecentBuildsRequest {
+  // Only builds that finished before this, Unix ms. 0 = now.
+  uint64 before_ms = 1;
+  // At most this many, 0 = 256, capped at 1000; with with_error, capped at 256.
+  uint32 limit = 2;
+  // From the failures ring, which keeps failures longer than the builds ring.
+  bool failed_only = 3;
+  // Fill FinishedBuild.error. Only with failed_only.
+  bool with_error = 4;
+  // Only these derivations (base names, at most 16), the newest record of
+  // each, error included. before_ms, limit and failed_only are ignored.
+  repeated string drv_paths = 5;
+}
+
+message RecentBuildsBatch {
+  // At most 256 per batch.
+  repeated FinishedBuild builds = 1;
+  // Last batch only: the ring holds nothing older than the last row sent.
+  bool complete = 2;
+  // Last batch only: the oldest finish time the ring holds, 0 if empty.
+  uint64 oldest_ms = 3;
+}
+
+message FinishedBuild {
+  string drv_path = 1;
+  string system = 2;
+  string worker_addr = 3;
+  DrvGone.Outcome outcome = 4;
+  DrvGone.Status status = 5;
+  // FAILED, with with_error or drv_paths only: as DrvGone.error.
+  string error = 6;
+  uint64 assign_id = 7;
+  // 0 when unknown (adopted after a restart).
+  uint64 assigned_ms = 8;
+  // 0: the builder did not report it.
+  uint64 build_started_ms = 9;
+  uint64 finished_ms = 10;
+  // Identities of the clients that waited on it when it finished, at most 4.
+  repeated string requested_by = 11;
+}
+
+// Events are batched per stream message, like the scheduler's other streams.
+message WatchEvents {
+  repeated WatchEvent msgs = 1;
+}
+
+message WatchEvent {
+  uint64 seq = 1;
+  // When the event happened, Unix ms: the scheduler's wall clock at process
+  // start plus monotonic time since. It never goes backwards within one
+  // instance and does not follow later system clock steps. Every *_ms field
+  // uses this clock, except the build start and phase times that builders
+  // report.
+  uint64 time_ms = 2;
+  oneof event {
+    Reset reset = 3;
+    SnapshotDone snapshot_done = 4;
+    WorkerState worker = 5;
+    ClientState client = 6;
+    ClientGone client_gone = 7;
+    DrvState drv = 8;
+    DrvGone drv_gone = 9;
+    DrvCached cached = 10;
+    Stats stats = 11;
+  }
+}
+
+// First event of every snapshot: drop all state.
+message Reset {
+  // Random per scheduler process. seq restarts with every new instance.
+  string instance = 1;
+  // When this process last became the active scheduler, Unix ms. Counters
+  // and history start here.
+  uint64 serving_since_ms = 2;
+  // nix-grpc-store version of the scheduler.
+  string version = 3;
+  // The system the scheduler assumes for derivations that name none.
+  string default_system = 4;
+  // niks3 server the scheduler asks for cache hits. Empty without a cache.
+  string cache_url = 5;
+  // Cumulative counters sampled once a minute, oldest first, newest last,
+  // for "last N minutes" totals right after connecting. The current
+  // values arrive with the next Stats.
+  repeated CounterSample history = 6;
+  // The farm cache as builders list it among their substituters
+  // (--niks3-cache-url, reduced like WorkerState.substituters). Empty when
+  // the scheduler does not know it.
+  string cache_substituter_url = 7;
+}
+
+message SnapshotDone {}
+
+// A builder's session. Upsert keyed by addr, sent in the snapshot (connected
+// workers only), on Hello, Load and disconnect, and at most once a second
+// after a WorkerReport changed it. A worker that went away stays known with
+// up = false until it says Hello again.
+message WorkerState {
+  // The address the balancer reaches it at (its --advertise).
+  string addr = 1;
+  // Native system first, then extra platforms.
+  repeated string systems = 2;
+  repeated string features = 3;
+  uint32 max_jobs = 4;
+  bool up = 5;
+  // Stopping, low on disk or without its local nix-daemon. drain_reason
+  // says which when the builder reports it.
+  bool draining = 6;
+  enum DrainReason {
+    DRAIN_REASON_UNSPECIFIED = 0;
+    DRAIN_REASON_STOPPING = 1;
+    DRAIN_REASON_LOW_DISK = 2;
+    DRAIN_REASON_LOCAL_DAEMON = 3;
+  }
+  // While draining. UNSPECIFIED: the builder does not say.
+  DrainReason drain_reason = 7;
+  // nix-grpc-store version of the builder. Empty: the builder is older and
+  // reports no drain reason, disk, substituters or build status.
+  string version = 8;
+  // As the builder last reported them. Unset: never reported.
+  optional uint64 disk_free_bytes = 9;
+  optional uint64 disk_total_bytes = 10;
+  // --min-free, 0 = none.
+  uint64 min_free_bytes = 11;
+  // The builder's substituters in its order, then any others it reported
+  // traffic for, sorted by URL. Each URL is reduced to
+  // scheme://host[:port]/path, without user, password, query or fragment.
+  // Counts are cumulative since Reset.serving_since_ms: a client takes rates
+  // from the change between two events. Kept while the builder is down and
+  // across its reconnects.
+  repeated SubstituterTraffic substituters = 12;
+}
+
+message SubstituterTraffic {
+  string url = 1;
+  // NAR bytes copied from it.
+  uint64 nar_bytes = 2;
+  // Bytes received on the wire, http and https substituters only.
+  uint64 download_bytes = 3;
+  // NARs that arrived in full. One whose hash check failed after the last
+  // byte counts too: nothing the builder sees tells the two apart.
+  uint64 paths = 4;
+  // Substitutions that stopped before the whole NAR arrived.
+  uint64 failures = 5;
+}
+
+// One Schedule stream: a build client. Hook-mode builds open one per
+// derivation, so group clients by identity for display.
+message ClientState {
+  uint64 id = 1;
+  // Certificate CN, "oidc:<provider>:<sub>" for a bearer token, or "-" for
+  // an anonymous caller.
+  string identity = 2;
+  uint64 connected_ms = 3;
+}
+
+message ClientGone {
+  uint64 id = 1;
+}
+
+// A derivation the scheduler is tracking: queued or assigned. Upsert keyed by
+// drv_path. Removed by DrvGone. A CAUSE_PROGRESS update changes only
+// build_phase, build_started_ms and build_phase_started_ms, at most once a
+// second per derivation.
+message DrvState {
+  enum Phase {
+    PHASE_QUEUED = 0;
+    // No connected worker offers its system and features. Still queued.
+    PHASE_UNPLACEABLE = 1;
+    // Sent to a worker. Covers the client's upload, input fetching, the
+    // build and publishing outputs. The scheduler does not see a build
+    // start itself; builders that report it set build_started_ms.
+    PHASE_ASSIGNED = 2;
+  }
+  // What made the scheduler send this update.
+  enum Cause {
+    CAUSE_SNAPSHOT = 0;
+    // No entry existed: the first Want for it. `cache_checked` tells whether
+    // the cache was asked first and missed.
+    CAUSE_WANTED = 1;
+    // A Want for a drv already tracked (by another client, by the same
+    // client again, or its first Want after a worker's Hello reported it),
+    // or a client cancelled or left and the drv stays. An assigned drv stays
+    // with empty client_ids after its last client leaves, until its worker
+    // reports an outcome.
+    CAUSE_FOLLOWERS = 2;
+    CAUSE_ASSIGNED = 3;
+    // A worker's Hello reported it as running: after a scheduler restart,
+    // when a worker reconnects or says Hello again, or when it takes over a
+    // drv queued here or placed on another worker (superseded).
+    CAUSE_ADOPTED = 4;
+    // Back in the queue: given back, never claimed, or its worker
+    // disconnected or reconnected without it. `reason` says which. Also sent,
+    // with reason "the worker's stream broke", for a drv whose Expect could
+    // not be delivered, which was never shown as ASSIGNED. A drv another
+    // worker reports as running comes as CAUSE_ADOPTED.
+    CAUSE_REQUEUED = 5;
+    // `phase` switched between PHASE_QUEUED and PHASE_UNPLACEABLE.
+    CAUSE_PLACEABILITY = 6;
+    // The builder reported a new phase or the start of the build.
+    CAUSE_PROGRESS = 7;
+  }
+  string drv_path = 1; // base name, "<hash>-<name>.drv"
+  Phase phase = 2;
+  Cause cause = 3;
+  // Required system and features. Empty for a drv only known from a
+  // worker's Hello.
+  string system = 4;
+  repeated string features = 5;
+  // Schedule streams waiting for it.
+  repeated uint64 client_ids = 6;
+  // First Want, Unix ms. 0 when unknown (adopted after a restart).
+  uint64 queued_ms = 7;
+  // Remaining critical path the clients reported, ms. Higher goes first.
+  uint64 cp_hint_ms = 8;
+  // Number of input paths (sources and input drv outputs).
+  uint32 inputs = 9;
+  bool cache_checked = 10;
+  // UNPLACEABLE: why. REQUEUED: why it came back.
+  string reason = 11;
+
+  // ASSIGNED only.
+  string worker_addr = 12;
+  uint64 assign_id = 13;
+  uint64 assigned_ms = 14;
+  // Where the inputs are, from what the scheduler remembers about recent
+  // builds: one entry per worker that built some of them. Inputs built on the
+  // assigned worker are local. Inputs built elsewhere come through the cache.
+  // Inputs nobody here built (sources, uploads, older cache content) count in
+  // inputs_unknown.
+  repeated InputSource input_sources = 15;
+  uint32 inputs_unknown = 16;
+  // ASSIGNED only, as the builder last reported them. Empty and 0 until
+  // then, and from builders that do not report them. The scheduler sees the
+  // assignment; these say when the build started on the builder (Unix ms,
+  // the builder's clock), its last stdenv phase, and when that began. A
+  // derivation with a buildCommand, a NixOS test included, never sets a
+  // phase.
+  string build_phase = 17;
+  uint64 build_started_ms = 18;
+  uint64 build_phase_started_ms = 19;
+}
+
+message InputSource {
+  string worker_addr = 1;
+  uint32 paths = 2;
+  uint64 nar_bytes = 3;
+}
+
+// A derivation left the scheduler.
+message DrvGone {
+  enum Outcome {
+    BUILT = 0;
+    FAILED = 1;
+    // The worker reported the build as cancelled.
+    CANCELLED = 2;
+    // Nobody wants it any more: every client cancelled or left a queued drv,
+    // or its worker gave it back, went away or reconnected without it while
+    // no client was waiting.
+    DROPPED = 3;
+  }
+  string drv_path = 1;
+  Outcome outcome = 2;
+  // The worker it was assigned to, if any.
+  string worker_addr = 3;
+  // BUILT only. These have been published to the cache.
+  repeated Output outputs = 4;
+  // Same values as nix.remote.Done.Status, repeated to keep this file
+  // self-contained.
+  enum Status {
+    STATUS_UNSPECIFIED = 0;
+    STATUS_BUILT = 1;
+    STATUS_SUBSTITUTED = 2;
+    STATUS_ALREADY_VALID = 3;
+    STATUS_PERMANENT_FAILURE = 4;
+    STATUS_INPUT_REJECTED = 5;
+    STATUS_OUTPUT_REJECTED = 6;
+    STATUS_TRANSIENT_FAILURE = 7;
+    STATUS_CACHED_FAILURE = 8;
+    STATUS_TIMED_OUT = 9;
+    STATUS_MISC_FAILURE = 10;
+    STATUS_DEPENDENCY_FAILED = 11;
+    STATUS_LOG_LIMIT_EXCEEDED = 12;
+    STATUS_NOT_DETERMINISTIC = 13;
+    STATUS_NO_SUBSTITUTERS = 14;
+    // The builder or its nix-daemon failed before or while building, so
+    // Nix reported no result.
+    STATUS_WORKER_ERROR = 15;
+  }
+  // Nix's status: BUILT and FAILED, from builders that report it.
+  Status status = 5;
+  // FAILED only: the builder's error text, valid UTF-8 without control or
+  // bidi control characters, at most 4096 bytes: its first two lines,
+  // "[...]" and its end. Every watcher gets it. Empty when the builder sent
+  // none. It can hold whatever the build printed; common secret shapes are
+  // masked.
+  string error = 6;
+}
+
+message Output {
+  string path = 1;
+  uint64 nar_size = 2;
+}
+
+// A Want answered from the cache: all outputs were already there. The
+// scheduler keeps no entry for it.
+message DrvCached {
+  string drv_path = 1;
+  string system = 2;
+  uint64 client_id = 3;
+}
+
+// Once a second while anyone watches. Doubles as a heartbeat.
+message Stats {
+  Counters totals = 1;
+  // Per system and feature set, as in the nix_grpc_sched_system metric.
+  repeated SystemStats systems = 2;
+}
+
+// Monotonic since Reset.serving_since_ms. They restart from zero when this
+// process becomes the active scheduler again, while instance and seq carry
+// on.
+message Counters {
+  uint64 wanted = 1;     // new queue entries
+  uint64 cache_hits = 2; // Wants answered Cached, one DrvCached each
+  // Wants the cache was asked about and lacked. This counts every such Want,
+  // including a repeat Want for a drv already tracked and a Want refused
+  // for its system, which the events do not show one by one. Take miss
+  // rates from this counter.
+  uint64 cache_misses = 3;
+  uint64 assigned = 4;
+  uint64 built = 5;
+  uint64 failed = 6;
+  uint64 cancelled = 7;
+  uint64 dropped = 8;
+  uint64 requeued = 9;
+  // Sum of nar_size of BUILT outputs, i.e. bytes published to the cache.
+  uint64 published_bytes = 10;
+  // Sum of input_sources nar_bytes from workers other than the assigned
+  // one, at each assignment. An estimate of bytes fetched from the cache, not
+  // a bound either way: it leaves out inputs nobody here built, and counts an
+  // input again for every build that needs it, even once the worker has it.
+  uint64 fetched_bytes_estimate = 11;
+  // What builders reported downloading, summed over builders per
+  // substituter URL, sorted by URL. At most 64 URLs; the rest add up under
+  // "other".
+  repeated SubstituterTraffic substituters = 12;
+}
+
+message CounterSample {
+  uint64 time_ms = 1;
+  Counters counters = 2;
+}
+
+message SystemStats {
+  string system = 1;
+  // Sorted, comma-joined. Empty for none.
+  string features = 2;
+  // Keyed by what derivations require.
+  uint32 queued = 3;
+  uint32 unplaceable = 4;
+  // Keyed by what workers offer (their native system).
+  uint32 running = 5;
+  uint32 slots = 6;
+  uint32 free = 7;
+}

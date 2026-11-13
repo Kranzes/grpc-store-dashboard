@@ -1,0 +1,1298 @@
+Machine state will be reset. To keep it, pass --keep-machine-state
+[1m[32mstart all VLans[0m
+(finished: start all VLans, in 0.00 seconds)
+Test will time out and terminate in 3600.0 seconds
+[1m[32mrun the VM test script[0m
+additionally exposed symbols:
+    machine,
+    vlan1,
+    start_all, test_script, machines, machines_qemu, machines_nspawn, vlans, driver, log, os, create_machine, subtest, run_tests, join_all, retry, serial_stdout_off, serial_stdout_on, polling_condition, BaseMachine, QemuMachine, NspawnMachine, t, debug, dump_machine_ssh
+[1m[32mstart all VMs[0m
+machine: starting vm
+[2mmachine # Disk image does not exist, creating the virtualisation disk image...[0m
+machine: QEMU running (pid 46)
+[2mmachine # Formatting '/build/vm-state-machine/tmp.h5FmP93tQS', fmt=raw size=1073741824[0m
+[2mmachine # mke2fs 1.47.4 (6-Mar-2025)[0m
+[2mmachine # Discarding device blocks:      0/262144             done[0m
+[2mmachine # Creating filesystem with 262144 4k blocks and 65536 inodes[0m
+[2mmachine # Filesystem UUID: ef5cdfa2-307f-450b-8f2a-1341ff20a189[0m
+[2mmachine # Superblock backups stored on blocks:[0m
+[2mmachine # 	32768, 98304, 163840, 229376[0m
+[2mmachine # [0m
+[2mmachine # Allocating group tables: 0/8   done[0m
+[2mmachine # Writing inode tables: 0/8   done[0m
+[2mmachine # Creating journal (8192 blocks): done[0m
+[2mmachine # Writing superblocks and filesystem accounting information: 0/8   done[0m
+[2mmachine # [0m
+[2mmachine # Virtualisation disk image created.[0m
+(finished: start all VMs, in 0.21 seconds)
+[2mmachine # Starting virtiofs daemons...[0m
+[1m[32msubtest: Wait for OpenBao to start up[0m
+[2mmachine # [2026-10-27T18:39:03Z WARN  virtiofsd::passthrough] Failed to open file handle for the root node: Operation not permitted (os error 1)[0m
+machine: [1m[32mwaiting for unit openbao.service[0m
+[2mmachine # [2026-10-27T18:39:03Z WARN  virtiofsd::passthrough] File handles do not appear safe to use, disabling file handles altogether[0m
+machine: [1m[32mwaiting for the VM to finish booting[0m
+[2mmachine # [2026-10-27T18:39:03Z INFO  virtiofsd] Waiting for vhost-user socket connection...[0m
+[2mmachine # [2026-10-27T18:39:03Z WARN  virtiofsd::passthrough] Failed to open file handle for the root node: Operation not permitted (os error 1)[0m
+[2mmachine # [2026-10-27T18:39:03Z WARN  virtiofsd::passthrough] File handles do not appear safe to use, disabling file handles altogether[0m
+[2mmachine # [2026-10-27T18:39:03Z INFO  virtiofsd] Waiting for vhost-user socket connection...[0m
+[2mmachine # [2026-10-27T18:39:03Z WARN  virtiofsd::passthrough] Failed to open file handle for the root node: Operation not permitted (os error 1)[0m
+[2mmachine # [2026-10-27T18:39:03Z WARN  virtiofsd::passthrough] File handles do not appear safe to use, disabling file handles altogether[0m
+[2mmachine # [2026-10-27T18:39:03Z INFO  virtiofsd] Waiting for vhost-user socket connection...[0m
+[2mmachine # [2026-10-27T18:39:03Z INFO  virtiofsd] Client connected, servicing requests[0m
+[2mmachine # [2026-10-27T18:39:03Z INFO  virtiofsd] Client connected, servicing requests[0m
+[2mmachine # [2026-10-27T18:39:03Z INFO  virtiofsd] Client connected, servicing requests[0m
+[2mmachine # c[?7l[2J[0mSeaBIOS (version rel-1.17.0-0-gb52ca86e094d-prebuilt.qemu.org)[0m
+[2mmachine # [0m
+[2mmachine # [0m
+[2mmachine # iPXE (http://ipxe.org) 00:02.0 CA00 PCI2.10 PnP PMM+3EFCC730+3EF2C730 CA00[0m
+[2mmachine # Press Ctrl-B to configure iPXE (PCI 00:02.0)...[0m
+[2mmachine # [0m
+[2mmachine # [0m
+[2mmachine # [0m
+[2mmachine # [0m
+[2mmachine # iPXE (http://ipxe.org) 00:05.0 CB00 PCI2.10 PnP PMM 3EFCC730 3EF2C730 CB00[0m
+[2mmachine # Press Ctrl-B to configure iPXE (PCI 00:05.0)...[0m
+[2mmachine # [0m
+[2mmachine # [0m
+[2mmachine # Booting from ROM...[0m
+[2mmachine # Probing EDD (edd=off to disable)... oc[?7l[2J[0mk[    0.000000] Linux version 6.18.59 (nixbld@localhost) (gcc (GCC) 16.2.0, GNU ld (GNU Binutils) 2.46) #1-NixOS SMP PREEMPT_DYNAMIC @1793027368[0m
+[2mmachine # [    0.000000] Command line: console=ttyS0 console=tty0 panic=1 boot.panic_on_fail clocksource=acpi_pm root=fstab loglevel=7 net.ifnames=0 lsm=landlock,yama,bpf init=/nix/store/pi9v13mc5hb0sq32s22i76yp3yqxnflv-nixos-system-machine-test/init regInfo=/nix/.ro-store/83rl5cvx3brrxakbhx7b5ngza3m5b6kh-closure-info/registration console=ttyS0,115200n8 console=tty0[0m
+[2mmachine # [    0.000000] BIOS-provided physical RAM map:[0m
+[2mmachine # [    0.000000] BIOS-e820: [mem 0x0000000000000000-0x000000000009fbff] usable[0m
+[2mmachine # [    0.000000] BIOS-e820: [mem 0x000000000009fc00-0x000000000009ffff] reserved[0m
+[2mmachine # [    0.000000] BIOS-e820: [mem 0x00000000000f0000-0x00000000000fffff] reserved[0m
+[2mmachine # [    0.000000] BIOS-e820: [mem 0x0000000000100000-0x000000003ffd7fff] usable[0m
+[2mmachine # [    0.000000] BIOS-e820: [mem 0x000000003ffd8000-0x000000003fffffff] reserved[0m
+[2mmachine # [    0.000000] BIOS-e820: [mem 0x00000000b0000000-0x00000000bfffffff] reserved[0m
+[2mmachine # [    0.000000] BIOS-e820: [mem 0x00000000fed1c000-0x00000000fed1ffff] reserved[0m
+[2mmachine # [    0.000000] BIOS-e820: [mem 0x00000000feffc000-0x00000000feffffff] reserved[0m
+[2mmachine # [    0.000000] BIOS-e820: [mem 0x00000000fffc0000-0x00000000ffffffff] reserved[0m
+[2mmachine # [    0.000000] BIOS-e820: [mem 0x000000fd00000000-0x000000ffffffffff] reserved[0m
+[2mmachine # [    0.000000] NX (Execute Disable) protection: active[0m
+[2mmachine # [    0.000000] APIC: Static calls initialized[0m
+[2mmachine # [    0.000000] SMBIOS 2.8 present.[0m
+[2mmachine # [    0.000000] DMI: QEMU Standard PC (Q35 + ICH9, 2009), BIOS rel-1.17.0-0-gb52ca86e094d-prebuilt.qemu.org 04/01/2014[0m
+[2mmachine # [    0.000000] DMI: Memory slots populated: 1/1[0m
+[2mmachine # [    0.000000] Hypervisor detected: KVM[0m
+[2mmachine # [    0.000000] last_pfn = 0x3ffd8 max_arch_pfn = 0x10000000000[0m
+[2mmachine # [    0.000000] kvm-clock: Using msrs 4b564d01 and 4b564d00[0m
+[2mmachine # [    0.000001] kvm-clock: using sched offset of 649631011 cycles[0m
+[2mmachine # [    0.000003] clocksource: kvm-clock: mask: 0xffffffffffffffff max_cycles: 0x1cd42e4dffb, max_idle_ns: 881590591483 ns[0m
+[2mmachine # [    0.000006] tsc: Detected 2749.998 MHz processor[0m
+[2mmachine # [    0.000766] last_pfn = 0x3ffd8 max_arch_pfn = 0x10000000000[0m
+[2mmachine # [    0.000797] MTRR map: 4 entries (3 fixed + 1 variable; max 19), built from 8 variable MTRRs[0m
+[2mmachine # [    0.000800] x86/PAT: Configuration [0-7]: WB  WC  UC- UC  WB  WP  UC- WT[0m
+[2mmachine # [    0.003035] found SMP MP-table at [mem 0x000f5450-0x000f545f][0m
+[2mmachine # [    0.003053] Using GB pages for direct mapping[0m
+[2mmachine # [    0.003122] RAMDISK: [mem 0x3e436000-0x3ffcffff][0m
+[2mmachine # [    0.003129] ACPI: Early table checksum verification disabled[0m
+[2mmachine # [    0.003133] ACPI: RSDP 0x00000000000F5270 000014 (v00 BOCHS )[0m
+[2mmachine # [    0.003136] ACPI: RSDT 0x000000003FFE2422 000038 (v01 BOCHS  BXPC     00000001 BXPC 00000001)[0m
+[2mmachine # [    0.003141] ACPI: FACP 0x000000003FFE221A 0000F4 (v03 BOCHS  BXPC     00000001 BXPC 00000001)[0m
+[2mmachine # [    0.003148] ACPI: DSDT 0x000000003FFE0040 0021DA (v01 BOCHS  BXPC     00000001 BXPC 00000001)[0m
+[2mmachine # [    0.003150] ACPI: FACS 0x000000003FFE0000 000040[0m
+[2mmachine # [    0.003152] ACPI: APIC 0x000000003FFE230E 000078 (v03 BOCHS  BXPC     00000001 BXPC 00000001)[0m
+[2mmachine # [    0.003154] ACPI: HPET 0x000000003FFE2386 000038 (v01 BOCHS  BXPC     00000001 BXPC 00000001)[0m
+[2mmachine # [    0.003155] ACPI: MCFG 0x000000003FFE23BE 00003C (v01 BOCHS  BXPC     00000001 BXPC 00000001)[0m
+[2mmachine # [    0.003157] ACPI: WAET 0x000000003FFE23FA 000028 (v01 BOCHS  BXPC     00000001 BXPC 00000001)[0m
+[2mmachine # [    0.003158] ACPI: Reserving FACP table memory at [mem 0x3ffe221a-0x3ffe230d][0m
+[2mmachine # [    0.003159] ACPI: Reserving DSDT table memory at [mem 0x3ffe0040-0x3ffe2219][0m
+[2mmachine # [    0.003160] ACPI: Reserving FACS table memory at [mem 0x3ffe0000-0x3ffe003f][0m
+[2mmachine # [    0.003160] ACPI: Reserving APIC table memory at [mem 0x3ffe230e-0x3ffe2385][0m
+[2mmachine # [    0.003161] ACPI: Reserving HPET table memory at [mem 0x3ffe2386-0x3ffe23bd][0m
+[2mmachine # [    0.003161] ACPI: Reserving MCFG table memory at [mem 0x3ffe23be-0x3ffe23f9][0m
+[2mmachine # [    0.003162] ACPI: Reserving WAET table memory at [mem 0x3ffe23fa-0x3ffe2421][0m
+[2mmachine # [    0.003599] No NUMA configuration found[0m
+[2mmachine # [    0.003600] Faking a node at [mem 0x0000000000000000-0x000000003ffd7fff][0m
+[2mmachine # [    0.003604] NODE_DATA(0) allocated [mem 0x3ffd2780-0x3ffd7cff][0m
+[2mmachine # [    0.005900] Zone ranges:[0m
+[2mmachine # [    0.005901]   DMA      [mem 0x0000000000001000-0x0000000000ffffff][0m
+[2mmachine # [    0.005903]   DMA32    [mem 0x0000000001000000-0x000000003ffd7fff][0m
+[2mmachine # [    0.005905]   Normal   empty[0m
+[2mmachine # [    0.005906]   Device   empty[0m
+[2mmachine # [    0.005906] Movable zone start for each node[0m
+[2mmachine # [    0.005907] Early memory node ranges[0m
+[2mmachine # [    0.005907]   node   0: [mem 0x0000000000001000-0x000000000009efff][0m
+[2mmachine # [    0.005909]   node   0: [mem 0x0000000000100000-0x000000003ffd7fff][0m
+[2mmachine # [    0.005910] Initmem setup node 0 [mem 0x0000000000001000-0x000000003ffd7fff][0m
+[2mmachine # [    0.005965] On node 0, zone DMA: 1 pages in unavailable ranges[0m
+[2mmachine # [    0.006216] On node 0, zone DMA: 97 pages in unavailable ranges[0m
+[2mmachine # [    0.024444] On node 0, zone DMA32: 40 pages in unavailable ranges[0m
+[2mmachine # [    0.025423] ACPI: PM-Timer IO Port: 0x608[0m
+[2mmachine # [    0.025438] ACPI: LAPIC_NMI (acpi_id[0xff] dfl dfl lint[0x1])[0m
+[2mmachine # [    0.025465] IOAPIC[0]: apic_id 0, version 17, address 0xfec00000, GSI 0-23[0m
+[2mmachine # [    0.025467] ACPI: INT_SRC_OVR (bus 0 bus_irq 0 global_irq 2 dfl dfl)[0m
+[2mmachine # [    0.025469] ACPI: INT_SRC_OVR (bus 0 bus_irq 5 global_irq 5 high level)[0m
+[2mmachine # [    0.025470] ACPI: INT_SRC_OVR (bus 0 bus_irq 9 global_irq 9 high level)[0m
+[2mmachine # [    0.025471] ACPI: INT_SRC_OVR (bus 0 bus_irq 10 global_irq 10 high level)[0m
+[2mmachine # [    0.025472] ACPI: INT_SRC_OVR (bus 0 bus_irq 11 global_irq 11 high level)[0m
+[2mmachine # [    0.025474] ACPI: Using ACPI (MADT) for SMP configuration information[0m
+[2mmachine # [    0.025475] ACPI: HPET id: 0x8086a201 base: 0xfed00000[0m
+[2mmachine # [    0.025481] TSC deadline timer available[0m
+[2mmachine # [    0.025486] CPU topo: Max. logical packages:   1[0m
+[2mmachine # [    0.025486] CPU topo: Max. logical dies:       1[0m
+[2mmachine # [    0.025487] CPU topo: Max. dies per package:   1[0m
+[2mmachine # [    0.025490] CPU topo: Max. threads per core:   1[0m
+[2mmachine # [    0.025491] CPU topo: Num. cores per package:     1[0m
+[2mmachine # [    0.025491] CPU topo: Num. threads per package:   1[0m
+[2mmachine # [    0.025491] CPU topo: Allowing 1 present CPUs plus 0 hotplug CPUs[0m
+[2mmachine # [    0.025514] kvm-guest: APIC: eoi() replaced with kvm_guest_apic_eoi_write()[0m
+[2mmachine # [    0.025550] PM: hibernation: Registered nosave memory: [mem 0x00000000-0x00000fff][0m
+[2mmachine # [    0.025551] PM: hibernation: Registered nosave memory: [mem 0x0009f000-0x000fffff][0m
+[2mmachine # [    0.025553] [mem 0x40000000-0xafffffff] available for PCI devices[0m
+[2mmachine # [    0.025555] Booting paravirtualized kernel on KVM[0m
+[2mmachine # [    0.025559] clocksource: refined-jiffies: mask: 0xffffffff max_cycles: 0xffffffff, max_idle_ns: 1910969940391419 ns[0m
+[2mmachine # [    0.030225] setup_percpu: NR_CPUS:512 nr_cpumask_bits:1 nr_cpu_ids:1 nr_node_ids:1[0m
+[2mmachine # [    0.032313] percpu: Embedded 98 pages/cpu s278528 r8192 d114688 u2097152[0m
+[2mmachine # [    0.032354] kvm-guest: PV spinlocks disabled, single CPU[0m
+[2mmachine # [    0.032355] Kernel command line: console=ttyS0 console=tty0 panic=1 boot.panic_on_fail clocksource=acpi_pm root=fstab loglevel=7 net.ifnames=0 lsm=landlock,yama,bpf init=/nix/store/pi9v13mc5hb0sq32s22i76yp3yqxnflv-nixos-system-machine-test/init regInfo=/nix/.ro-store/83rl5cvx3brrxakbhx7b5ngza3m5b6kh-closure-info/registration console=ttyS0,115200n8 console=tty0[0m
+[2mmachine # [    0.032445] Unknown kernel command line parameters "regInfo=/nix/.ro-store/83rl5cvx3brrxakbhx7b5ngza3m5b6kh-closure-info/registration", will be passed to user space.[0m
+[2mmachine # [    0.032458] random: crng init done[0m
+[2mmachine # [    0.032459] printk: log buffer data + meta data: 1048576 + 3670016 = 4718592 bytes[0m
+[2mmachine # [    0.032481] Dentry cache hash table entries: 131072 (order: 8, 1048576 bytes, linear)[0m
+[2mmachine # [    0.032495] Inode-cache hash table entries: 65536 (order: 7, 524288 bytes, linear)[0m
+[2mmachine # [    0.032528] Fallback order for Node 0: 0[0m
+[2mmachine # [    0.032531] Built 1 zonelists, mobility grouping on.  Total pages: 262006[0m
+[2mmachine # [    0.032532] Policy zone: DMA32[0m
+[2mmachine # [    0.034917] mem auto-init: stack:all(zero), heap alloc:on, heap free:off[0m
+[2mmachine # [    0.037636] SLUB: HWalign=64, Order=0-3, MinObjects=0, CPUs=1, Nodes=1[0m
+[2mmachine # [    0.040108] allocated 2097152 bytes of page_ext[0m
+[2mmachine # [    0.050895] ftrace: allocating 48996 entries in 192 pages[0m
+[2mmachine # [    0.050898] ftrace: allocated 192 pages with 2 groups[0m
+[2mmachine # [    0.051783] Dynamic Preempt: lazy[0m
+[2mmachine # [    0.051908] rcu: Preemptible hierarchical RCU implementation.[0m
+[2mmachine # [    0.051909] rcu: 	RCU event tracing is enabled.[0m
+[2mmachine # [    0.051909] rcu: 	RCU restricting CPUs from NR_CPUS=512 to nr_cpu_ids=1.[0m
+[2mmachine # [    0.051911] 	Trampoline variant of Tasks RCU enabled.[0m
+[2mmachine # [    0.051911] 	Rude variant of Tasks RCU enabled.[0m
+[2mmachine # [    0.051912] 	Tracing variant of Tasks RCU enabled.[0m
+[2mmachine # [    0.051912] rcu: RCU calculated value of scheduler-enlistment delay is 100 jiffies.[0m
+[2mmachine # [    0.051913] rcu: Adjusting geometry for rcu_fanout_leaf=16, nr_cpu_ids=1[0m
+[2mmachine # [    0.051923] RCU Tasks: Setting shift to 0 and lim to 1 rcu_task_cb_adjust=1 rcu_task_cpu_ids=1.[0m
+[2mmachine # [    0.051924] RCU Tasks Rude: Setting shift to 0 and lim to 1 rcu_task_cb_adjust=1 rcu_task_cpu_ids=1.[0m
+[2mmachine # [    0.051925] RCU Tasks Trace: Setting shift to 0 and lim to 1 rcu_task_cb_adjust=1 rcu_task_cpu_ids=1.[0m
+[2mmachine # [    0.056360] NR_IRQS: 33024, nr_irqs: 256, preallocated irqs: 16[0m
+[2mmachine # [    0.056640] rcu: srcu_init: Setting srcu_struct sizes based on contention.[0m
+[2mmachine # [    0.056647] clocksource: jiffies: mask: 0xffffffff max_cycles: 0xffffffff, max_idle_ns: 1911260446275000 ns[0m
+[2mmachine # [    0.056778] kfence: initialized - using 2097152 bytes for 255 objects at 0x(____ptrval____)-0x(____ptrval____)[0m
+[2mmachine # [    0.063619] Console: colour VGA+ 80x25[0m
+[2mmachine # [    0.063623] printk: legacy console [tty0] enabled[0m
+[2mmachine # [    0.103072] printk: legacy console [ttyS0] enabled[0m
+[2mmachine # [    0.277379] ACPI: Core revision 20250807[0m
+[2mmachine # [    0.278759] clocksource: hpet: mask: 0xffffffff max_cycles: 0xffffffff, max_idle_ns: 19112604467 ns[0m
+[2mmachine # [    0.281263] APIC: Switch to symmetric I/O mode setup[0m
+[2mmachine # [    0.282816] x2apic enabled[0m
+[2mmachine # [    0.283898] APIC: Switched APIC routing to: physical x2apic[0m
+[2mmachine # [    0.286451] ..TIMER: vector=0x30 apic1=0 pin1=2 apic2=-1 pin2=-1[0m
+[2mmachine # [    0.288035] clocksource: tsc-early: mask: 0xffffffffffffffff max_cycles: 0x27a3bdae5c8, max_idle_ns: 440795216753 ns[0m
+[2mmachine # [    0.290762] Calibrating delay loop (skipped) preset value.. 5499.99 BogoMIPS (lpj=2749998)[0m
+[2mmachine # [    0.291856] x86/cpu: User Mode Instruction Prevention (UMIP) activated[0m
+[2mmachine # [    0.293905] Last level iTLB entries: 4KB 512, 2MB 255, 4MB 127[0m
+[2mmachine # [    0.294761] Last level dTLB entries: 4KB 512, 2MB 255, 4MB 127, 1GB 0[0m
+[2mmachine # [    0.295765] mitigations: Enabled attack vectors: user_kernel, user_user, guest_host, guest_guest, SMT mitigations: auto[0m
+[2mmachine # [    0.297762] Speculative Store Bypass: Mitigation: Speculative Store Bypass disabled via prctl[0m
+[2mmachine # [    0.299761] Spectre V2 : Mitigation: Enhanced / Automatic IBRS[0m
+[2mmachine # [    0.300761] Speculative Return Stack Overflow: Mitigation: Safe RET[0m
+[2mmachine # [    0.301761] Spectre V1 : Mitigation: usercopy/swapgs barriers and __user pointer sanitization[0m
+[2mmachine # [    0.302771] Spectre V2 : Enabling IBPB for BPF[0m
+[2mmachine # [    0.304764] Spectre V2 : mitigation: Enabling conditional Indirect Branch Prediction Barrier[0m
+[2mmachine # [    0.305761] active return thunk: srso_alias_return_thunk[0m
+[2mmachine # [    0.307785] x86/fpu: Supporting XSAVE feature 0x001: 'x87 floating point registers'[0m
+[2mmachine # [    0.308761] x86/fpu: Supporting XSAVE feature 0x002: 'SSE registers'[0m
+[2mmachine # [    0.309760] x86/fpu: Supporting XSAVE feature 0x004: 'AVX registers'[0m
+[2mmachine # [    0.311760] x86/fpu: Supporting XSAVE feature 0x020: 'AVX-512 opmask'[0m
+[2mmachine # [    0.312761] x86/fpu: Supporting XSAVE feature 0x040: 'AVX-512 Hi256'[0m
+[2mmachine # [    0.313760] x86/fpu: Supporting XSAVE feature 0x080: 'AVX-512 ZMM_Hi256'[0m
+[2mmachine # [    0.315760] x86/fpu: Supporting XSAVE feature 0x200: 'Protection Keys User registers'[0m
+[2mmachine # [    0.316761] x86/fpu: Supporting XSAVE feature 0x800: 'Control-flow User registers'[0m
+[2mmachine # [    0.317761] x86/fpu: Supporting XSAVE feature 0x1000: 'Control-flow Kernel registers (KVM only)'[0m
+[2mmachine # [    0.318761] x86/fpu: xstate_offset[2]:  576, xstate_sizes[2]:  256[0m
+[2mmachine # [    0.319761] x86/fpu: xstate_offset[5]:  832, xstate_sizes[5]:   64[0m
+[2mmachine # [    0.320761] x86/fpu: xstate_offset[6]:  896, xstate_sizes[6]:  512[0m
+[2mmachine # [    0.322760] x86/fpu: xstate_offset[7]: 1408, xstate_sizes[7]: 1024[0m
+[2mmachine # [    0.323761] x86/fpu: xstate_offset[9]: 2432, xstate_sizes[9]:    8[0m
+[2mmachine # [    0.324761] x86/fpu: xstate_offset[11]: 2440, xstate_sizes[11]:   16[0m
+[2mmachine # [    0.326761] x86/fpu: xstate_offset[12]: 2456, xstate_sizes[12]:   24[0m
+[2mmachine # [    0.327761] x86/fpu: Enabled xstate features 0x1ae7, context size is 2480 bytes, using 'compacted' format.[0m
+[2mmachine # [    0.361602] Freeing SMP alternatives memory: 48K[0m
+[2mmachine # [    0.362763] pid_max: default: 32768 minimum: 301[0m
+[2mmachine # [    0.363858] LSM: initializing lsm=lockdown,capability,landlock,yama,bpf,ima[0m
+[2mmachine # [    0.364869] landlock: Up and running.[0m
+[2mmachine # [    0.365761] Yama: becoming mindful.[0m
+[2mmachine # [    0.366990] LSM support for eBPF active[0m
+[2mmachine # [    0.367860] Mount-cache hash table entries: 2048 (order: 2, 16384 bytes, linear)[0m
+[2mmachine # [    0.369787] Mountpoint-cache hash table entries: 2048 (order: 2, 16384 bytes, linear)[0m
+[2mmachine # [    0.373456] smpboot: CPU0: AMD EPYC 9454P 48-Core Processor (family: 0x19, model: 0x11, stepping: 0x1)[0m
+[2mmachine # [    0.374279] Performance Events: Fam17h+ core perfctr, AMD PMU driver.[0m
+[2mmachine # [    0.374765] ... version:                   2[0m
+[2mmachine # [    0.375763] ... bit width:                 48[0m
+[2mmachine # [    0.376822] ... generic counters:          6[0m
+[2mmachine # [    0.377762] ... generic bitmap:            000000000000003f[0m
+[2mmachine # [    0.378762] ... fixed-purpose counters:    0[0m
+[2mmachine # [    0.379763] ... fixed-purpose bitmap:      0000000000000000[0m
+[2mmachine # [    0.380763] ... value mask:                0000ffffffffffff[0m
+[2mmachine # [    0.381762] ... max period:                00007fffffffffff[0m
+[2mmachine # [    0.382762] ... global_ctrl mask:          000000000000003f[0m
+[2mmachine # [    0.383893] signal: max sigframe size: 3376[0m
+[2mmachine # [    0.384856] rcu: Hierarchical SRCU implementation.[0m
+[2mmachine # [    0.385767] rcu: 	Max phase no-delay instances is 400.[0m
+[2mmachine # [    0.390931] smp: Bringing up secondary CPUs ...[0m
+[2mmachine # [    0.391780] smp: Brought up 1 node, 1 CPU[0m
+[2mmachine # [    0.392765] smpboot: Total of 1 processors activated (5499.99 BogoMIPS)[0m
+[2mmachine # [    0.393970] Memory: 935736K/1048024K available (18190K kernel code, 5432K rwdata, 13716K rodata, 6720K init, 3992K bss, 104928K reserved, 0K cma-reserved)[0m
+[2mmachine # [    0.395016] devtmpfs: initialized[0m
+[2mmachine # [    0.395988] x86/mm: Memory block size: 128MB[0m
+[2mmachine # [    0.397716] posixtimers hash table entries: 512 (order: 1, 8192 bytes, linear)[0m
+[2mmachine # [    0.398800] futex hash table entries: 256 (16384 bytes on 1 NUMA nodes, total 16 KiB, linear).[0m
+[2mmachine # [    0.399870] pinctrl core: initialized pinctrl subsystem[0m
+[2mmachine # [    0.401127] PM: RTC time: 18:39:04, date: 2026-10-27[0m
+[2mmachine # [    0.404358] NET: Registered PF_NETLINK/PF_ROUTE protocol family[0m
+[2mmachine # [    0.405132] DMA: preallocated 128 KiB GFP_KERNEL pool for atomic allocations[0m
+[2mmachine # [    0.405798] DMA: preallocated 128 KiB GFP_KERNEL|GFP_DMA pool for atomic allocations[0m
+[2mmachine # [    0.406915] DMA: preallocated 128 KiB GFP_KERNEL|GFP_DMA32 pool for atomic allocations[0m
+[2mmachine # [    0.407779] audit: initializing netlink subsys (disabled)[0m
+[2mmachine # [    0.409038] thermal_sys: Registered thermal governor 'fair_share'[0m
+[2mmachine # [    0.409040] thermal_sys: Registered thermal governor 'bang_bang'[0m
+[2mmachine # [    0.409766] audit: type=2000 audit(1793126344.225:1): state=initialized audit_enabled=0 res=1[0m
+[2mmachine # [    0.411766] thermal_sys: Registered thermal governor 'step_wise'[0m
+[2mmachine # [    0.411768] thermal_sys: Registered thermal governor 'user_space'[0m
+[2mmachine # [    0.412763] thermal_sys: Registered thermal governor 'power_allocator'[0m
+[2mmachine # [    0.413786] cpuidle: using governor menu[0m
+[2mmachine # [    0.416864] acpiphp: ACPI Hot Plug PCI Controller Driver version: 0.5[0m
+[2mmachine # [    0.418071] PCI: ECAM [mem 0xb0000000-0xbfffffff] (base 0xb0000000) for domain 0000 [bus 00-ff][0m
+[2mmachine # [    0.418766] PCI: ECAM [mem 0xb0000000-0xbfffffff] reserved as E820 entry[0m
+[2mmachine # [    0.419777] PCI: Using configuration type 1 for base access[0m
+[2mmachine # [    0.421013] kprobes: kprobe jump-optimization is enabled. All kprobes are optimized if possible.[0m
+[2mmachine # [    0.427783] HugeTLB: registered 1.00 GiB page size, pre-allocated 0 pages[0m
+[2mmachine # [    0.428763] HugeTLB: 16380 KiB vmemmap can be freed for a 1.00 GiB page[0m
+[2mmachine # [    0.433762] HugeTLB: registered 2.00 MiB page size, pre-allocated 0 pages[0m
+[2mmachine # [    0.434763] HugeTLB: 28 KiB vmemmap can be freed for a 2.00 MiB page[0m
+[2mmachine # [    0.446010] ACPI: Added _OSI(Module Device)[0m
+[2mmachine # [    0.446763] ACPI: Added _OSI(Processor Device)[0m
+[2mmachine # [    0.448670] ACPI: Added _OSI(Processor Aggregator Device)[0m
+[2mmachine # [    0.454324] ACPI: 1 ACPI AML tables successfully acquired and loaded[0m
+[2mmachine # [    0.460190] ACPI: Interpreter enabled[0m
+[2mmachine # [    0.460781] ACPI: PM: (supports S0 S3 S4 S5)[0m
+[2mmachine # [    0.463764] ACPI: Using IOAPIC for interrupt routing[0m
+[2mmachine # [    0.464817] PCI: Using host bridge windows from ACPI; if necessary, use "pci=nocrs" and report a bug[0m
+[2mmachine # [    0.467230] PCI: Using E820 reservations for host bridge windows[0m
+[2mmachine # [    0.467938] ACPI: Enabled 2 GPEs in block 00 to 3F[0m
+[2mmachine # [    0.473106] ACPI: PCI Root Bridge [PCI0] (domain 0000 [bus 00-ff])[0m
+[2mmachine # [    0.473769] acpi PNP0A08:00: _OSC: OS supports [ExtendedConfig ASPM ClockPM Segments MSI HPX-Type3][0m
+[2mmachine # [    0.474856] acpi PNP0A08:00: _OSC: platform does not support [PCIeHotplug LTR][0m
+[2mmachine # [    0.475931] acpi PNP0A08:00: _OSC: OS now controls [PME AER PCIeCapability][0m
+[2mmachine # [    0.477369] PCI host bridge to bus 0000:00[0m
+[2mmachine # [    0.478772] pci_bus 0000:00: root bus resource [io  0x0000-0x0cf7 window][0m
+[2mmachine # [    0.479765] pci_bus 0000:00: root bus resource [io  0x0d00-0xffff window][0m
+[2mmachine # [    0.480765] pci_bus 0000:00: root bus resource [mem 0x000a0000-0x000bffff window][0m
+[2mmachine # [    0.481765] pci_bus 0000:00: root bus resource [mem 0x40000000-0xafffffff window][0m
+[2mmachine # [    0.482765] pci_bus 0000:00: root bus resource [mem 0xc0000000-0xfebfffff window][0m
+[2mmachine # [    0.483764] pci_bus 0000:00: root bus resource [mem 0x100000000-0x8ffffffff window][0m
+[2mmachine # [    0.484863] pci_bus 0000:00: root bus resource [bus 00-ff][0m
+[2mmachine # [    0.485906] pci 0000:00:00.0: [8086:29c0] type 00 class 0x060000 conventional PCI endpoint[0m
+[2mmachine # [    0.487651] pci 0000:00:01.0: [1234:1111] type 00 class 0x030000 conventional PCI endpoint[0m
+[2mmachine # [    0.490829] pci 0000:00:01.0: BAR 0 [mem 0xfd000000-0xfdffffff pref][0m
+[2mmachine # [    0.491787] pci 0000:00:01.0: BAR 2 [mem 0xfebd0000-0xfebd0fff][0m
+[2mmachine # [    0.492810] pci 0000:00:01.0: ROM [mem 0xfebc0000-0xfebcffff pref][0m
+[2mmachine # [    0.493960] pci 0000:00:01.0: Video device with shadowed ROM at [mem 0x000c0000-0x000dffff][0m
+[2mmachine # [    0.495702] pci 0000:00:02.0: [1af4:1000] type 00 class 0x020000 conventional PCI endpoint[0m
+[2mmachine # [    0.498776] pci 0000:00:02.0: BAR 0 [io  0xc100-0xc11f][0m
+[2mmachine # [    0.499776] pci 0000:00:02.0: BAR 1 [mem 0xfebd1000-0xfebd1fff][0m
+[2mmachine # [    0.500810] pci 0000:00:02.0: BAR 4 [mem 0xfe000000-0xfe003fff 64bit pref][0m
+[2mmachine # [    0.501776] pci 0000:00:02.0: ROM [mem 0xfeb40000-0xfeb7ffff pref][0m
+[2mmachine # [    0.503861] pci 0000:00:03.0: [1af4:1005] type 00 class 0x00ff00 conventional PCI endpoint[0m
+[2mmachine # [    0.505775] pci 0000:00:03.0: BAR 0 [io  0xc120-0xc13f][0m
+[2mmachine # [    0.506778] pci 0000:00:03.0: BAR 1 [mem 0xfebd2000-0xfebd2fff][0m
+[2mmachine # [    0.507809] pci 0000:00:03.0: BAR 4 [mem 0xfe004000-0xfe007fff 64bit pref][0m
+[2mmachine # [    0.509897] pci 0000:00:04.0: [1af4:1001] type 00 class 0x010000 conventional PCI endpoint[0m
+[2mmachine # [    0.512510] pci 0000:00:04.0: BAR 0 [io  0xc000-0xc07f][0m
+[2mmachine # [    0.513776] pci 0000:00:04.0: BAR 1 [mem 0xfebd3000-0xfebd3fff][0m
+[2mmachine # [    0.514811] pci 0000:00:04.0: BAR 4 [mem 0xfe008000-0xfe00bfff 64bit pref][0m
+[2mmachine # [    0.516875] pci 0000:00:05.0: [1af4:1000] type 00 class 0x020000 conventional PCI endpoint[0m
+[2mmachine # [    0.518776] pci 0000:00:05.0: BAR 0 [io  0xc140-0xc15f][0m
+[2mmachine # [    0.519776] pci 0000:00:05.0: BAR 1 [mem 0xfebd4000-0xfebd4fff][0m
+[2mmachine # [    0.520810] pci 0000:00:05.0: BAR 4 [mem 0xfe00c000-0xfe00ffff 64bit pref][0m
+[2mmachine # [    0.521776] pci 0000:00:05.0: ROM [mem 0xfeb80000-0xfebbffff pref][0m
+[2mmachine # [    0.523871] pci 0000:00:06.0: [1af4:1052] type 00 class 0x090000 conventional PCI endpoint[0m
+[2mmachine # [    0.525793] pci 0000:00:06.0: BAR 1 [mem 0xfebd5000-0xfebd5fff][0m
+[2mmachine # [    0.526811] pci 0000:00:06.0: BAR 4 [mem 0xfe010000-0xfe013fff 64bit pref][0m
+[2mmachine # [    0.529071] pci 0000:00:07.0: [1af4:105a] type 00 class 0x018000 conventional PCI endpoint[0m
+[2mmachine # [    0.530787] pci 0000:00:07.0: BAR 1 [mem 0xfebd6000-0xfebd6fff][0m
+[2mmachine # [    0.531810] pci 0000:00:07.0: BAR 4 [mem 0xfe014000-0xfe017fff 64bit pref][0m
+[2mmachine # [    0.533902] pci 0000:00:08.0: [1af4:105a] type 00 class 0x018000 conventional PCI endpoint[0m
+[2mmachine # [    0.535787] pci 0000:00:08.0: BAR 1 [mem 0xfebd7000-0xfebd7fff][0m
+[2mmachine # [    0.536810] pci 0000:00:08.0: BAR 4 [mem 0xfe018000-0xfe01bfff 64bit pref][0m
+[2mmachine # [    0.538871] pci 0000:00:09.0: [1af4:105a] type 00 class 0x018000 conventional PCI endpoint[0m
+[2mmachine # [    0.540788] pci 0000:00:09.0: BAR 1 [mem 0xfebd8000-0xfebd8fff][0m
+[2mmachine # [    0.541811] pci 0000:00:09.0: BAR 4 [mem 0xfe01c000-0xfe01ffff 64bit pref][0m
+[2mmachine # [    0.543874] pci 0000:00:0a.0: [1af4:1003] type 00 class 0x078000 conventional PCI endpoint[0m
+[2mmachine # [    0.545794] pci 0000:00:0a.0: BAR 0 [io  0xc080-0xc0bf][0m
+[2mmachine # [    0.546776] pci 0000:00:0a.0: BAR 1 [mem 0xfebd9000-0xfebd9fff][0m
+[2mmachine # [    0.547810] pci 0000:00:0a.0: BAR 4 [mem 0xfe020000-0xfe023fff 64bit pref][0m
+[2mmachine # [    0.549885] pci 0000:00:0b.0: [1af4:1005] type 00 class 0x00ff00 conventional PCI endpoint[0m
+[2mmachine # [    0.551809] pci 0000:00:0b.0: BAR 0 [io  0xc160-0xc17f][0m
+[2mmachine # [    0.552776] pci 0000:00:0b.0: BAR 1 [mem 0xfebda000-0xfebdafff][0m
+[2mmachine # [    0.553810] pci 0000:00:0b.0: BAR 4 [mem 0xfe024000-0xfe027fff 64bit pref][0m
+[2mmachine # [    0.555942] pci 0000:00:1d.0: [8086:2934] type 00 class 0x0c0300 conventional PCI endpoint[0m
+[2mmachine # [    0.557642] pci 0000:00:1d.0: BAR 4 [io  0xc180-0xc19f][0m
+[2mmachine # [    0.559144] pci 0000:00:1d.1: [8086:2935] type 00 class 0x0c0300 conventional PCI endpoint[0m
+[2mmachine # [    0.561634] pci 0000:00:1d.1: BAR 4 [io  0xc1a0-0xc1bf][0m
+[2mmachine # [    0.563114] pci 0000:00:1d.2: [8086:2936] type 00 class 0x0c0300 conventional PCI endpoint[0m
+[2mmachine # [    0.564662] pci 0000:00:1d.2: BAR 4 [io  0xc1c0-0xc1df][0m
+[2mmachine # [    0.566150] pci 0000:00:1d.7: [8086:293a] type 00 class 0x0c0320 conventional PCI endpoint[0m
+[2mmachine # [    0.567519] pci 0000:00:1d.7: BAR 0 [mem 0xfebdb000-0xfebdbfff][0m
+[2mmachine # [    0.569180] pci 0000:00:1f.0: [8086:2918] type 00 class 0x060100 conventional PCI endpoint[0m
+[2mmachine # [    0.570361] pci 0000:00:1f.0: quirk: [io  0x0600-0x067f] claimed by ICH6 ACPI/GPIO/TCO[0m
+[2mmachine # [    0.571185] pci 0000:00:1f.2: [8086:2922] type 00 class 0x010601 conventional PCI endpoint[0m
+[2mmachine # [    0.572822] pci 0000:00:1f.2: BAR 4 [io  0xc1e0-0xc1ff][0m
+[2mmachine # [    0.573777] pci 0000:00:1f.2: BAR 5 [mem 0xfebdc000-0xfebdcfff][0m
+[2mmachine # [    0.575370] pci 0000:00:1f.3: [8086:2930] type 00 class 0x0c0500 conventional PCI endpoint[0m
+[2mmachine # [    0.577851] pci 0000:00:1f.3: BAR 4 [io  0x0700-0x073f][0m
+[2mmachine # [    0.585064] ACPI: PCI: Interrupt link LNKA configured for IRQ 10[0m
+[2mmachine # [    0.585927] ACPI: PCI: Interrupt link LNKB configured for IRQ 10[0m
+[2mmachine # [    0.586932] ACPI: PCI: Interrupt link LNKC configured for IRQ 11[0m
+[2mmachine # [    0.587922] ACPI: PCI: Interrupt link LNKD configured for IRQ 11[0m
+[2mmachine # [    0.588974] ACPI: PCI: Interrupt link LNKE configured for IRQ 10[0m
+[2mmachine # [    0.590126] ACPI: PCI: Interrupt link LNKF configured for IRQ 10[0m
+[2mmachine # [    0.590916] ACPI: PCI: Interrupt link LNKG configured for IRQ 11[0m
+[2mmachine # [    0.591917] ACPI: PCI: Interrupt link LNKH configured for IRQ 11[0m
+[2mmachine # [    0.592826] ACPI: PCI: Interrupt link GSIA configured for IRQ 16[0m
+[2mmachine # [    0.593785] ACPI: PCI: Interrupt link GSIB configured for IRQ 17[0m
+[2mmachine # [    0.594789] ACPI: PCI: Interrupt link GSIC configured for IRQ 18[0m
+[2mmachine # [    0.595788] ACPI: PCI: Interrupt link GSID configured for IRQ 19[0m
+[2mmachine # [    0.596785] ACPI: PCI: Interrupt link GSIE configured for IRQ 20[0m
+[2mmachine # [    0.597786] ACPI: PCI: Interrupt link GSIF configured for IRQ 21[0m
+[2mmachine # [    0.598785] ACPI: PCI: Interrupt link GSIG configured for IRQ 22[0m
+[2mmachine # [    0.599782] ACPI: PCI: Interrupt link GSIH configured for IRQ 23[0m
+[2mmachine # [    0.601867] iommu: Default domain type: Translated[0m
+[2mmachine # [    0.602774] iommu: DMA domain TLB invalidation policy: lazy mode[0m
+[2mmachine # [    0.604039] ACPI: bus type USB registered[0m
+[2mmachine # [    0.604834] usbcore: registered new interface driver usbfs[0m
+[2mmachine # [    0.605786] usbcore: registered new interface driver hub[0m
+[2mmachine # [    0.606778] usbcore: registered new device driver usb[0m
+[2mmachine # [    0.608620] NetLabel: Initializing[0m
+[2mmachine # [    0.609477] NetLabel:  domain hash size = 128[0m
+[2mmachine # [    0.609763] NetLabel:  protocols = UNLABELED CIPSOv4 CALIPSO[0m
+[2mmachine # [    0.610802] NetLabel:  unlabeled traffic allowed by default[0m
+[2mmachine # [    0.611781] PCI: Using ACPI for IRQ routing[0m
+[2mmachine # [    0.708088] pci 0000:00:01.0: vgaarb: setting as boot VGA device[0m
+[2mmachine # [    0.708758] pci 0000:00:01.0: vgaarb: bridge control possible[0m
+[2mmachine # [    0.708758] pci 0000:00:01.0: vgaarb: VGA device added: decodes=io+mem,owns=io+mem,locks=none[0m
+[2mmachine # [    0.708768] vgaarb: loaded[0m
+[2mmachine # [    0.709800] hpet0: at MMIO 0xfed00000, IRQs 2, 8, 0[0m
+[2mmachine # [    0.710762] hpet0: 3 comparators, 64-bit 100.000000 MHz counter[0m
+[2mmachine # [    0.717856] clocksource: Switched to clocksource kvm-clock[0m
+[2mmachine # [    0.720010] VFS: Disk quotas dquot_6.6.0[0m
+[2mmachine # [    0.722765] VFS: Dquot-cache hash table entries: 512 (order 0, 4096 bytes)[0m
+[2mmachine # [    0.724772] pnp: PnP ACPI init[0m
+[2mmachine # [    0.725904] ACPI: IRQ 4 override to edge(!), high(!)[0m
+[2mmachine # [    0.727385] system 00:04: [mem 0xb0000000-0xbfffffff window] has been reserved[0m
+[2mmachine # [    0.729705] pnp: PnP ACPI: found 5 devices[0m
+[2mmachine # [    0.737776] clocksource: acpi_pm: mask: 0xffffff max_cycles: 0xffffff, max_idle_ns: 2085701024 ns[0m
+[2mmachine # [    0.740056] clocksource: Switched to clocksource acpi_pm[0m
+[2mmachine # [    0.741622] NET: Registered PF_INET protocol family[0m
+[2mmachine # [    0.743196] IP idents hash table entries: 16384 (order: 5, 131072 bytes, linear)[0m
+[2mmachine # [    0.761477] tcp_listen_portaddr_hash hash table entries: 512 (order: 1, 8192 bytes, linear)[0m
+[2mmachine # [    0.764007] Table-perturb hash table entries: 65536 (order: 6, 262144 bytes, linear)[0m
+[2mmachine # [    0.766268] TCP established hash table entries: 8192 (order: 4, 65536 bytes, linear)[0m
+[2mmachine # [    0.768367] TCP bind hash table entries: 8192 (order: 6, 262144 bytes, linear)[0m
+[2mmachine # [    0.770323] TCP: Hash tables configured (established 8192 bind 8192)[0m
+[2mmachine # [    0.772088] MPTCP token hash table entries: 1024 (order: 3, 24576 bytes, linear)[0m
+[2mmachine # [    0.774156] UDP hash table entries: 512 (order: 3, 32768 bytes, linear)[0m
+[2mmachine # [    0.775999] UDP-Lite hash table entries: 512 (order: 3, 32768 bytes, linear)[0m
+[2mmachine # [    0.777975] NET: Registered PF_UNIX/PF_LOCAL protocol family[0m
+[2mmachine # [    0.779819] NET: Registered PF_XDP protocol family[0m
+[2mmachine # [    0.781197] pci_bus 0000:00: resource 4 [io  0x0000-0x0cf7 window][0m
+[2mmachine # [    0.782875] pci_bus 0000:00: resource 5 [io  0x0d00-0xffff window][0m
+[2mmachine # [    0.784605] pci_bus 0000:00: resource 6 [mem 0x000a0000-0x000bffff window][0m
+[2mmachine # [    0.786399] pci_bus 0000:00: resource 7 [mem 0x40000000-0xafffffff window][0m
+[2mmachine # [    0.788218] pci_bus 0000:00: resource 8 [mem 0xc0000000-0xfebfffff window][0m
+[2mmachine # [    0.790047] pci_bus 0000:00: resource 9 [mem 0x100000000-0x8ffffffff window][0m
+[2mmachine # [    0.792693] ACPI: \_SB_.GSIA: Enabled at IRQ 16[0m
+[2mmachine # [    0.795324] ACPI: \_SB_.GSIB: Enabled at IRQ 17[0m
+[2mmachine # [    0.797862] ACPI: \_SB_.GSIC: Enabled at IRQ 18[0m
+[2mmachine # [    0.800452] ACPI: \_SB_.GSID: Enabled at IRQ 19[0m
+[2mmachine # [    0.802678] PCI: CLS 0 bytes, default 64[0m
+[2mmachine # [    0.804017] clocksource: tsc: mask: 0xffffffffffffffff max_cycles: 0x27a3bdae5c8, max_idle_ns: 440795216753 ns[0m
+[2mmachine # [    0.806930] Trying to unpack rootfs image as initramfs...[0m
+[2mmachine # [    0.854350] Initialise system trusted keyrings[0m
+[2mmachine # [    0.858201] Key type blacklist registered[0m
+[2mmachine # [    0.861208] workingset: timestamp_bits=40 max_order=18 bucket_order=0[0m
+[2mmachine # [    0.865462] integrity: Platform Keyring initialized[0m
+[2mmachine # [    0.866825] integrity: Machine keyring initialized[0m
+[2mmachine # [    0.889927] Key type asymmetric registered[0m
+[2mmachine # [    0.893157] Asymmetric key parser 'x509' registered[0m
+[2mmachine # [    0.894531] Block layer SCSI generic (bsg) driver version 0.4 loaded (major 248)[0m
+[2mmachine # [    0.900357] io scheduler mq-deadline registered[0m
+[2mmachine # [    0.904158] io scheduler kyber registered[0m
+[2mmachine # [    0.908735] Serial: 8250/16550 driver, 4 ports, IRQ sharing enabled[0m
+[2mmachine # [    0.910836] 00:03: ttyS0 at I/O 0x3f8 (irq = 4, base_baud = 115200) is a 16550A[0m
+[2mmachine # [    0.917265] Linux agpgart interface v0.103[0m
+[2mmachine # [    0.918569] ACPI: bus type drm_connector registered[0m
+[2mmachine # [    0.923622] usbcore: registered new interface driver usbserial_generic[0m
+[2mmachine # [    0.925426] usbserial: USB Serial support registered for generic[0m
+[2mmachine # [    0.930154] amd_pstate: The CPPC feature is supported but currently disabled by the BIOS.[0m
+[2mmachine # [    0.930154] Please enable it if your BIOS has the CPPC option.[0m
+[2mmachine # [    0.933852] amd_pstate: the _CPC object is not present in SBIOS or ACPI disabled[0m
+[2mmachine # [    0.941353] drop_monitor: Initializing network drop monitor service[0m
+[2mmachine # [    0.946232] NET: Registered PF_INET6 protocol family[0m
+[2mmachine # [    0.949457] Segment Routing with IPv6[0m
+[2mmachine # [    0.952189] In-situ OAM (IOAM) with IPv6[0m
+[2mmachine # [    0.955476] IPI shorthand broadcast: enabled[0m
+[2mmachine # [    0.964304] sched_clock: Marking stable (736025873, 228112069)->(1124925128, -160787186)[0m
+[2mmachine # [    0.971268] registered taskstats version 1[0m
+[2mmachine # [    0.972696] Loading compiled-in X.509 certificates[0m
+[2mmachine # [    0.992160] Demotion targets for Node 0: null[0m
+[2mmachine # [    0.996207] Key type .fscrypt registered[0m
+[2mmachine # [    0.997367] Key type fscrypt-provisioning registered[0m
+[2mmachine # [    0.999260] ima: No TPM chip found, activating TPM-bypass![0m
+[2mmachine # [    1.000804] ima: Allocated hash algorithm: sha1[0m
+[2mmachine # [    1.006197] ima: No architecture policies found[0m
+[2mmachine # [    1.009162] PM:   Magic number: 14:98:697[0m
+[2mmachine # [    1.013182] RAS: Correctable Errors collector initialized.[0m
+[2mmachine # [    1.021849] clk: Disabling unused clocks[0m
+[2mmachine # [    1.027164] PM: genpd: Disabling unused power domains[0m
+[2mmachine # [    1.167992] Freeing initrd memory: 28264K[0m
+[2mmachine # [    1.171655] Freeing unused decrypted memory: 2028K[0m
+[2mmachine # [    1.176516] Freeing unused kernel image (initmem) memory: 6720K[0m
+[2mmachine # [    1.178245] Write protecting the kernel read-only data: 32768k[0m
+[2mmachine # [    1.180184] Freeing unused kernel image (text/rodata gap) memory: 240K[0m
+[2mmachine # [    1.182333] Freeing unused kernel image (rodata/data gap) memory: 620K[0m
+[2mmachine # [    1.227071] x86/mm: Checked W+X mappings: passed, no W+X pages found.[0m
+[2mmachine # [    1.228899] Run /init as init process[0m
+[2mmachine # [    1.239378] autofs4: module verification failed: signature and/or required key missing - tainting kernel[0m
+[2mmachine # [    1.242851] systemd[1]: Inserted module 'autofs4'[0m
+[2mmachine # [    1.263759] fuse: init (API version 7.45)[0m
+[2mmachine # [    1.271796] ACPI: \_SB_.GSIG: Enabled at IRQ 22[0m
+[2mmachine # [    1.275269] ACPI: \_SB_.GSIH: Enabled at IRQ 23[0m
+[2mmachine # [    1.279605] ACPI: \_SB_.GSIE: Enabled at IRQ 20[0m
+[2mmachine # [    1.282650] ACPI: \_SB_.GSIF: Enabled at IRQ 21[0m
+[2mmachine # [    1.289600] virtiofs virtio5: discovered new tag: nix-store[0m
+[2mmachine # [    1.292300] virtiofs virtio5: virtio_fs_setup_dax: No cache capability[0m
+[2mmachine # [    1.300967] virtiofs virtio6: discovered new tag: shared[0m
+[2mmachine # [    1.303819] virtiofs virtio6: virtio_fs_setup_dax: No cache capability[0m
+[2mmachine # [    1.309239] virtiofs virtio7: discovered new tag: xchg[0m
+[2mmachine # [    1.312255] virtiofs virtio7: virtio_fs_setup_dax: No cache capability[0m
+[2mmachine # [    1.336918] systemd[1]: Successfully made /usr/ read-only.[0m
+[2mmachine # [    1.675856] systemd[1]: systemd 262 running in system mode (+PAM +AUDIT -SELINUX +APPARMOR +IMA +IPE +SMACK +SECCOMP -GNUTLS +OPENSSL +ACL +BLKID +CURL +ELFUTILS +FIDO2 +IDN2 +KMOD +LIBCRYPTSETUP +LIBCRYPTSETUP_PLUGINS +LIBFDISK +PCRE2 +PWQUALITY +P11KIT +QRENCODE +TPM2 +BZIP2 +LZ4 +XZ +ZLIB +ZSTD +BPF_FRAMEWORK -BTF -XKBCOMMON +UTMP +LIBARCHIVE)[0m
+[2mmachine # [    1.696017] systemd[1]: Detected virtualization kvm.[0m
+[2mmachine # [    1.699790] systemd[1]: Detected architecture x86-64.[0m
+[2mmachine # [    1.703596] systemd[1]: Running in initrd.[0m
+[2mmachine # [    1.707670] systemd[1]: Initializing machine ID from random generator.[0m
+[2mmachine # [    1.712838] systemd[1]: Hostname set to <machine>.[0m
+[2mmachine # [    1.803081] systemd[1]: bpf-restrict-fs: LSM BPF program attached[0m
+[2mmachine # [    1.842699] systemd[1]: Queued start job for default target Initrd Default Target.[0m
+[2mmachine # [    1.847939] systemd[1]: Created slice Slice /system/modprobe.[0m
+[2mmachine # [    1.849859] systemd[1]: Started Dispatch Password Requests to Console Directory Watch.[0m
+[2mmachine # [    1.852181] systemd[1]: Expecting device /dev/disk/by-label/nixos...[0m
+[2mmachine # [    1.853986] systemd[1]: Reached target Path Units.[0m
+[2mmachine # [    1.855437] systemd[1]: Reached target Slice Units.[0m
+[2mmachine # [    1.856904] systemd[1]: Reached target Swaps.[0m
+[2mmachine # [    1.871996] systemd[1]: Reached target Timer Units.[0m
+[2mmachine # [    1.873705] systemd[1]: Listening on D-Bus System Message Bus Socket.[0m
+[2mmachine # [    1.875726] systemd[1]: Listening on Journal Socket (/dev/log).[0m
+[2mmachine # [    1.877698] systemd[1]: Listening on Journal Sockets.[0m
+[2mmachine # [    1.879319] systemd[1]: Listening on udev Kernel Socket.[0m
+[2mmachine # [    1.881089] systemd[1]: Listening on udev Varlink Socket.[0m
+[2mmachine # [    1.882804] systemd[1]: Reached target Socket Units.[0m
+[2mmachine # [    1.885480] systemd[1]: Starting Create List of Static Device Nodes...[0m
+[2mmachine # [    1.892270] systemd[1]: Starting Load Kernel Module configfs...[0m
+[2mmachine # [    1.904287] systemd[1]: Starting Journal Service...[0m
+[2mmachine # [    1.915534] systemd[1]: Starting Load Kernel Modules...[0m
+[2mmachine # [    1.920335] systemd[1]: Early TPM SRK Setup skipped, unmet condition check ConditionSecurity=measured-os[0m
+[2mmachine # [    1.929860] systemd[1]: Starting Coldplug All udev Devices...[0m
+[2mmachine # [    1.950707] systemd[1]: Finished Create List of Static Device Nodes.[0m
+[2mmachine # [    1.958790] systemd-journald[65]: Collecting audit messages is disabled.[0m
+[2mmachine # [    1.961635] systemd[1]: modprobe@configfs.service: Deactivated successfully.[0m
+[2mmachine # [    1.971820] systemd[1]: Finished Load Kernel Module configfs.[0m
+[2mmachine # [    1.980934] systemd[1]: Kernel Configuration File System skipped, unmet condition check ConditionPathExists=/sys/kernel/config[0m
+[2mmachine # [    1.987878] device-mapper: core: CONFIG_IMA_DISABLE_HTABLE is disabled. Duplicate IMA measurements will not be recorded in the IMA log.[0m
+[2mmachine # [    1.998418] systemd[1]: Starting Create Static Device Nodes in /dev gracefully...[0m
+[2mmachine # [    2.003332] device-mapper: ioctl: 4.50.0-ioctl (2025-04-28) initialised: dm-devel@lists.linux.dev[0m
+[2mmachine # [    2.043072] systemd[1]: Finished Load Kernel Modules.[0m
+[2mmachine # [    2.053384] systemd[1]: Starting Apply Kernel Variables...[0m
+[2mmachine # [    2.071302] systemd[1]: Finished Create Static Device Nodes in /dev gracefully.[0m
+[2mmachine # [    2.083260] systemd[1]: Starting Create Static Device Nodes in /dev...[0m
+[2mmachine # [    2.110358] systemd[1]: Finished Apply Kernel Variables.[0m
+[2mmachine # [    2.129104] systemd[1]: Finished Create Static Device Nodes in /dev.[0m
+[2mmachine # [    2.135493] systemd[1]: Reached target Preparation for Local File Systems.[0m
+[2mmachine # [    2.142291] systemd[1]: Reached target Local File Systems.[0m
+[2mmachine # [    2.150516] systemd[1]: Starting Rule-based Manager for Device Events and Files...[0m
+[2mmachine # [    1.927496] systemd-modules-load[66]: Inserted module 'dm_mod'[0m
+[2mmachine # [    1.931457] systemd-modules-load[66]: Inserted module 'virtio_balloon'[0m
+[2mmachine # [    1.934451] systemd-modules-load[66]: Inserted module 'virtio_gpu'[0m
+[2mmachine # [    2.167991] systemd[1]: Started Journal Service.[0m
+[2mmachine # [    1.962391] systemd[1]: Starting Create System Files and Directories...[0m
+[2mmachine # [    1.995763] systemd[1]: Finished Create System Files and Directories.[0m
+[2mmachine # [    2.002413] systemd-udevd[73]: Using default interface naming scheme 'v261'.[0m
+[2mmachine # [    2.032409] systemd[1]: Started Rule-based Manager for Device Events and Files.[0m
+[2mmachine # [    2.052981] systemd[1]: Finished Coldplug All udev Devices.[0m
+[2mmachine # [    2.055304] systemd[1]: Reached target System Initialization.[0m
+[2mmachine # [    2.056760] systemd[1]: Reached target Basic System.[0m
+[2mmachine # [    2.566865] virtio_blk virtio2: 1/0/0 default/read/poll queues[0m
+[2mmachine # [    2.576600] i8042: PNP: PS/2 Controller [PNP0303:KBD,PNP0f13:MOU] at 0x60,0x64 irq 1,12[0m
+[2mmachine # [    2.580718] virtio_blk virtio2: [vda] 2097152 512-byte logical blocks (1.07 GB/1.00 GiB)[0m
+[2mmachine # [    2.592090] ehci-pci 0000:00:1d.7: EHCI Host Controller[0m
+[2mmachine # [    2.593384] ehci-pci 0000:00:1d.7: new USB bus registered, assigned bus number 1[0m
+[2mmachine # [    2.596061] ehci-pci 0000:00:1d.7: irq 19, io mem 0xfebdb000[0m
+[2mmachine # [    2.599675] serio: i8042 KBD port at 0x60,0x64 irq 1[0m
+[2mmachine # [    2.605200] ehci-pci 0000:00:1d.7: USB 2.0 started, EHCI 1.00[0m
+[2mmachine # [    2.606639] usb usb1: New USB device found, idVendor=1d6b, idProduct=0002, bcdDevice= 6.18[0m
+[2mmachine # [    2.610686] usb usb1: New USB device strings: Mfr=3, Product=2, SerialNumber=1[0m
+[2mmachine # [    2.612209] serio: i8042 AUX port at 0x60,0x64 irq 12[0m
+[2mmachine # [    2.614165] usb usb1: Product: EHCI Host Controller[0m
+[2mmachine # [    2.616195] usb usb1: Manufacturer: Linux 6.18.59 ehci_hcd[0m
+[2mmachine # [    2.618702] usb usb1: SerialNumber: 0000:00:1d.7[0m
+[2mmachine # [    2.620327] hub 1-0:1.0: USB hub found[0m
+[2mmachine # [    2.621456] hub 1-0:1.0: 6 ports detected[0m
+[2mmachine # [    2.626166] uhci_hcd 0000:00:1d.0: UHCI Host Controller[0m
+[2mmachine # [    2.627360] uhci_hcd 0000:00:1d.0: new USB bus registered, assigned bus number 2[0m
+[2mmachine # [    2.647378] uhci_hcd 0000:00:1d.0: detected 2 ports[0m
+[2mmachine # [    2.657263] uhci_hcd 0000:00:1d.0: irq 16, io port 0x0000c180[0m
+[2mmachine # [    2.668627] usb usb2: New USB device found, idVendor=1d6b, idProduct=0001, bcdDevice= 6.18[0m
+[2mmachine # [    2.670449] usb usb2: New USB device strings: Mfr=3, Product=2, SerialNumber=1[0m
+[2mmachine # [    2.693436] usb usb2: Product: UHCI Host Controller[0m
+[2mmachine # [    2.705484] usb usb2: Manufacturer: Linux 6.18.59 uhci_hcd[0m
+[2mmachine # [    2.480059] (udev-worker)[85]: Network interface NamePolicy= disabled on kernel command line.[0m
+[2mmachine # [    2.488241] systemd[1]: Starting Virtual Console Setup...[0m
+[2mmachine # [    2.728073] SCSI subsystem initialized[0m
+[2mmachine # [    2.731574] usb usb2: SerialNumber: 0000:00:1d.0[0m
+[2mmachine # [    2.508175] (udev-worker)[93]: [0;1;33m[0;1;38:5:185meth1: Config file /etc/systemd/network/40-eth1.link is applied to device based on potentially unpredictable interface name.[0m[0m
+[2mmachine # [    2.512098] (udev-worker)[93]: Network interface NamePolicy= disabled on kernel command line.[0m
+[2mmachine # [    2.755642] hub 2-0:1.0: USB hub found[0m
+[2mmachine # [    2.531437] systemd-vconsole-setup[96]: [0;1;39mConfiguration of first virtual console was skipped, ignoring remaining ones.[0m[0m
+[2mmachine # [    2.537122] systemd[1]: Finished Virtual Console Setup.[0m
+[2mmachine # [    2.769111] input: AT Translated Set 2 keyboard as /devices/platform/i8042/serio0/input/input0[0m
+[2mmachine # [    2.774667] hub 2-0:1.0: 2 ports detected[0m
+[2mmachine # [    2.788536] uhci_hcd 0000:00:1d.1: UHCI Host Controller[0m
+[2mmachine # [    2.797184] uhci_hcd 0000:00:1d.1: new USB bus registered, assigned bus number 3[0m
+[2mmachine # [    2.577284] systemd[1]: Found device /dev/disk/by-label/nixos.[0m
+[2mmachine # [    2.579816] systemd[1]: Reached target Initrd Root Device.[0m
+[2mmachine # [    2.810443] uhci_hcd 0000:00:1d.1: detected 2 ports[0m
+[2mmachine # [    2.585401] systemd[1]: Starting File System Check on /dev/disk/by-label/nixos...[0m
+[2mmachine # [    2.819084] uhci_hcd 0000:00:1d.1: irq 17, io port 0x0000c1a0[0m
+[2mmachine # [    2.822300] usb usb3: New USB device found, idVendor=1d6b, idProduct=0001, bcdDevice= 6.18[0m
+[2mmachine # [    2.831170] usb usb3: New USB device strings: Mfr=3, Product=2, SerialNumber=1[0m
+[2mmachine # [    2.837781] usb usb3: Product: UHCI Host Controller[0m
+[2mmachine # [    2.839180] usb usb3: Manufacturer: Linux 6.18.59 uhci_hcd[0m
+[2mmachine # [    2.840546] usb usb3: SerialNumber: 0000:00:1d.1[0m
+[2mmachine # [    2.844891] hub 3-0:1.0: USB hub found[0m
+[2mmachine # [    2.849987] hub 3-0:1.0: 2 ports detected[0m
+[2mmachine # [    2.624736] systemd-fsck[104]: nixos: clean, 12/65536 files, 13019/262144 blocks[0m
+[2mmachine # [    2.857377] uhci_hcd 0000:00:1d.2: UHCI Host Controller[0m
+[2mmachine # [    2.861167] usb 1-1: new high-speed USB device number 2 using ehci-pci[0m
+[2mmachine # [    2.635090] systemd[1]: Finished File System Check on /dev/disk/by-label/nixos.[0m
+[2mmachine # [    2.868318] uhci_hcd 0000:00:1d.2: new USB bus registered, assigned bus number 4[0m
+[2mmachine # [    2.879497] uhci_hcd 0000:00:1d.2: detected 2 ports[0m
+[2mmachine # [    2.884107] uhci_hcd 0000:00:1d.2: irq 18, io port 0x0000c1c0[0m
+[2mmachine # [    2.888611] usb usb4: New USB device found, idVendor=1d6b, idProduct=0001, bcdDevice= 6.18[0m
+[2mmachine # [    2.892216] usb usb4: New USB device strings: Mfr=3, Product=2, SerialNumber=1[0m
+[2mmachine # [    2.896020] ahci 0000:00:1f.2: AHCI vers 0001.0000, 32 command slots, 1.5 Gbps, SATA mode[0m
+[2mmachine # [    2.897847] usb usb4: Product: UHCI Host Controller[0m
+[2mmachine # [    2.899209] usb usb4: Manufacturer: Linux 6.18.59 uhci_hcd[0m
+[2mmachine # [    2.901068] usb usb4: SerialNumber: 0000:00:1d.2[0m
+[2mmachine # [    2.902418] ahci 0000:00:1f.2: 6/6 ports implemented (port mask 0x3f)[0m
+[2mmachine # [    2.907074] hub 4-0:1.0: USB hub found[0m
+[2mmachine # [    2.910172] ahci 0000:00:1f.2: flags: 64bit ncq only[0m
+[2mmachine # [    2.911640] hub 4-0:1.0: 2 ports detected[0m
+[2mmachine # [    2.924264] scsi host0: ahci[0m
+[2mmachine # [    2.927233] scsi host1: ahci[0m
+[2mmachine # [    2.929236] scsi host2: ahci[0m
+[2mmachine # [    2.931255] scsi host3: ahci[0m
+[2mmachine # [    2.938261] scsi host4: ahci[0m
+[2mmachine # [    2.716672] systemd[1]: Mounting /sysroot...[0m
+[2mmachine # [    2.946115] scsi host5: ahci[0m
+[2mmachine # [    2.947039] ata1: SATA max UDMA/133 abar m4096@0xfebdc000 port 0xfebdc100 irq 47 lpm-pol 1[0m
+[2mmachine # [    2.969233] ata2: SATA max UDMA/133 abar m4096@0xfebdc000 port 0xfebdc180 irq 47 lpm-pol 1[0m
+[2mmachine # [    2.988190] ata3: SATA max UDMA/133 abar m4096@0xfebdc000 port 0xfebdc200 irq 47 lpm-pol 1[0m
+[2mmachine # [    2.995297] ata4: SATA max UDMA/133 abar m4096@0xfebdc000 port 0xfebdc280 irq 47 lpm-pol 1[0m
+[2mmachine # [    2.999172] ata5: SATA max UDMA/133 abar m4096@0xfebdc000 port 0xfebdc300 irq 47 lpm-pol 1[0m
+[2mmachine # [    3.003171] ata6: SATA max UDMA/133 abar m4096@0xfebdc000 port 0xfebdc380 irq 47 lpm-pol 1[0m
+[2mmachine # [    3.009253] usb 1-1: New USB device found, idVendor=0627, idProduct=0001, bcdDevice= 0.00[0m
+[2mmachine # [    3.010920] usb 1-1: New USB device strings: Mfr=1, Product=3, SerialNumber=10[0m
+[2mmachine # [    3.015662] usb 1-1: Product: QEMU USB Tablet[0m
+[2mmachine # [    3.017225] usb 1-1: Manufacturer: QEMU[0m
+[2mmachine # [    3.020156] usb 1-1: SerialNumber: 28754-0000:00:1d.7-1[0m
+[2mmachine # [    3.075233] hid: raw HID events driver (C) Jiri Kosina[0m
+[2mmachine # [    3.324044] ata3: SATA link up 1.5 Gbps (SStatus 113 SControl 300)[0m
+[2mmachine # [    3.325719] ata3.00: ATAPI: QEMU DVD-ROM, 2.5+, max UDMA/100[0m
+[2mmachine # [    3.327511] ata3.00: applying bridge limits[0m
+[2mmachine # [    3.328634] ata3.00: configured for UDMA/100[0m
+[2mmachine # [    3.329906] ata6: SATA link down (SStatus 0 SControl 300)[0m
+[2mmachine # [    3.331387] ata1: SATA link down (SStatus 0 SControl 300)[0m
+[2mmachine # [    3.332722] ata5: SATA link down (SStatus 0 SControl 300)[0m
+[2mmachine # [    3.334353] ata4: SATA link down (SStatus 0 SControl 300)[0m
+[2mmachine # [    3.337229] ata2: SATA link down (SStatus 0 SControl 300)[0m
+[2mmachine # [    3.341821] scsi 2:0:0:0: CD-ROM            QEMU     QEMU DVD-ROM     2.5+ PQ: 0 ANSI: 5[0m
+[2mmachine # [    3.371577] EXT4-fs (vda): mounted filesystem ef5cdfa2-307f-450b-8f2a-1341ff20a189 r/w with ordered data mode. Quota mode: none.[0m
+[2mmachine # [    3.159128] systemd[1]: Mounted /sysroot.[0m
+[2mmachine # [    3.164101] systemd[1]: Reached target Initrd Root File System.[0m
+[2mmachine # [    3.167164] systemd[1]: Starting Mountpoints Configured in the Real Root...[0m
+[2mmachine # [    3.189782] systemd-sysroot-fstab-check[136]: /sysroot should be mounted in the initrd, will request daemon-reload.[0m
+[2mmachine # [    3.196093] systemd[1]: [0;1;39mReload requested from client PID 136 ('systemd-sysroot') (unit initrd-parse-etc.service)...[0m[0m
+[2mmachine # [    3.199236] systemd[1]: Reloading...[0m
+[2mmachine # [    3.438242] usbcore: registered new interface driver usbhid[0m
+[2mmachine # [    3.447248] usbhid: USB HID core driver[0m
+[2mmachine # [    3.464972] input: QEMU QEMU USB Tablet as /devices/pci0000:00/0000:00:1d.7/usb1/1-1/1-1:1.0/0003:0627:0001.0001/input/input2[0m
+[2mmachine # [    3.470500] hid-generic 0003:0627:0001.0001: input,hidraw0: USB HID v0.01 Mouse [QEMU QEMU USB Tablet] on usb-0000:00:1d.7-1/input0[0m
+[2mmachine # [    3.476531] sr 2:0:0:0: [sr0] scsi3-mmc drive: 4x/4x cd/rw xa/form2 tray[0m
+[2mmachine # [    3.488184] cdrom: Uniform CD-ROM driver Revision: 3.20[0m
+[2mmachine # [    3.318115] systemd[1]: Reloading finished in 120 ms.[0m
+[2mmachine # [    3.334129] systemd-sysroot-fstab-check[136]: Requesting initrd-fs.target/start/replace...[0m
+[2mmachine # [    3.342732] systemd-sysroot-fstab-check[136]: Requesting swap.target/start/replace...[0m
+[2mmachine # [    3.348403] systemd[1]: initrd-parse-etc.service: Deactivated successfully.[0m
+[2mmachine # [    3.351874] systemd[1]: Finished Mountpoints Configured in the Real Root.[0m
+[2mmachine # [    3.355186] systemd[1]: initrd-parse-etc.service: Triggering OnSuccess= dependencies.[0m
+[2mmachine # [    3.717312] systemd[1]: Mounting /sysroot/nix/.ro-store...[0m
+[2mmachine # [    3.722229] systemd[1]: Mounting /sysroot/nix/.rw-store...[0m
+[2mmachine # [    3.728201] systemd[1]: Mounting /sysroot/run...[0m
+[2mmachine # [    3.731377] systemd[1]: Mounting /sysroot/tmp/shared...[0m
+[2mmachine # [    3.745714] systemd[1]: Mounting /sysroot/tmp/xchg...[0m
+[2mmachine # [    3.775202] systemd[1]: Mounted /sysroot/run.[0m
+[2mmachine # [    3.778574] systemd[1]: Mounted /sysroot/nix/.ro-store.[0m
+[2mmachine # [    3.781352] systemd[1]: Mounted /sysroot/nix/.rw-store.[0m
+[2mmachine # [    3.784829] systemd[1]: Mounted /sysroot/tmp/shared.[0m
+[2mmachine # [    3.789937] systemd[1]: Mounted /sysroot/tmp/xchg.[0m
+[2mmachine # [    3.794717] systemd[1]: Starting rw-sysroot-nix-store.service...[0m
+[2mmachine # [    3.807514] systemd[1]: rw-sysroot-nix-store.service: Deactivated successfully.[0m
+[2mmachine # [    3.809956] systemd[1]: Finished rw-sysroot-nix-store.service.[0m
+[2mmachine # [    4.716133] systemd[1]: Mounting /sysroot/nix/store...[0m
+[2mmachine # [    4.746377] systemd[1]: Mounted /sysroot/nix/store.[0m
+[2mmachine # [    4.748820] systemd[1]: Reached target Initrd File Systems.[0m
+[2mmachine # [    4.753152] systemd[1]: Starting Find NixOS closure...[0m
+[2mmachine # [    4.757222] systemd[1]: Starting Create Volatile Files and Directories in the Real Root...[0m
+[2mmachine # [    4.790381] systemd[1]: Finished Create Volatile Files and Directories in the Real Root.[0m
+[2mmachine # [    4.796304] systemd[1]: sysroot-run-credentials-systemd\x2dtmpfiles\x2dsetup\x2dsysroot.service.mount: Deactivated successfully.[0m
+[2mmachine # [    4.806480] systemd[1]: Finished Find NixOS closure.[0m
+[2mmachine # [    4.808787] systemd[1]: Reached target Initrd Default Target.[0m
+[2mmachine # [    4.811350] systemd[1]: Starting Cleaning Up and Shutting Down Daemons...[0m
+[2mmachine # [    4.828313] systemd[1]: Stopped target Initrd Default Target.[0m
+[2mmachine # [    4.829769] systemd[1]: Stopped target Basic System.[0m
+[2mmachine # [    4.831063] systemd[1]: Stopped target Initrd Root Device.[0m
+[2mmachine # [    4.832495] systemd[1]: Stopped target Path Units.[0m
+[2mmachine # [    4.834440] systemd[1]: systemd-ask-password-console.path: Deactivated successfully.[0m
+[2mmachine # [    4.836449] systemd[1]: Stopped Dispatch Password Requests to Console Directory Watch.[0m
+[2mmachine # [    4.839191] systemd[1]: Stopped target Slice Units.[0m
+[2mmachine # [    4.840447] systemd[1]: Stopped target Socket Units.[0m
+[2mmachine # [    4.841801] systemd[1]: Stopped target System Initialization.[0m
+[2mmachine # [    4.844186] systemd[1]: Stopped target Swaps.[0m
+[2mmachine # [    4.845313] systemd[1]: Stopped target Timer Units.[0m
+[2mmachine # [    4.846536] systemd[1]: dbus.socket: Deactivated successfully.[0m
+[2mmachine # [    4.848280] systemd[1]: Closed D-Bus System Message Bus Socket.[0m
+[2mmachine # [    4.849827] systemd[1]: initrd-find-nixos-closure.service: Deactivated successfully.[0m
+[2mmachine # [    4.852218] systemd[1]: Stopped Find NixOS closure.[0m
+[2mmachine # [    4.853451] systemd[1]: Starting rw-sysroot-nix-store.service...[0m
+[2mmachine # [    4.856183] systemd[1]: systemd-sysctl.service: Deactivated successfully.[0m
+[2mmachine # [    4.857886] systemd[1]: Stopped Apply Kernel Variables.[0m
+[2mmachine # [    4.859224] systemd[1]: systemd-modules-load.service: Deactivated successfully.[0m
+[2mmachine # [    4.860886] systemd[1]: Stopped Load Kernel Modules.[0m
+[2mmachine # [    4.863223] systemd[1]: systemd-tmpfiles-setup-sysroot.service: Deactivated successfully.[0m
+[2mmachine # [    4.864982] systemd[1]: Stopped Create Volatile Files and Directories in the Real Root.[0m
+[2mmachine # [    4.866765] systemd[1]: systemd-tmpfiles-setup.service: Deactivated successfully.[0m
+[2mmachine # [    4.868426] systemd[1]: Stopped Create System Files and Directories.[0m
+[2mmachine # [    4.871191] systemd[1]: Stopped target Local File Systems.[0m
+[2mmachine # [    4.872830] systemd[1]: Stopped target Preparation for Local File Systems.[0m
+[2mmachine # [    4.874607] systemd[1]: systemd-udev-trigger.service: Deactivated successfully.[0m
+[2mmachine # [    4.876647] systemd[1]: Stopped Coldplug All udev Devices.[0m
+[2mmachine # [    4.879653] systemd[1]: Stopping Rule-based Manager for Device Events and Files...[0m
+[2mmachine # [    4.881350] systemd[1]: systemd-vconsole-setup.service: Deactivated successfully.[0m
+[2mmachine # [    4.884186] systemd[1]: Stopped Virtual Console Setup.[0m
+[2mmachine # [    4.895323] systemd[1]: initrd-cleanup.service: Deactivated successfully.[0m
+[2mmachine # [    4.901144] systemd[1]: Finished Cleaning Up and Shutting Down Daemons.[0m
+[2mmachine # [    4.905617] systemd[1]: systemd-udevd.service: Deactivated successfully.[0m
+[2mmachine # [    4.910201] systemd[1]: Stopped Rule-based Manager for Device Events and Files.[0m
+[2mmachine # [    4.913111] systemd[1]: rw-sysroot-nix-store.service: Deactivated successfully.[0m
+[2mmachine # [    4.915675] systemd[1]: Finished rw-sysroot-nix-store.service.[0m
+[2mmachine # [    4.920114] systemd[1]: systemd-udevd-varlink.socket: Deactivated successfully.[0m
+[2mmachine # [    4.921891] systemd[1]: Closed udev Varlink Socket.[0m
+[2mmachine # [    4.924533] systemd[1]: Starting Cleanup udev Database...[0m
+[2mmachine # [    4.926260] systemd[1]: systemd-tmpfiles-setup-dev.service: Deactivated successfully.[0m
+[2mmachine # [    4.929218] systemd[1]: Stopped Create Static Device Nodes in /dev.[0m
+[2mmachine # [    4.930850] systemd[1]: systemd-tmpfiles-setup-dev-early.service: Deactivated successfully.[0m
+[2mmachine # [    4.932936] systemd[1]: Stopped Create Static Device Nodes in /dev gracefully.[0m
+[2mmachine # [    4.935218] systemd[1]: kmod-static-nodes.service: Deactivated successfully.[0m
+[2mmachine # [    4.936913] systemd[1]: Stopped Create List of Static Device Nodes.[0m
+[2mmachine # [    4.956383] systemd[1]: initrd-udevadm-cleanup-db.service: Deactivated successfully.[0m
+[2mmachine # [    4.958985] systemd[1]: Finished Cleanup udev Database.[0m
+[2mmachine # [    4.961080] systemd[1]: Reached target Switch Root.[0m
+[2mmachine # [    4.963565] systemd[1]: Starting NixOS Activation...[0m
+[2mmachine # [    5.030700] initrd-nixos-activation-start[189]: booting system configuration /nix/store/pi9v13mc5hb0sq32s22i76yp3yqxnflv-nixos-system-machine-test[0m
+[2mmachine # [    5.061356] initrd-nixos-activation-start[189]: running activation script...[0m
+[2mmachine # [    5.276955] initrd-nixos-activation-start[212]: setting up /etc...[0m
+[2mmachine # [    5.410685] systemd[1]: initrd-nixos-activation.service: Deactivated successfully.[0m
+[2mmachine # [    5.413173] systemd[1]: Finished NixOS Activation.[0m
+[2mmachine # [    5.415838] systemd[1]: Starting Switch Root...[0m
+[2mmachine # [    5.430661] systemd[1]: [0;1;39mSwitching root.[0m[0m
+[2mmachine # [    5.784955] systemd-journald[65]: Received SIGTERM from PID 1 (systemd).[0m
+[2mmachine # [    5.840865] NET: Registered PF_VSOCK protocol family[0m
+[2mmachine # [    6.198773] systemd[1]: systemd 262 running in system mode (+PAM +AUDIT -SELINUX +APPARMOR +IMA +IPE +SMACK +SECCOMP -GNUTLS +OPENSSL +ACL +BLKID +CURL +ELFUTILS +FIDO2 +IDN2 +KMOD +LIBCRYPTSETUP +LIBCRYPTSETUP_PLUGINS +LIBFDISK +PCRE2 +PWQUALITY +P11KIT +QRENCODE +TPM2 +BZIP2 +LZ4 +XZ +ZLIB +ZSTD +BPF_FRAMEWORK -BTF -XKBCOMMON +UTMP +LIBARCHIVE)[0m
+[2mmachine # [    6.205374] systemd[1]: Detected virtualization kvm.[0m
+[2mmachine # [    6.206666] systemd[1]: Detected architecture x86-64.[0m
+[2mmachine # [    6.208034] systemd[1]: Detected first boot.[0m
+[2mmachine # [    6.210339] systemd[1]: Initializing machine ID from random generator.[0m
+[2mmachine # [    6.338058] systemd[1]: bpf-restrict-fs: LSM BPF program attached[0m
+[2mmachine # [    6.419502] systemd[1]: Applying preset policy.[0m
+[2mmachine # [    6.635420] systemd[1]: Populated /etc with preset unit settings.[0m
+[2mmachine # [    6.847849] systemd[1]: initrd-switch-root.service: Deactivated successfully.[0m
+[2mmachine # [    6.849934] systemd[1]: Stopped initrd-switch-root.service.[0m
+[2mmachine # [    6.852882] systemd[1]: systemd-journald.service: Scheduled restart job, restart counter is at 1.[0m
+[2mmachine # [    6.855863] systemd[1]: Created slice Slice /system/getty.[0m
+[2mmachine # [    6.857776] systemd[1]: Created slice User and Session Slice.[0m
+[2mmachine # [    6.859233] systemd[1]: Started Dispatch Password Requests to Console Directory Watch.[0m
+[2mmachine # [    6.861115] systemd[1]: Started Forward Password Requests to Wall Directory Watch.[0m
+[2mmachine # [    6.873669] systemd[1]: Expecting device /dev/hvc0...[0m
+[2mmachine # [    6.874817] systemd[1]: Expecting device /dev/ttyS0...[0m
+[2mmachine # [    6.876049] systemd[1]: Reached target Local Encrypted Volumes.[0m
+[2mmachine # [    6.877404] systemd[1]: Stopped target initrd-fs.target.[0m
+[2mmachine # [    6.878621] systemd[1]: Stopped target initrd-root-fs.target.[0m
+[2mmachine # [    6.879922] systemd[1]: Stopped target initrd-switch-root.target.[0m
+[2mmachine # [    6.881350] systemd[1]: Reached target Virtual Machines and Containers.[0m
+[2mmachine # [    6.882841] systemd[1]: Reached target Path Units.[0m
+[2mmachine # [    6.883959] systemd[1]: Reached target Remote File Systems.[0m
+[2mmachine # [    6.885244] systemd[1]: Reached target Slice Units.[0m
+[2mmachine # [    6.886374] systemd[1]: Reached target Swaps.[0m
+[2mmachine # [    6.888637] systemd[1]: Listening on Query the User Interactively for a Password.[0m
+[2mmachine # [    6.891814] systemd[1]: Listening on Process Core Dump Socket.[0m
+[2mmachine # [    6.894215] systemd[1]: Listening on Credential Encryption/Decryption.[0m
+[2mmachine # [    6.896595] systemd[1]: Listening on Factory Reset Management.[0m
+[2mmachine # [    6.898015] systemd[1]: Listening on Hostname Service Socket.[0m
+[2mmachine # [    6.901672] systemd[1]: Starting Journal Log Access Socket...[0m
+[2mmachine # [    6.903716] systemd[1]: Listening on Journal Audit Socket.[0m
+[2mmachine # [    6.906940] systemd[1]: Listening on Console Output Muting Service Socket.[0m
+[2mmachine # [    6.908688] systemd[1]: Listening on Userspace Out-Of-Memory (OOM) Killer Socket.[0m
+[2mmachine # [    6.910384] systemd[1]: TPM PCR Measurements skipped, unmet condition check ConditionSecurity=measured-os[0m
+[2mmachine # [    6.912413] systemd[1]: Make TPM PCR Policy skipped, unmet condition check ConditionSecurity=measured-uki[0m
+[2mmachine # [    6.917391] systemd[1]: Listening on Disk Repartitioning Service Socket.[0m
+[2mmachine # [    6.919027] systemd[1]: Listening on udev Varlink Socket.[0m
+[2mmachine # [    6.921901] systemd[1]: Mounting Huge Pages File System...[0m
+[2mmachine # [    6.926652] systemd[1]: Mounting POSIX Message Queue File System...[0m
+[2mmachine # [    6.934753] systemd[1]: Mounting Kernel Debug File System...[0m
+[2mmachine # [    6.943760] systemd[1]: Mounting Kernel Trace File System...[0m
+[2mmachine # [    6.955439] systemd[1]: Starting Create List of Static Device Nodes...[0m
+[2mmachine # [    6.973879] systemd[1]: Starting Load Kernel Module configfs...[0m
+[2mmachine # [    6.984919] systemd[1]: Load Kernel Module drm skipped, unmet condition check ConditionKernelModuleLoaded=!drm[0m
+[2mmachine # [    6.999008] systemd[1]: Load Kernel Module efi_pstore skipped, unmet condition check ConditionKernelModuleLoaded=!efi_pstore[0m
+[2mmachine # [    7.003729] systemd[1]: Load Kernel Module fuse skipped, unmet condition check ConditionKernelModuleLoaded=!fuse[0m
+[2mmachine # [    7.008889] systemd[1]: Mounting FUSE Control File System...[0m
+[2mmachine # [    7.010775] systemd[1]: Clear Stale Hibernate Storage Info skipped, unmet condition check ConditionPathExists=/sys/firmware/efi/efivars/HibernateLocation-8cf2644b-4b0b-428f-9387-6d876050dc67[0m
+[2mmachine # [    7.019755] systemd[1]: Starting Journal Service...[0m
+[2mmachine # [    7.033254] systemd[1]: Starting Load Kernel Modules...[0m
+[2mmachine # [    7.050815] systemd[1]: Starting Userspace Out-Of-Memory (OOM) Killer...[0m
+[2mmachine # [    7.073388] systemd[1]: Starting Remount Root and Kernel File Systems...[0m
+[2mmachine # [    7.076332] systemd[1]: Early TPM SRK Setup skipped, unmet condition check ConditionSecurity=measured-os[0m
+[2mmachine # [    7.090806] systemd-journald[283]: Collecting audit messages is enabled.[0m
+[2mmachine # [    7.092892] systemd[1]: Starting Coldplug All udev Devices...[0m
+[2mmachine # [    7.116450] systemd[1]: Listening on Journal Log Access Socket.[0m
+[2mmachine # [    7.127669] loop: module loaded[0m
+[2mmachine # [    7.131540] systemd[1]: Mounted Huge Pages File System.[0m
+[2mmachine # [    6.905941] systemd[1]: Queued start job for default target Multi-User System.[0m
+[2mmachine # [    6.910758] systemd[1]: systemd-journald.service: Deactivated successfully.[0m
+[2mmachine # [    6.914743] systemd-modules-load[284]: Inserted module 'loop'[0m
+[2mmachine # [    7.150282] systemd[1]: Started Journal Service.[0m
+[2mmachine # [    6.930140] systemd[1]: Mounted POSIX Message Queue File System.[0m
+[2mmachine # [    6.934463] systemd[1]: Mounted Kernel Debug File System.[0m
+[2mmachine # [    6.937354] systemd[1]: Mounted Kernel Trace File System.[0m
+[2mmachine # [    7.167528] EXT4-fs (vda): re-mounted ef5cdfa2-307f-450b-8f2a-1341ff20a189.[0m
+[2mmachine # [    6.943702] systemd[1]: Finished Create List of Static Device Nodes.[0m
+[2mmachine # [    6.945322] systemd[1]: modprobe@configfs.service: Deactivated successfully.[0m
+[2mmachine # [    6.950512] systemd[1]: Finished Load Kernel Module configfs.[0m
+[2mmachine # [    6.951965] systemd[1]: Mounted FUSE Control File System.[0m
+[2mmachine # [    6.957448] systemd[1]: Finished Load Kernel Modules.[0m
+[2mmachine # [    6.965260] systemd[1]: Finished Remount Root and Kernel File Systems.[0m
+[2mmachine # [    6.980135] systemd[1]: Listening on Disk Image Download Service Socket.[0m
+[2mmachine # [    6.988128] systemd[1]: Mounting Kernel Configuration File System...[0m
+[2mmachine # [    6.992124] systemd[1]: Starting Firewall...[0m
+[2mmachine # [    7.002239] systemd-oomd[286]: [0;1;33m[0;1;38:5:185mNo swap; memory pressure usage will be degraded[0m[0m
+[2mmachine # [    7.008128] systemd[1]: Starting Flush Journal to Persistent Storage...[0m
+[2mmachine # [    7.009672] systemd[1]: Platform Persistent Storage Archival skipped, unmet condition check ConditionDirectoryNotEmpty=/sys/fs/pstore[0m
+[2mmachine # [    7.022155] systemd[1]: Starting Load/Save OS Random Seed...[0m
+[2mmachine # [    7.041201] systemd[1]: Starting Apply Kernel Variables...[0m
+[2mmachine # [    7.054148] systemd[1]: Starting Create Static Device Nodes in /dev gracefully...[0m
+[2mmachine # [    7.056764] systemd[1]: TPM SRK Setup skipped, unmet condition check ConditionSecurity=measured-os[0m
+[2mmachine # [    7.066514] systemd[1]: Started Userspace Out-Of-Memory (OOM) Killer.[0m
+[2mmachine # [    7.327938] systemd-journald[283]: Received client request to flush runtime journal.[0m
+[2mmachine # [    7.318856] systemd[1]: Finished Load/Save OS Random Seed.[0m
+[2mmachine # [    7.324745] systemd[1]: Reached target First Boot Complete.[0m
+[2mmachine # [    7.326463] systemd[1]: Mounted Kernel Configuration File System.[0m
+[2mmachine # [    7.331428] systemd[1]: Finished Apply Kernel Variables.[0m
+[2mmachine # [    7.332770] systemd[1]: Finished Create Static Device Nodes in /dev gracefully.[0m
+[2mmachine # [    7.334543] systemd[1]: Starting Create Static Device Nodes in /dev...[0m
+[2mmachine # [    7.337218] systemd[1]: Finished Flush Journal to Persistent Storage.[0m
+[2mmachine # [    7.383586] systemd[1]: Finished Create Static Device Nodes in /dev.[0m
+[2mmachine # [    7.387294] systemd[1]: Reached target Preparation for Local File Systems.[0m
+[2mmachine # [    7.392369] systemd[1]: Starting Rule-based Manager for Device Events and Files...[0m
+[2mmachine # [    7.411731] systemd[1]: Finished Coldplug All udev Devices.[0m
+[2mmachine # [    7.450965] systemd-udevd[323]: Using default interface naming scheme 'v261'.[0m
+[2mmachine # [    7.511426] systemd[1]: Started Rule-based Manager for Device Events and Files.[0m
+[2mmachine # [    7.625239] systemd[1]: Mounting /run/wrappers...[0m
+[2mmachine # [    7.669435] systemd[1]: Mounted /run/wrappers.[0m
+[2mmachine # [    7.671777] systemd[1]: Reached target Local File Systems.[0m
+[2mmachine # [    7.677730] systemd[1]: Listening on Boot Loader Control Service Socket.[0m
+[2mmachine # [    7.683126] systemd[1]: Starting Create SUID/SGID Wrappers...[0m
+[2mmachine # [    7.684562] systemd[1]: Update Boot Loader Random Seed skipped, no trigger condition checks were met.[0m
+[2mmachine # [    7.692112] systemd[1]: Starting Save Transient machine-id to Disk...[0m
+[2mmachine # [    7.704528] systemd[1]: Starting Create System Files and Directories...[0m
+[2mmachine # [    7.750796] systemd[1]: Load Kernel Module fuse skipped, unmet condition check ConditionKernelModuleLoaded=!fuse[0m
+[2mmachine # [    7.787709] systemd[1]: etc-machine\x2did.mount: Deactivated successfully.[0m
+[2mmachine # [    7.802201] systemd[1]: Finished Save Transient machine-id to Disk.[0m
+[2mmachine # [    7.849117] systemd[1]: Finished Create System Files and Directories.[0m
+[2mmachine # [    7.861198] systemd[1]: Starting Rebuild Journal Catalog...[0m
+[2mmachine # [    7.868358] systemd[1]: Starting Record System Boot/Shutdown in UTMP...[0m
+[2mmachine # [    7.956125] systemd[1]: Finished Record System Boot/Shutdown in UTMP.[0m
+[2mmachine # [    7.988437] systemd[1]: Finished Rebuild Journal Catalog.[0m
+[2mmachine # [    7.996853] systemd[1]: Starting Update is Completed...[0m
+[2mmachine # [    8.055979] systemd[1]: Finished Update is Completed.[0m
+[2mmachine # [    8.057518] systemd[1]: Condition check resulted in /dev/hvc0 being skipped.[0m
+[2mmachine # [    8.120461] systemd[1]: Condition check resulted in /dev/ttyS0 being skipped.[0m
+[2mmachine # [    8.149397] (udev-worker)[347]: [0;1;33m[0;1;38:5:185meth1: Config file /etc/systemd/network/40-eth1.link is applied to device based on potentially unpredictable interface name.[0m[0m
+[2mmachine # [    8.153668] (udev-worker)[347]: Network interface NamePolicy= disabled on kernel command line.[0m
+[2mmachine # [    8.171525] (udev-worker)[349]: Network interface NamePolicy= disabled on kernel command line.[0m
+[2mmachine # [    8.250590] systemd[1]: suid-sgid-wrappers.service: Deactivated successfully.[0m
+[2mmachine # [    8.254118] systemd[1]: Finished Create SUID/SGID Wrappers.[0m
+[2mmachine # [    8.257311] systemd[1]: Reached target System Initialization.[0m
+[2mmachine # [    8.261111] systemd[1]: Started Discard unused filesystem blocks once a week.[0m
+[2mmachine # [    8.262862] systemd[1]: Started Daily Cleanup of Temporary Directories.[0m
+[2mmachine # [    8.265434] systemd[1]: Reached target Timer Units.[0m
+[2mmachine # [    8.268580] systemd[1]: Listening on D-Bus System Message Bus Socket.[0m
+[2mmachine # [    8.270304] systemd[1]: Listening on Virtual Machine and Container Registration Service Socket.[0m
+[2mmachine # [    8.272754] systemd[1]: Reached target Socket Units.[0m
+[2mmachine # [    8.275408] systemd[1]: Reached target Basic System.[0m
+[2mmachine # [    8.279106] systemd[1]: Started backdoor.service.[0m
+[2mmachine # [    8.287552] systemd[1]: Starting Import lastlog data into lastlog2 database...[0m
+[2mmachine # [    8.306886] systemd[1]: Starting Name Service Cache Daemon (nsncd)...[0m
+[2mmachine # [    8.320142] systemd[1]: Starting Post-Boot Actions...[0m
+[2mmachine # [    8.345682] systemd[1]: Started Reset console on configuration changes.[0m
+[2mmachine # [    8.377605] systemd[1]: Starting resolvconf update...[0m
+[2mmachine # connecting to host...[0m
+[2mmachine # [    8.463124] systemd[1]: Starting D-Bus System Message Bus...[0m
+machine: Guest shell says: b'Spawning backdoor root shell...\n'
+[2mmachine # [    8.480243] systemd[1]: Finished Post-Boot Actions.[0m
+[2mmachine # [    8.484598] nsncd[480]: Oct 27 18:39:12.524 INFO started, config: Config { ignored_request_types: {}, worker_count: 8, handoff_timeout: 10s }, path: "/var/run/nscd/socket"[0m
+machine: connected to guest root shell
+machine: (connecting took 9.53 seconds)
+machine: (finished: waiting for the VM to finish booting, in 9.53 seconds)
+[2mmachine # [    8.505920] systemd[1]: Started Name Service Cache Daemon (nsncd).[0m
+[2mmachine # [    8.534634] systemd[1]: Condition check resulted in Virtio network device being skipped.[0m
+[2mmachine # [    8.544577] systemd[1]: Finished Import lastlog data into lastlog2 database.[0m
+[2mmachine # [    8.552179] systemd[1]: Reached target Host and Network Name Lookups.[0m
+[2mmachine # [    8.555276] systemd[1]: Reached target User and Group Name Lookups.[0m
+[2mmachine # [    8.578220] systemd[1]: Starting User Login Management...[0m
+[2mmachine # [    8.683726] systemd[1]: Finished Firewall.[0m
+[2mmachine # [    8.690876] dbus-broker-launch[500]: Looking up NSS user entry for 'systemd-timesync'...[0m
+[2mmachine # [    8.700732] dbus-broker-launch[500]: NSS returned no entry for 'systemd-timesync'[0m
+[2mmachine # [    8.703220] dbus-broker-launch[500]: Invalid user-name in /nix/store/7aqifbp4js9fsybqhhhfbl2s7nyy765b-system-path/share/dbus-1/system.d/org.freedesktop.timesync1.conf +16: user="systemd-timesync"[0m
+[2mmachine # [    8.739845] systemd[1]: Started D-Bus System Message Bus.[0m
+[2mmachine # [    8.780685] dbus-broker-launch[500]: Ready[0m
+[2mmachine # [    8.794916] systemd-logind[525]: New seat seat0.[0m
+[2mmachine # [    8.799863] systemd[1]: Started User Login Management.[0m
+[2mmachine # [    8.809303] systemd[1]: Stopped target Host and Network Name Lookups.[0m
+[2mmachine # [    8.814372] systemd[1]: Stopping Host and Network Name Lookups...[0m
+[2mmachine # [    8.815912] systemd[1]: Stopped target User and Group Name Lookups.[0m
+[2mmachine # [    8.817443] systemd[1]: Stopping User and Group Name Lookups...[0m
+[2mmachine # [    8.823289] systemd[1]: Starting linger-users.service...[0m
+[2mmachine # [    8.826173] systemd[1]: Stopping Name Service Cache Daemon (nsncd)...[0m
+[2mmachine # [    8.831160] systemd[1]: nscd.service: Deactivated successfully.[0m
+[2mmachine # [    8.837346] systemd[1]: Stopped Name Service Cache Daemon (nsncd).[0m
+[2mmachine # [    8.861464] systemd[1]: Starting Name Service Cache Daemon (nsncd)...[0m
+[2mmachine # [    8.906382] systemd[1]: linger-users.service: Deactivated successfully.[0m
+[2mmachine # [    8.912414] systemd[1]: Finished linger-users.service.[0m
+[2mmachine # [    8.926230] systemd[1]: Finished resolvconf update.[0m
+[2mmachine # [    8.930951] systemd[1]: Reached target Preparation for Network.[0m
+[2mmachine # [    8.941279] systemd[1]: Starting DHCP Client...[0m
+[2mmachine # [    8.949208] systemd[1]: Starting Address configuration of eth1...[0m
+[2mmachine # [    8.960651] nsncd[590]: Oct 27 18:39:13.003 INFO started, config: Config { ignored_request_types: {}, worker_count: 8, handoff_timeout: 10s }, path: "/var/run/nscd/socket"[0m
+[2mmachine # [    8.971109] systemd[1]: Starting Extra networking commands....[0m
+[2mmachine # [    8.975466] systemd[1]: Started Name Service Cache Daemon (nsncd).[0m
+[2mmachine # [    8.986573] systemd[1]: Reached target Host and Network Name Lookups.[0m
+[2mmachine # [    8.989412] systemd[1]: Reached target User and Group Name Lookups.[0m
+[2mmachine # [    9.285032] bochs-drm 0000:00:01.0: vgaarb: deactivate vga console[0m
+[2mmachine # [    9.093190] network-addresses-eth1-start[600]: adding address 192.168.1.1/24... done[0m
+[2mmachine # [    9.124960] network-addresses-eth1-start[600]: adding address 2001:db8:1::1/64... done[0m
+[2mmachine # [    9.150949] systemd[1]: Finished Address configuration of eth1.[0m
+[2mmachine # [    9.234956] dhcpcd[624]: dhcpcd-10.3.2 starting[0m
+[2mmachine # [    9.241358] dhcpcd[673]: dev: loaded udev[0m
+[2mmachine # [    9.253391] systemd[1]: Finished Extra networking commands..[0m
+[2mmachine # [    9.256234] systemd[1]: Reached target Network.[0m
+[2mmachine # [    9.262284] systemd[1]: Starting OpenBao - A tool for managing secrets...[0m
+[2mmachine # [    9.272769] systemd[1]: Starting Permit User Sessions...[0m
+[2mmachine # [    9.341700] mousedev: PS/2 mouse device common for all mice[0m
+[2mmachine # [    9.344519] input: QEMU Virtio Keyboard as /devices/pci0000:00/0000:00:06.0/virtio4/input/input3[0m
+[2mmachine # [    9.500715] 8021q: 802.1Q VLAN Support v1.8[0m
+[2mmachine # [    9.356543] systemd[1]: Finished Permit User Sessions.[0m
+[2mmachine # [    9.500731] 8021q: adding VLAN 0 to HW filter on device eth1[0m
+[2mmachine # [    9.524196] rtc_cmos PNP0B00:00: RTC can wake from S4[0m
+[2mmachine # [    9.551372] rtc_cmos PNP0B00:00: registered as rtc0[0m
+[2mmachine # [    9.551496] rtc_cmos PNP0B00:00: setting system clock to 2026-10-27T18:39:13 UTC (1793126353)[0m
+[2mmachine # [    9.551621] rtc_cmos PNP0B00:00: alarms up to one day, y3k, 242 bytes nvram, hpet irqs[0m
+[2mmachine # [    9.560297] Console: switching to colour dummy device 80x25[0m
+[2mmachine # [    9.566082] parport_pc 00:02: reported by Plug and Play ACPI[0m
+[2mmachine # [    9.590338] parport0: PC-style at 0x378, irq 7 [PCSPP(,...)][0m
+[2mmachine # [    9.707280] cfg80211: Loading compiled-in X.509 certificates for regulatory database[0m
+[2mmachine # [    9.708597] lpc_ich 0000:00:1f.0: I/O space for GPIO uninitialized[0m
+[2mmachine # [    9.709373] Loaded X.509 cert 'sforshee: 00b28ddf47aef9cea7'[0m
+[2mmachine # [    9.709492] Loaded X.509 cert 'wens: 61c038651aabdcf94bd0ac7ff06c7248db18c600'[0m
+[2mmachine # [    9.591276] dhcpcd[673]: eth0: waiting for carrier[0m
+[2mmachine # [    9.592822] dhcpcd[673]: eth0: carrier acquired[0m
+[2mmachine # [    9.612956] dhcpcd[673]: DUID 00:01:00:01:32:73:ac:51:52:54:00:12:34:56[0m
+[2mmachine # [    9.615436] dhcpcd[673]: eth0: IAID 00:12:34:56[0m
+[2mmachine # [    9.617545] dhcpcd[673]: eth0: adding address fe80::5054:ff:fe12:3456[0m
+[2mmachine # [    9.710016] faux_driver regulatory: Direct firmware load for regulatory.db failed with error -2[0m
+[2mmachine # [    9.710021] cfg80211: failed to load regulatory.db[0m
+[2mmachine # [    9.818592] 8021q: adding VLAN 0 to HW filter on device eth0[0m
+[2mmachine # [    9.837735] i801_smbus 0000:00:1f.3: SMBus using PCI interrupt[0m
+[2mmachine # [    9.837880] i2c i2c-0: Memory type 0x07 not supported yet, not instantiating SPD[0m
+[2mmachine # [    9.894848] input: VirtualPS/2 VMware VMMouse as /devices/platform/i8042/serio1/input/input5[0m
+[2mmachine # [    9.895261] input: VirtualPS/2 VMware VMMouse as /devices/platform/i8042/serio1/input/input4[0m
+[2mmachine # [    9.956135] [drm] Found bochs VGA, ID 0xb0c5.[0m
+[2mmachine # [    9.956138] [drm] Framebuffer size 16384 kB @ 0xfd000000, mmio @ 0xfebd0000.[0m
+[2mmachine # [    9.732113] systemd[1]: Started Getty on tty1.[0m
+[2mmachine # [    9.733340] systemd[1]: Reached target Login Prompts.[0m
+[2mmachine # [    9.967691] bochs-drm 0000:00:01.0: [drm] Registered 1 planes with drm panic[0m
+[2mmachine # [    9.968832] [drm] Initialized bochs-drm 1.0.0 for 0000:00:01.0 on minor 0[0m
+[2mmachine # [    9.797266] systemd[1]: Starting Virtual Console Setup...[0m
+[2mmachine # [    9.912325] systemd-logind[525]: Watching system buttons on /dev/input/event0 (AT Translated Set 2 keyboard)[0m
+[2mmachine # [   10.233315] Console: switching to colour frame buffer device 160x50[0m
+[2mmachine # [   10.263546] ppdev: user-space parallel port driver[0m
+[2mmachine # [   10.266586] bochs-drm 0000:00:01.0: [drm] fb0: bochs-drmdrmfb frame buffer device[0m
+[2mmachine # [    9.973609] systemd[1]: Listening on Load/Save RF Kill Switch Status /dev/rfkill Watch.[0m
+[2mmachine # [   10.042224] systemd-logind[525]: Watching system buttons on /dev/input/event2 (QEMU Virtio Keyboard)[0m
+[2mmachine # [   10.048482] systemd[1]: systemd-vconsole-setup.service: Deactivated successfully.[0m
+[2mmachine # [   10.052478] systemd[1]: Stopped Virtual Console Setup.[0m
+[2mmachine # [   10.067806] systemd[1]: Starting Virtual Console Setup...[0m
+[2mmachine # [   10.370652] iTCO_wdt iTCO_wdt.1.auto: Found a ICH9 TCO device (Version=2, TCOBASE=0x0660)[0m
+[2mmachine # [   10.417324] iTCO_wdt iTCO_wdt.1.auto: initialized. heartbeat=30 sec (nowayout=0)[0m
+[2mmachine # [   10.219583] systemd[1]: systemd-vconsole-setup.service: Deactivated successfully.[0m
+[2mmachine # [   10.227333] systemd[1]: Stopped Virtual Console Setup.[0m
+[2mmachine # [   10.239920] systemd[1]: Starting Virtual Console Setup...[0m
+[2mmachine # [   10.320526] bao[677]: 2026-10-27T18:39:14.495Z [INFO]  proxy environment: http_proxy="" https_proxy="" no_proxy=""[0m
+[2mmachine # [   10.578517] kvm_amd: TSC scaling supported[0m
+[2mmachine # [   10.580076] kvm_amd: Nested Virtualization enabled[0m
+[2mmachine # [   10.582138] kvm_amd: Nested Paging enabled[0m
+[2mmachine # [   10.583472] kvm_amd: LBR virtualization supported[0m
+[2mmachine # [   10.584935] kvm_amd: Virtual VMLOAD VMSAVE supported[0m
+[2mmachine # [   10.586853] kvm_amd: Virtual GIF supported[0m
+[2mmachine # [   10.588280] kvm_amd: Virtual NMI enabled[0m
+[2mmachine # [   10.370469] bao[677]: 2026-10-27T18:39:14.547Z [INFO]  core: Initializing version history cache for core[0m
+[2mmachine # [   10.382632] bao[677]: ==> OpenBao server configuration:[0m
+[2mmachine # [   10.384345] bao[677]:              Api Address: https://acme.test:8200[0m
+[2mmachine # [   10.385805] bao[677]:                      Cgo: enabled[0m
+[2mmachine # [   10.388375] bao[677]:          Cluster Address: https://127.0.0.1:8201[0m
+[2mmachine # [   10.390420] bao[677]:    Environment Variables: INVOCATION_ID, IO_PRESSURE_WATCH, IO_PRESSURE_WRITE, JOURNAL_STREAM, LANG, LOCALE_ARCHIVE, LOGNAME, MEMORY_PRESSURE_WATCH, MEMORY_PRESSURE_WRITE, NOTIFY_SOCKET, PATH, RUNTIME_DIRECTORY, STATE_DIRECTORY, SYSTEMD_EXEC_PID, TZDIR, USER[0m
+[2mmachine # [   10.395943] bao[677]:               Go Version: go1.27.3[0m
+[2mmachine # [   10.397234] bao[677]:               Listener 1: tcp (addr: "127.0.0.1:8200", cluster address: "127.0.0.1:8201", max_request_duration: "1m30s", max_request_json_memory: "34078720", max_request_json_strings: "1000", max_request_size: "33554432", tls: "enabled")[0m
+[2mmachine # [   10.403415] bao[677]:               Listener 2: unix (max_request_duration: "1m30s", max_request_json_memory: "34078720", max_request_json_strings: "1000", max_request_size: "33554432")[0m
+[2mmachine # [   10.406616] bao[677]:               Listener 3: unix (max_request_duration: "1m30s", max_request_json_memory: "34078720", max_request_json_strings: "1000", max_request_size: "33554432")[0m
+[2mmachine # [   10.409980] bao[677]:                Log Level:[0m
+[2mmachine # [   10.411183] bao[677]:            Recovery Mode: false[0m
+[2mmachine # [   10.414130] bao[677]:                  Storage: raft (HA available)[0m
+[2mmachine # [   10.417169] bao[677]:                  Version: OpenBao v2.7.2, committed 1970-01-01T00:00:00Z[0m
+[2mmachine # [   10.419246] bao[677]:              Version Sha: refs/tags/v2.7.2[0m
+[2mmachine # [   10.431515] bao[677]: ==> OpenBao server started![0m
+[2mmachine # [   10.432835] systemd[1]: Started OpenBao - A tool for managing secrets.[0m
+[2mmachine # [   10.675053] EDAC MC: Ver: 3.0.0[0m
+[2mmachine # [   10.572456] systemd-vconsole-setup[716]: [0;1;39mConfiguration of first virtual console was skipped, ignoring remaining ones.[0m[0m
+[2mmachine # [   10.577992] systemd[1]: Finished Virtual Console Setup.[0m
+[2mmachine # [   10.766573] dhcpcd[673]: eth0: soliciting a DHCP lease[0m
+[2mmachine # [   11.004267] NET: Registered PF_PACKET protocol family[0m
+[2mmachine # [   10.781510] dhcpcd[673]: eth0: offered 10.0.2.15 from 10.0.2.2[0m
+[2mmachine # [   10.784218] dhcpcd[673]: eth0: probing address 10.0.2.15/24[0m
+machine: (finished: waiting for unit openbao.service, in 11.92 seconds)
+machine: [1m[32mwaiting for TCP port 8200 on localhost[0m
+[2mmachine # Connection to localhost (127.0.0.1) 8200 port [tcp/trivnet1] succeeded![0m
+[2mmachine # [   10.914281] bao[677]: 2026-10-27T18:39:15.090Z [INFO]  http: TLS handshake error from 127.0.0.1:44536: EOF[0m
+machine: (finished: waiting for TCP port 8200 on localhost, in 0.03 seconds)
+machine: [1m[32mwaiting for UNIX-domain stream on '/run/openbao/openbao.sock'[0m
+machine: (finished: waiting for UNIX-domain stream on '/run/openbao/openbao.sock', in 0.02 seconds)
+machine: [1m[32mwaiting for UNIX-domain stream on '/run/openbao/world-accessible.sock'[0m
+machine: (finished: waiting for UNIX-domain stream on '/run/openbao/world-accessible.sock', in 0.02 seconds)
+(finished: subtest: Wait for OpenBao to start up, in 12.00 seconds)
+[1m[32msubtest: Check Unix Socket listeners[0m
+machine: [1m[32mmust succeed: stat --printf '%A %U:%G' /run/openbao/openbao.sock[0m
+machine: (finished: must succeed: stat --printf '%A %U:%G' /run/openbao/openbao.sock, in 0.02 seconds)
+machine: [1m[32mmust fail: su -l nobody -s /bin/sh -c 'curl --fail --silent --unix-socket /run/openbao/openbao.sock localhost'[0m
+[2mmachine # [   11.001428] su[745]: Successful su for nobody by root[0m
+[2mmachine # [   11.009221] su[745]: pam_unix(su:session): session opened for user nobody(uid=65534) by (uid=0)[0m
+[2mmachine # [   11.062603] su[745]: pam_unix(su:session): session closed for user nobody[0m
+machine: (finished: must fail: su -l nobody -s /bin/sh -c 'curl --fail --silent --unix-socket /run/openbao/openbao.sock localhost', in 0.09 seconds)
+machine: [1m[32mmust succeed: stat --printf '%A %U:%G' /run/openbao/world-accessible.sock[0m
+machine: (finished: must succeed: stat --printf '%A %U:%G' /run/openbao/world-accessible.sock, in 0.02 seconds)
+machine: [1m[32mmust succeed: su -l nobody -s /bin/sh -c 'curl --fail --silent --unix-socket /run/openbao/world-accessible.sock localhost'[0m
+[2mmachine # [   11.100920] su[753]: Successful su for nobody by root[0m
+[2mmachine # [   11.109706] su[753]: pam_unix(su:session): session opened for user nobody(uid=65534) by (uid=0)[0m
+[2mmachine # [   11.141328] su[753]: pam_unix(su:session): session closed for user nobody[0m
+machine: (finished: must succeed: su -l nobody -s /bin/sh -c 'curl --fail --silent --unix-socket /run/openbao/world-accessible.sock localhost', in 0.06 seconds)
+(finished: subtest: Check Unix Socket listeners, in 0.18 seconds)
+[1m[32msubtest: Check that the web UI is being served[0m
+machine: [1m[32mmust succeed: curl -L --fail --show-error --silent $BAO_ADDR | grep '<title>OpenBao</title>'[0m
+machine: (finished: must succeed: curl -L --fail --show-error --silent $BAO_ADDR | grep '<title>OpenBao</title>', in 0.13 seconds)
+(finished: subtest: Check that the web UI is being served, in 0.13 seconds)
+[1m[32msubtest: Check that OpenBao is not initialized[0m
+machine: [1m[32mmust fail: bao status[0m
+[2mmachine # [   11.424869] bao[677]: 2026-10-27T18:39:15.600Z [INFO]  core: security barrier not initialized[0m
+[2mmachine # [   11.427462] bao[677]: 2026-10-27T18:39:15.603Z [INFO]  core: seal configuration missing, not initialized[0m
+machine: (finished: must fail: bao status, in 0.17 seconds)
+(finished: subtest: Check that OpenBao is not initialized, in 0.17 seconds)
+[1m[32msubtest: Initialize OpenBao[0m
+machine: [1m[32mmust succeed: bao operator init[0m
+[2mmachine # [   11.549651] dhcpcd[673]: eth0: soliciting an IPv6 router[0m
+[2mmachine # [   11.551469] dhcpcd[673]: eth0: Router Advertisement from fe80::2[0m
+[2mmachine # [   11.553414] dhcpcd[673]: eth0: adding address fec0::5054:ff:fe12:3456/64[0m
+[2mmachine # [   11.556162] dhcpcd[673]: eth0: adding route to fec0::/64[0m
+[2mmachine # [   11.557599] dhcpcd[673]: eth0: adding default route via fe80::2[0m
+[2mmachine # [   11.601091] bao[677]: 2026-10-27T18:39:15.777Z [INFO]  core: security barrier not initialized[0m
+[2mmachine # [   11.603562] bao[677]: 2026-10-27T18:39:15.780Z [INFO]  core: seal configuration missing, not initialized[0m
+[2mmachine # [   11.608688] bao[677]: 2026-10-27T18:39:15.785Z [INFO]  core: security barrier not initialized[0m
+[2mmachine # [   11.613369] bao[677]: 2026-10-27T18:39:15.789Z [INFO]  storage.raft: creating Raft: config="&raft.Config{ProtocolVersion:3, HeartbeatTimeout:5000000000, ElectionTimeout:5000000000, CommitTimeout:50000000, MaxAppendEntries:64, BatchApplyCh:true, ShutdownOnRemove:true, TrailingLogs:0xffffffffffffffff, SnapshotInterval:4611686018427387903, SnapshotThreshold:0xffffffffffffffff, LeaderLeaseTimeout:2500000000, LocalID:\"d6c00626-c083-71e7-2c0f-585708adaebc\", NotifyCh:(chan<- bool)(0x1c312e286d00), LogOutput:io.Writer(nil), LogLevel:\"DEBUG\", Logger:(*hclog.interceptLogger)(0x1c312e26e6f0), NoSnapshotRestoreOnStart:true, PreVoteDisabled:false, NoLegacyTelemetry:false, skipStartup:false}"[0m
+[2mmachine # [   11.630157] bao[677]: 2026-10-27T18:39:15.804Z [INFO]  storage.raft: initial configuration: index=1 servers="[{Suffrage:Voter ID:d6c00626-c083-71e7-2c0f-585708adaebc Address:127.0.0.1:8201}]"[0m
+[2mmachine # [   11.633650] bao[677]: 2026-10-27T18:39:15.806Z [INFO]  storage.raft: entering follower state: follower="Node at d6c00626-c083-71e7-2c0f-585708adaebc [Follower]" leader-address= leader-id=[0m
+[2mmachine # [   16.569955] dhcpcd[673]: eth0: leased 10.0.2.15 for 86400 seconds[0m
+[2mmachine # [   16.571473] dhcpcd[673]: eth0: adding route to 10.0.2.0/24[0m
+[2mmachine # [   16.572752] dhcpcd[673]: eth0: adding default route via 10.0.2.2[0m
+[2mmachine # [   16.638319] systemd[1]: Started DHCP Client.[0m
+[2mmachine # [   16.641280] systemd[1]: Reached target Multi-User System.[0m
+[2mmachine # [   16.642880] systemd[1]: Startup finished in 1.004s (kernel) + 4.587s (initrd) + 11.050s (userspace) = 16.642s.[0m
+[2mmachine # [   17.041874] bao[677]: 2026-10-27T18:39:21.217Z [WARN]  storage.raft: heartbeat timeout reached, starting election: last-leader-addr= last-leader-id=[0m
+[2mmachine # [   17.045159] bao[677]: 2026-10-27T18:39:21.217Z [INFO]  storage.raft: entering candidate state: node="Node at d6c00626-c083-71e7-2c0f-585708adaebc [Candidate]" term=2[0m
+[2mmachine # [   17.048354] bao[677]: 2026-10-27T18:39:21.221Z [INFO]  storage.raft: pre-vote successful, starting election: term=2 tally=1 refused=0 votesNeeded=1[0m
+[2mmachine # [   17.055986] bao[677]: 2026-10-27T18:39:21.232Z [INFO]  storage.raft: election won: term=2 tally=1[0m
+[2mmachine # [   17.057961] bao[677]: 2026-10-27T18:39:21.232Z [INFO]  storage.raft: entering leader state: leader="Node at d6c00626-c083-71e7-2c0f-585708adaebc [Leader]"[0m
+[2mmachine # [   17.070711] bao[677]: 2026-10-27T18:39:21.246Z [INFO]  core: security barrier not initialized[0m
+[2mmachine # [   17.072558] bao[677]: 2026-10-27T18:39:21.246Z [INFO]  core: acquired HA initialization lock[0m
+[2mmachine # [   17.086990] bao[677]: 2026-10-27T18:39:21.263Z [INFO]  core: security barrier initialized: shares=5 threshold=3[0m
+[2mmachine # [   17.116102] bao[677]: 2026-10-27T18:39:21.292Z [INFO]  core: post-unseal setup starting[0m
+[2mmachine # [   17.122271] bao[677]: 2026-10-27T18:39:21.298Z [INFO]  core: loaded wrapping token key[0m
+[2mmachine # [   17.124751] bao[677]: 2026-10-27T18:39:21.301Z [INFO]  core: upgrading plugin information: plugins=[][0m
+[2mmachine # [   17.126933] bao[677]: 2026-10-27T18:39:21.303Z [INFO]  core: successfully setup plugin catalog: plugin-directory=/run/openbao/plugins[0m
+[2mmachine # [   17.129901] bao[677]: 2026-10-27T18:39:21.306Z [INFO]  core: registering new declarative plugin: name=aws type=auth version=v0.1.1 sha256=""[0m
+[2mmachine # [   17.336183] bao[677]: 2026-10-27T18:39:21.512Z [INFO]  core: registering new declarative plugin: name=azure type=auth version=v0.23.0 sha256=""[0m
+[2mmachine # [   17.604214] bao[677]: 2026-10-27T18:39:21.780Z [INFO]  core: registering new declarative plugin: name=gcp type=auth version=v0.22.0 sha256=""[0m
+[2mmachine # [   17.825133] bao[677]: 2026-10-27T18:39:22.001Z [INFO]  core: registering new declarative plugin: name=github type=auth version=v0.0.1 sha256=""[0m
+[2mmachine # [   17.987204] bao[677]: 2026-10-27T18:39:22.163Z [INFO]  core: registering new declarative plugin: name=mongodb-database-plugin type=database version=v0.0.1 sha256=""[0m
+[2mmachine # [   18.082086] bao[677]: 2026-10-27T18:39:22.258Z [INFO]  openbao-plugin-database-mongodb: configuring server automatic mTLS: metadata=true timestamp=2026-10-27T18:39:22.257Z[0m
+[2mmachine # [   18.146114] bao[677]: 2026-10-27T18:39:22.322Z [INFO]  plugin process exited: metadata=true plugin=/run/openbao/plugins/openbao-plugin-database-mongodb id=863[0m
+[2mmachine # [   18.158690] bao[677]: 2026-10-27T18:39:22.335Z [INFO]  core: registering new declarative plugin: name=aws type=secret version=v0.3.1 sha256=""[0m
+[2mmachine # [   18.345198] bao[677]: 2026-10-27T18:39:22.521Z [INFO]  core: registering new declarative plugin: name=azure type=secret version=v0.23.0 sha256=""[0m
+[2mmachine # [   18.617797] bao[677]: 2026-10-27T18:39:22.794Z [INFO]  core: registering new declarative plugin: name=consul type=secret version=v0.1.1 sha256=""[0m
+[2mmachine # [   18.759943] bao[677]: 2026-10-27T18:39:22.936Z [INFO]  core: registering new declarative plugin: name=gcp type=secret version=v0.23.1 sha256=""[0m
+[2mmachine # [   18.924668] bao[677]: 2026-10-27T18:39:23.101Z [INFO]  core: registering new declarative plugin: name=gcpkms type=secret version=v0.21.0 sha256=""[0m
+[2mmachine # [   19.113444] bao[677]: 2026-10-27T18:39:23.289Z [INFO]  core: registering new declarative plugin: name=gitlab type=secret version=v0.12.1 sha256=""[0m
+[2mmachine # [   19.329208] bao[677]: 2026-10-27T18:39:23.505Z [INFO]  core: registering new declarative plugin: name=nomad type=secret version=v0.1.6 sha256=""[0m
+[2mmachine # [   19.495338] bao[677]: 2026-10-27T18:39:23.671Z [INFO]  core: registering new declarative plugin: name=oauthapp type=secret version=v3.4.1 sha256=""[0m
+[2mmachine # [   19.712368] bao[677]: 2026-10-27T18:39:23.888Z [INFO]  core: reading transactional mount table[0m
+[2mmachine # [   19.715081] bao[677]: 2026-10-27T18:39:23.891Z [INFO]  core: no mounts in transactional mount table; adding default mount table[0m
+[2mmachine # [   19.726286] bao[677]: 2026-10-27T18:39:23.902Z [INFO]  core: successfully mounted: type=cubbyhole version="v2.7.2+builtin.bao" path=cubbyhole/ namespace="ID: root. Path: "[0m
+[2mmachine # [   19.731925] bao[677]: 2026-10-27T18:39:23.908Z [INFO]  core: successfully mounted: type=system version="v2.7.2+builtin.bao" path=sys/ namespace="ID: root. Path: "[0m
+[2mmachine # [   19.737112] bao[677]: 2026-10-27T18:39:23.913Z [INFO]  core: successfully mounted: type=identity version="v2.7.2+builtin.bao" path=identity/ namespace="ID: root. Path: "[0m
+[2mmachine # [   19.753714] bao[677]: 2026-10-27T18:39:23.930Z [INFO]  core: reading transactional auth mount table[0m
+[2mmachine # [   19.757335] bao[677]: 2026-10-27T18:39:23.933Z [INFO]  core: no auth mounts in transactional auth mount table; adding default auth mount table[0m
+[2mmachine # [   19.768086] bao[677]: 2026-10-27T18:39:23.944Z [INFO]  core: successfully mounted: type=token version="v2.7.2+builtin.bao" path=token/ namespace="ID: root. Path: "[0m
+[2mmachine # [   19.776545] bao[677]: 2026-10-27T18:39:23.953Z [INFO]  rollback: Starting the rollback manager with 256 workers[0m
+[2mmachine # [   19.781229] bao[677]: 2026-10-27T18:39:23.957Z [INFO]  core: restoring leases[0m
+[2mmachine # [   19.800542] bao[677]: 2026-10-27T18:39:23.960Z [INFO]  rollback: starting rollback manager[0m
+[2mmachine # [   19.804263] bao[677]: 2026-10-27T18:39:23.980Z [INFO]  core: entities restored[0m
+[2mmachine # [   19.806151] bao[677]: 2026-10-27T18:39:23.980Z [INFO]  core: groups restored[0m
+[2mmachine # [   19.810435] bao[677]: 2026-10-27T18:39:23.986Z [INFO]  expiration: lease restore complete[0m
+[2mmachine # [   19.812442] bao[677]: 2026-10-27T18:39:23.989Z [INFO]  core: usage gauge collection is disabled[0m
+[2mmachine # [   19.817904] bao[677]: 2026-10-27T18:39:23.994Z [INFO]  core: Recorded vault version: vault version=2.7.2 upgrade time="2026-10-27 18:39:23.985770955 +0000 UTC" commit date=1970-01-01T00:00:00Z[0m
+[2mmachine # [   19.835862] bao[677]: 2026-10-27T18:39:24.011Z [INFO]  core: post-unseal setup complete[0m
+[2mmachine # [   19.847926] bao[677]: 2026-10-27T18:39:24.024Z [INFO]  core: root token generated[0m
+[2mmachine # [   19.858842] bao[677]: 2026-10-27T18:39:24.035Z [INFO]  core: pre-seal teardown starting[0m
+[2mmachine # [   19.861300] bao[677]: 2026-10-27T18:39:24.037Z [INFO]  core: stopping raft active node[0m
+[2mmachine # [   19.865969] bao[677]: 2026-10-27T18:39:24.042Z [INFO]  rollback: stopping rollback manager[0m
+[2mmachine # [   19.871424] bao[677]: 2026-10-27T18:39:24.047Z [INFO]  core: pre-seal teardown complete[0m
+[2mmachine # [   19.874195] bao[677]: 2026-10-27T18:39:24.050Z [ERROR] core: failed to unlock initialization lock: error="cannot find peer"[0m
+machine: (finished: must succeed: bao operator init, in 8.44 seconds)
+(finished: subtest: Initialize OpenBao, in 8.44 seconds)
+[1m[32msubtest: Check that OpenBao is initialized and sealed[0m
+machine: [1m[32mmust fail: bao status[0m
+machine: (finished: must fail: bao status, in 0.20 seconds)
+(finished: subtest: Check that OpenBao is initialized and sealed, in 0.20 seconds)
+[1m[32msubtest: Unseal OpenBao[0m
+machine: [1m[32mmust succeed: bao operator unseal ziawqRC7IKP+vJwGCS083UpiWYWM7HmZcz1ep6ge6x1H[0m
+machine: (finished: must succeed: bao operator unseal ziawqRC7IKP+vJwGCS083UpiWYWM7HmZcz1ep6ge6x1H, in 0.17 seconds)
+machine: [1m[32mmust succeed: bao operator unseal hAuq9F3W7sRL+7npuhFxzyHvbo35245Hi4uBcdMG2mRl[0m
+machine: (finished: must succeed: bao operator unseal hAuq9F3W7sRL+7npuhFxzyHvbo35245Hi4uBcdMG2mRl, in 0.15 seconds)
+machine: [1m[32mmust succeed: bao operator unseal CcJa3FmBSzoI03QnFMrSsqA/w/7oCxSamfVBu3w/gSZD[0m
+[2mmachine # [   20.542973] bao[677]: 2026-10-27T18:39:24.719Z [INFO]  core.cluster-listener.tcp: starting listener: listener_address=127.0.0.1:8201[0m
+[2mmachine # [   20.546413] bao[677]: 2026-10-27T18:39:24.719Z [INFO]  core.cluster-listener: serving cluster requests: cluster_listen_address=127.0.0.1:8201[0m
+[2mmachine # [   20.549744] bao[677]: 2026-10-27T18:39:24.726Z [INFO]  storage.raft: creating Raft: config="&raft.Config{ProtocolVersion:3, HeartbeatTimeout:15000000000, ElectionTimeout:15000000000, CommitTimeout:50000000, MaxAppendEntries:64, BatchApplyCh:true, ShutdownOnRemove:true, TrailingLogs:0xffffffffffffffff, SnapshotInterval:4611686018427387903, SnapshotThreshold:0xffffffffffffffff, LeaderLeaseTimeout:2500000000, LocalID:\"d6c00626-c083-71e7-2c0f-585708adaebc\", NotifyCh:(chan<- bool)(0x1c312e6e9000), LogOutput:io.Writer(nil), LogLevel:\"DEBUG\", Logger:(*hclog.interceptLogger)(0x1c312e26e6f0), NoSnapshotRestoreOnStart:true, PreVoteDisabled:false, NoLegacyTelemetry:false, skipStartup:false}"[0m
+[2mmachine # [   20.563107] bao[677]: 2026-10-27T18:39:24.738Z [INFO]  storage.raft: initial configuration: index=1 servers="[{Suffrage:Voter ID:d6c00626-c083-71e7-2c0f-585708adaebc Address:127.0.0.1:8201}]"[0m
+[2mmachine # [   20.566478] bao[677]: 2026-10-27T18:39:24.738Z [INFO]  core: vault is unsealed[0m
+[2mmachine # [   20.568084] bao[677]: 2026-10-27T18:39:24.739Z [INFO]  storage.raft: entering follower state: follower="Node at 127.0.0.1:8201 [Follower]" leader-address= leader-id=[0m
+[2mmachine # [   20.572213] bao[677]: 2026-10-27T18:39:24.748Z [WARN]  storage.raft: heartbeat timeout reached, starting election: last-leader-addr= last-leader-id=[0m
+[2mmachine # [   20.574873] bao[677]: 2026-10-27T18:39:24.748Z [INFO]  storage.raft: entering candidate state: node="Node at 127.0.0.1:8201 [Candidate]" term=3[0m
+[2mmachine # [   20.578219] bao[677]: 2026-10-27T18:39:24.754Z [INFO]  storage.raft: pre-vote successful, starting election: term=3 tally=1 refused=0 votesNeeded=1[0m
+[2mmachine # [   20.582218] bao[677]: 2026-10-27T18:39:24.758Z [INFO]  core: attempting leadership lock acquisition[0m
+[2mmachine # [   20.584653] bao[677]: 2026-10-27T18:39:24.761Z [INFO]  core: pre-seal teardown starting[0m
+[2mmachine # [   20.586794] bao[677]: 2026-10-27T18:39:24.763Z [INFO]  core: stopping raft active node[0m
+[2mmachine # [   20.588968] bao[677]: 2026-10-27T18:39:24.765Z [INFO]  core: pre-seal teardown complete[0m
+[2mmachine # [   20.591191] bao[677]: 2026-10-27T18:39:24.767Z [INFO]  core: entering read-enabled standby mode[0m
+[2mmachine # [   20.593101] bao[677]: 2026-10-27T18:39:24.767Z [INFO]  core: post-unseal setup starting[0m
+[2mmachine # [   20.596663] bao[677]: 2026-10-27T18:39:24.773Z [INFO]  core: upgrading plugin information: plugins=[][0m
+[2mmachine # [   20.601091] bao[677]: 2026-10-27T18:39:24.776Z [INFO]  core: successfully setup plugin catalog: plugin-directory=/run/openbao/plugins[0m
+[2mmachine # [   20.603556] bao[677]: 2026-10-27T18:39:24.776Z [INFO]  core: updating existing plugin: name=aws type=auth version=v0.1.1 sha256=""[0m
+[2mmachine # [   20.605936] bao[677]: 2026-10-27T18:39:24.776Z [WARN]  core: plugin out of date in storage versus standby node configuration; this may be a false-positive depending on data replication state: name=aws type=auth version=v0.1.1 sha256=""[0m
+[2mmachine # [   20.609926] bao[677]: 2026-10-27T18:39:24.776Z [INFO]  core: updating existing plugin: name=azure type=auth version=v0.23.0 sha256=""[0m
+[2mmachine # [   20.612400] bao[677]: 2026-10-27T18:39:24.776Z [WARN]  core: plugin out of date in storage versus standby node configuration; this may be a false-positive depending on data replication state: name=azure type=auth version=v0.23.0 sha256=""[0m
+[2mmachine # [   20.616476] bao[677]: 2026-10-27T18:39:24.777Z [INFO]  core: updating existing plugin: name=gcp type=auth version=v0.22.0 sha256=""[0m
+[2mmachine # [   20.618886] bao[677]: 2026-10-27T18:39:24.777Z [WARN]  core: plugin out of date in storage versus standby node configuration; this may be a false-positive depending on data replication state: name=gcp type=auth version=v0.22.0 sha256=""[0m
+[2mmachine # [   20.623532] bao[677]: 2026-10-27T18:39:24.799Z [INFO]  core: updating existing plugin: name=github type=auth version=v0.0.1 sha256=""[0m
+[2mmachine # [   20.625990] bao[677]: 2026-10-27T18:39:24.800Z [WARN]  core: plugin out of date in storage versus standby node configuration; this may be a false-positive depending on data replication state: name=github type=auth version=v0.0.1 sha256=""[0m
+[2mmachine # [   20.631150] bao[677]: 2026-10-27T18:39:24.807Z [INFO]  core: updating existing plugin: name=mongodb-database-plugin type=database version=v0.0.1 sha256=""[0m
+[2mmachine # [   20.636109] bao[677]: 2026-10-27T18:39:24.807Z [WARN]  core: plugin out of date in storage versus standby node configuration; this may be a false-positive depending on data replication state: name=mongodb-database-plugin type=database version=v0.0.1 sha256=""[0m
+[2mmachine # [   20.640587] bao[677]: 2026-10-27T18:39:24.811Z [INFO]  core: updating existing plugin: name=aws type=secret version=v0.3.1 sha256=""[0m
+[2mmachine # [   20.643086] bao[677]: 2026-10-27T18:39:24.811Z [WARN]  core: plugin out of date in storage versus standby node configuration; this may be a false-positive depending on data replication state: name=aws type=secret version=v0.3.1 sha256=""[0m
+[2mmachine # [   20.647480] bao[677]: 2026-10-27T18:39:24.812Z [INFO]  core: updating existing plugin: name=azure type=secret version=v0.23.0 sha256=""[0m
+[2mmachine # [   20.650196] bao[677]: 2026-10-27T18:39:24.812Z [WARN]  core: plugin out of date in storage versus standby node configuration; this may be a false-positive depending on data replication state: name=azure type=secret version=v0.23.0 sha256=""[0m
+[2mmachine # [   20.655281] bao[677]: 2026-10-27T18:39:24.812Z [INFO]  core: updating existing plugin: name=consul type=secret version=v0.1.1 sha256=""[0m
+[2mmachine # [   20.658381] bao[677]: 2026-10-27T18:39:24.831Z [WARN]  core: plugin out of date in storage versus standby node configuration; this may be a false-positive depending on data replication state: name=consul type=secret version=v0.1.1 sha256=""[0m
+[2mmachine # [   20.663961] bao[677]: 2026-10-27T18:39:24.840Z [INFO]  core: updating existing plugin: name=gcp type=secret version=v0.23.1 sha256=""[0m
+[2mmachine # [   20.666793] bao[677]: 2026-10-27T18:39:24.840Z [WARN]  core: plugin out of date in storage versus standby node configuration; this may be a false-positive depending on data replication state: name=gcp type=secret version=v0.23.1 sha256=""[0m
+[2mmachine # [   20.672419] bao[677]: 2026-10-27T18:39:24.848Z [INFO]  core: updating existing plugin: name=gcpkms type=secret version=v0.21.0 sha256=""[0m
+[2mmachine # [   20.675240] bao[677]: 2026-10-27T18:39:24.848Z [WARN]  core: plugin out of date in storage versus standby node configuration; this may be a false-positive depending on data replication state: name=gcpkms type=secret version=v0.21.0 sha256=""[0m
+[2mmachine # [   20.680941] bao[677]: 2026-10-27T18:39:24.857Z [INFO]  core: updating existing plugin: name=gitlab type=secret version=v0.12.1 sha256=""[0m
+[2mmachine # [   20.685096] bao[677]: 2026-10-27T18:39:24.857Z [WARN]  core: plugin out of date in storage versus standby node configuration; this may be a false-positive depending on data replication state: name=gitlab type=secret version=v0.12.1 sha256=""[0m
+[2mmachine # [   20.689742] bao[677]: 2026-10-27T18:39:24.861Z [INFO]  core: updating existing plugin: name=nomad type=secret version=v0.1.6 sha256=""[0m
+[2mmachine # [   20.692546] bao[677]: 2026-10-27T18:39:24.861Z [WARN]  core: plugin out of date in storage versus standby node configuration; this may be a false-positive depending on data replication state: name=nomad type=secret version=v0.1.6 sha256=""[0m
+[2mmachine # [   20.697117] bao[677]: 2026-10-27T18:39:24.861Z [INFO]  core: updating existing plugin: name=oauthapp type=secret version=v3.4.1 sha256=""[0m
+[2mmachine # [   20.700302] bao[677]: 2026-10-27T18:39:24.861Z [WARN]  core: plugin out of date in storage versus standby node configuration; this may be a false-positive depending on data replication state: name=oauthapp type=secret version=v3.4.1 sha256=""[0m
+[2mmachine # [   20.716596] bao[677]: 2026-10-27T18:39:24.893Z [INFO]  storage.raft: election won: term=3 tally=1[0m
+[2mmachine # [   20.719329] bao[677]: 2026-10-27T18:39:24.895Z [INFO]  storage.raft: entering leader state: leader="Node at 127.0.0.1:8201 [Leader]"[0m
+[2mmachine # [   20.749140] bao[677]: 2026-10-27T18:39:24.925Z [INFO]  core: reading transactional mount table[0m
+[2mmachine # [   20.754985] bao[677]: 2026-10-27T18:39:24.931Z [INFO]  core: successfully mounted: type=system version="v2.7.2+builtin.bao" path=sys/ namespace="ID: root. Path: "[0m
+[2mmachine # [   20.759465] bao[677]: 2026-10-27T18:39:24.936Z [INFO]  core: successfully mounted: type=identity version="v2.7.2+builtin.bao" path=identity/ namespace="ID: root. Path: "[0m
+[2mmachine # [   20.762964] bao[677]: 2026-10-27T18:39:24.939Z [INFO]  core: successfully mounted: type=cubbyhole version="v2.7.2+builtin.bao" path=cubbyhole/ namespace="ID: root. Path: "[0m
+[2mmachine # [   20.777739] bao[677]: 2026-10-27T18:39:24.954Z [INFO]  core: reading transactional auth mount table[0m
+[2mmachine # [   20.783937] bao[677]: 2026-10-27T18:39:24.960Z [INFO]  core: successfully mounted: type=token version="v2.7.2+builtin.bao" path=token/ namespace="ID: root. Path: "[0m
+[2mmachine # [   20.790707] bao[677]: 2026-10-27T18:39:24.967Z [INFO]  rollback: Starting the rollback manager with 256 workers[0m
+[2mmachine # [   20.796734] bao[677]: 2026-10-27T18:39:24.973Z [INFO]  core: skipping lease restoration - standby[0m
+[2mmachine # [   20.799701] bao[677]: 2026-10-27T18:39:24.976Z [INFO]  rollback: starting rollback manager[0m
+[2mmachine # [   20.807097] bao[677]: 2026-10-27T18:39:24.982Z [INFO]  core: acquired lock, enabling active operation[0m
+[2mmachine # [   20.814794] bao[677]: 2026-10-27T18:39:24.991Z [INFO]  core: entities restored[0m
+[2mmachine # [   20.816989] bao[677]: 2026-10-27T18:39:24.993Z [INFO]  core: groups restored[0m
+[2mmachine # [   20.822066] bao[677]: 2026-10-27T18:39:24.998Z [INFO]  core: post-unseal setup complete[0m
+[2mmachine # [   20.839992] bao[677]: 2026-10-27T18:39:25.016Z [INFO]  core: pre-seal teardown starting[0m
+[2mmachine # [   20.843100] bao[677]: 2026-10-27T18:39:25.018Z [INFO]  core: stopping raft active node[0m
+[2mmachine # [   20.848755] bao[677]: 2026-10-27T18:39:25.025Z [INFO]  rollback: stopping rollback manager[0m
+[2mmachine # [   20.854442] bao[677]: 2026-10-27T18:39:25.030Z [INFO]  core: pre-seal teardown complete[0m
+[2mmachine # [   20.857111] bao[677]: 2026-10-27T18:39:25.033Z [INFO]  core: post-unseal setup starting[0m
+[2mmachine # [   20.860108] bao[677]: 2026-10-27T18:39:25.036Z [INFO]  core: loaded wrapping token key[0m
+[2mmachine # [   20.862237] bao[677]: 2026-10-27T18:39:25.038Z [INFO]  core: upgrading plugin information: plugins=[][0m
+[2mmachine # [   20.865098] bao[677]: 2026-10-27T18:39:25.041Z [INFO]  core: successfully setup plugin catalog: plugin-directory=/run/openbao/plugins[0m
+[2mmachine # [   20.867899] bao[677]: 2026-10-27T18:39:25.041Z [INFO]  core: updating existing plugin: name=aws type=auth version=v0.1.1 sha256=""[0m
+[2mmachine # [   20.969446] bao[677]: 2026-10-27T18:39:25.145Z [INFO]  core: updating existing plugin: name=azure type=auth version=v0.23.0 sha256=""[0m
+[2mmachine # [   21.062309] bao[677]: 2026-10-27T18:39:25.238Z [INFO]  core: updating existing plugin: name=gcp type=auth version=v0.22.0 sha256=""[0m
+[2mmachine # [   21.141122] bao[677]: 2026-10-27T18:39:25.316Z [INFO]  core: updating existing plugin: name=github type=auth version=v0.0.1 sha256=""[0m
+[2mmachine # [   21.233895] bao[677]: 2026-10-27T18:39:25.410Z [INFO]  core: updating existing plugin: name=mongodb-database-plugin type=database version=v0.0.1 sha256=""[0m
+[2mmachine # [   21.260301] bao[677]: 2026-10-27T18:39:25.436Z [INFO]  openbao-plugin-database-mongodb: configuring server automatic mTLS: metadata=true timestamp=2026-10-27T18:39:25.436Z[0m
+[2mmachine # [   21.309146] bao[677]: 2026-10-27T18:39:25.485Z [INFO]  plugin process exited: metadata=true plugin=/run/openbao/plugins/openbao-plugin-database-mongodb id=959[0m
+[2mmachine # [   21.317557] bao[677]: 2026-10-27T18:39:25.493Z [INFO]  core: updating existing plugin: name=aws type=secret version=v0.3.1 sha256=""[0m
+[2mmachine # [   21.415251] bao[677]: 2026-10-27T18:39:25.591Z [INFO]  core: updating existing plugin: name=azure type=secret version=v0.23.0 sha256=""[0m
+[2mmachine # [   21.529151] bao[677]: 2026-10-27T18:39:25.704Z [INFO]  core: updating existing plugin: name=consul type=secret version=v0.1.1 sha256=""[0m
+[2mmachine # [   21.631239] bao[677]: 2026-10-27T18:39:25.807Z [INFO]  core: updating existing plugin: name=gcp type=secret version=v0.23.1 sha256=""[0m
+[2mmachine # [   21.722599] bao[677]: 2026-10-27T18:39:25.899Z [INFO]  core: updating existing plugin: name=gcpkms type=secret version=v0.21.0 sha256=""[0m
+[2mmachine # [   21.828861] bao[677]: 2026-10-27T18:39:26.005Z [INFO]  core: updating existing plugin: name=gitlab type=secret version=v0.12.1 sha256=""[0m
+[2mmachine # [   21.934330] bao[677]: 2026-10-27T18:39:26.110Z [INFO]  core: updating existing plugin: name=nomad type=secret version=v0.1.6 sha256=""[0m
+[2mmachine # [   22.040792] bao[677]: 2026-10-27T18:39:26.217Z [INFO]  core: updating existing plugin: name=oauthapp type=secret version=v3.4.1 sha256=""[0m
+[2mmachine # [   22.162126] bao[677]: 2026-10-27T18:39:26.337Z [INFO]  core: reading transactional mount table[0m
+[2mmachine # [   22.167299] bao[677]: 2026-10-27T18:39:26.343Z [INFO]  core: successfully mounted: type=system version="v2.7.2+builtin.bao" path=sys/ namespace="ID: root. Path: "[0m
+[2mmachine # [   22.172203] bao[677]: 2026-10-27T18:39:26.348Z [INFO]  core: successfully mounted: type=identity version="v2.7.2+builtin.bao" path=identity/ namespace="ID: root. Path: "[0m
+[2mmachine # [   22.175352] bao[677]: 2026-10-27T18:39:26.351Z [INFO]  core: successfully mounted: type=cubbyhole version="v2.7.2+builtin.bao" path=cubbyhole/ namespace="ID: root. Path: "[0m
+[2mmachine # [   22.186247] bao[677]: 2026-10-27T18:39:26.362Z [INFO]  core: reading transactional auth mount table[0m
+[2mmachine # [   22.189740] bao[677]: 2026-10-27T18:39:26.366Z [INFO]  core: successfully mounted: type=token version="v2.7.2+builtin.bao" path=token/ namespace="ID: root. Path: "[0m
+[2mmachine # [   22.194240] bao[677]: 2026-10-27T18:39:26.370Z [INFO]  rollback: Starting the rollback manager with 256 workers[0m
+[2mmachine # [   22.198303] bao[677]: 2026-10-27T18:39:26.374Z [INFO]  core: restoring leases[0m
+[2mmachine # [   22.208101] bao[677]: 2026-10-27T18:39:26.384Z [INFO]  expiration: lease restore complete[0m
+[2mmachine # [   22.213091] bao[677]: 2026-10-27T18:39:26.389Z [INFO]  rollback: starting rollback manager[0m
+[2mmachine # [   22.215987] bao[677]: 2026-10-27T18:39:26.392Z [INFO]  core: entities restored[0m
+[2mmachine # [   22.217860] bao[677]: 2026-10-27T18:39:26.394Z [INFO]  core: groups restored[0m
+[2mmachine # [   22.221084] bao[677]: 2026-10-27T18:39:26.397Z [INFO]  core: starting raft active node[0m
+[2mmachine # [   22.222732] bao[677]: 2026-10-27T18:39:26.397Z [INFO]  storage.raft: starting autopilot: config="&{false 0 10s 24h0m0s 1000 0 10s}" reconcile_interval=0s[0m
+[2mmachine # [   22.227763] bao[677]: 2026-10-27T18:39:26.404Z [INFO]  core: post-unseal setup complete[0m
+[2mmachine # [   22.230874] bao[677]: 2026-10-27T18:39:26.407Z [INFO]  core: usage gauge collection is disabled[0m
+machine: (finished: must succeed: bao operator unseal CcJa3FmBSzoI03QnFMrSsqA/w/7oCxSamfVBu3w/gSZD, in 1.84 seconds)
+(finished: subtest: Unseal OpenBao, in 2.16 seconds)
+[1m[32msubtest: Check that OpenBao is not sealed[0m
+machine: [1m[32mmust succeed: bao status[0m
+machine: (finished: must succeed: bao status, in 0.17 seconds)
+(finished: subtest: Check that OpenBao is not sealed, in 0.17 seconds)
+[1m[32msubtest: Login with root token[0m
+machine: [1m[32mmust succeed: bao login s.5XY0c9DdTNEGvXMUyS39ILRS[0m
+machine: (finished: must succeed: bao login s.5XY0c9DdTNEGvXMUyS39ILRS, in 0.15 seconds)
+(finished: subtest: Login with root token, in 0.15 seconds)
+[1m[32msubtest: Check that external plugins are registered[0m
+machine: [1m[32mmust succeed: bao plugin info -version v0.1.1 auth aws[0m
+machine: (finished: must succeed: bao plugin info -version v0.1.1 auth aws, in 0.15 seconds)
+machine: [1m[32mmust succeed: bao plugin info -version v0.23.0 auth azure[0m
+machine: (finished: must succeed: bao plugin info -version v0.23.0 auth azure, in 0.15 seconds)
+machine: [1m[32mmust succeed: bao plugin info -version v0.22.0 auth gcp[0m
+machine: (finished: must succeed: bao plugin info -version v0.22.0 auth gcp, in 0.14 seconds)
+machine: [1m[32mmust succeed: bao plugin info -version v0.0.1 auth github[0m
+machine: (finished: must succeed: bao plugin info -version v0.0.1 auth github, in 0.17 seconds)
+machine: [1m[32mmust succeed: bao plugin info -version v0.0.1 database mongodb-database-plugin[0m
+machine: (finished: must succeed: bao plugin info -version v0.0.1 database mongodb-database-plugin, in 0.14 seconds)
+machine: [1m[32mmust succeed: bao plugin info -version v0.3.1 secret aws[0m
+machine: (finished: must succeed: bao plugin info -version v0.3.1 secret aws, in 0.14 seconds)
+machine: [1m[32mmust succeed: bao plugin info -version v0.23.0 secret azure[0m
+machine: (finished: must succeed: bao plugin info -version v0.23.0 secret azure, in 0.15 seconds)
+machine: [1m[32mmust succeed: bao plugin info -version v0.1.1 secret consul[0m
+machine: (finished: must succeed: bao plugin info -version v0.1.1 secret consul, in 0.16 seconds)
+machine: [1m[32mmust succeed: bao plugin info -version v0.23.1 secret gcp[0m
+machine: (finished: must succeed: bao plugin info -version v0.23.1 secret gcp, in 0.16 seconds)
+machine: [1m[32mmust succeed: bao plugin info -version v0.21.0 secret gcpkms[0m
+machine: (finished: must succeed: bao plugin info -version v0.21.0 secret gcpkms, in 0.15 seconds)
+machine: [1m[32mmust succeed: bao plugin info -version v0.12.1 secret gitlab[0m
+machine: (finished: must succeed: bao plugin info -version v0.12.1 secret gitlab, in 0.14 seconds)
+machine: [1m[32mmust succeed: bao plugin info -version v0.1.6 secret nomad[0m
+machine: (finished: must succeed: bao plugin info -version v0.1.6 secret nomad, in 0.15 seconds)
+machine: [1m[32mmust succeed: bao plugin info -version v3.4.1 secret oauthapp[0m
+machine: (finished: must succeed: bao plugin info -version v3.4.1 secret oauthapp, in 0.15 seconds)
+(finished: subtest: Check that external plugins are registered, in 1.95 seconds)
+[1m[32msubtest: Enable external plugins[0m
+machine: [1m[32mmust succeed: bao auth enable github[0m
+[2mmachine # [   24.673402] bao[677]: 2026-10-27T18:39:28.849Z [INFO]  auth.github.auth_github_6f624ef8.github.openbao-plugin-auth-github: configuring server automatic mTLS: timestamp=2026-10-27T18:39:28.849Z[0m
+[2mmachine # [   24.740123] bao[677]: 2026-10-27T18:39:28.913Z [INFO]  core: enabled credential backend: namespace="" path=github/ type=github version=v0.0.1[0m
+machine: (finished: must succeed: bao auth enable github, in 0.24 seconds)
+machine: [1m[32mmust succeed: bao secrets enable nomad[0m
+[2mmachine # [   24.908239] bao[677]: 2026-10-27T18:39:29.084Z [INFO]  secrets.nomad.nomad_5c673b21.nomad.openbao-plugin-secrets-nomad: configuring server automatic mTLS: timestamp=2026-10-27T18:39:29.084Z[0m
+[2mmachine # [   24.968205] bao[677]: 2026-10-27T18:39:29.144Z [INFO]  core: successful mount: namespace="" path=nomad/ type=nomad version=v0.1.6[0m
+machine: (finished: must succeed: bao secrets enable nomad, in 0.23 seconds)
+machine: [1m[32mmust succeed: bao secrets enable oauthapp[0m
+[2mmachine # [   25.208110] bao[677]: 2026-10-27T18:39:29.384Z [INFO]  core: successful mount: namespace="" path=oauthapp/ type=oauthapp version=v3.4.1[0m
+machine: (finished: must succeed: bao secrets enable oauthapp, in 0.24 seconds)
+machine: [1m[32mmust succeed: bao auth list[0m
+machine: (finished: must succeed: bao auth list, in 0.15 seconds)
+machine: [1m[32mmust succeed: bao secrets list[0m
+machine: (finished: must succeed: bao secrets list, in 0.18 seconds)
+(finished: subtest: Enable external plugins, in 1.05 seconds)
+[1m[32msubtest: Enable userpass auth method[0m
+machine: [1m[32mmust succeed: bao auth enable userpass[0m
+[2mmachine # [   25.692916] bao[677]: 2026-10-27T18:39:29.869Z [INFO]  core: enabled credential backend: namespace="" path=userpass/ type=userpass version=""[0m
+machine: (finished: must succeed: bao auth enable userpass, in 0.15 seconds)
+(finished: subtest: Enable userpass auth method, in 0.15 seconds)
+[1m[32msubtest: Create a user in userpass[0m
+machine: [1m[32mmust succeed: bao write auth/userpass/users/testuser password=testpassword[0m
+machine: (finished: must succeed: bao write auth/userpass/users/testuser password=testpassword, in 0.20 seconds)
+(finished: subtest: Create a user in userpass, in 0.20 seconds)
+[1m[32msubtest: Login to a user from userpass[0m
+machine: [1m[32mmust succeed: bao login -method userpass username=testuser password=testpassword[0m
+machine: (finished: must succeed: bao login -method userpass username=testuser password=testpassword, in 0.23 seconds)
+(finished: subtest: Login to a user from userpass, in 0.23 seconds)
+[1m[32msubtest: Write a secret to cubbyhole[0m
+machine: [1m[32mmust succeed: bao write cubbyhole/my-secret my-value=s3cr3t[0m
+machine: (finished: must succeed: bao write cubbyhole/my-secret my-value=s3cr3t, in 0.14 seconds)
+(finished: subtest: Write a secret to cubbyhole, in 0.14 seconds)
+[1m[32msubtest: Read a secret from cubbyhole[0m
+machine: [1m[32mmust succeed: bao read cubbyhole/my-secret[0m
+machine: (finished: must succeed: bao read cubbyhole/my-secret, in 0.15 seconds)
+(finished: subtest: Read a secret from cubbyhole, in 0.15 seconds)
+(finished: run the VM test script, in 27.67 seconds)
+test script finished in 27.70s
+[1m[32mcleanup[0m
+kill QemuMachine (pid 46)
+[2mmachine # qemu-system-x86_64: terminating on signal 15 from pid 39 (/nix/store/xahxrjs30p3mw0a42bqg9ikgkikskw8m-python3-3.14.8/bin/python3.14)[0m
+[2mmachine # [2026-10-27T18:39:30Z INFO  virtiofsd] Client disconnected, shutting down[0m
+[2mmachine # [2026-10-27T18:39:30Z INFO  virtiofsd] Client disconnected, shutting down[0m
+[2mmachine # [2026-10-27T18:39:30Z INFO  virtiofsd] Client disconnected, shutting down[0m
+(finished: cleanup, in 0.20 seconds)

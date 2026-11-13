@@ -1,0 +1,231 @@
+# The dashboard listener and its clusters, for an Envoy that the NixOS module
+# does not set up. Replace the identity header (x-forwarded-user), the proxy's
+# address (10.0.0.5), the anonymous networks, the host, the scheduler
+# addresses and the files server, as docs/operators.md says.
+# File SDS needs node.id and node.cluster.
+node: { id: nix-grpc-farm-lb, cluster: nix-grpc-farm }
+# The identity check's {1,128} compiles to about 900 RE2 instructions, and Envoy
+# refuses a regex over 100 by default.
+layered_runtime:
+  layers:
+  - name: dashboard
+    static_layer: { re2.max_program_size.error_level: 1000 }
+static_resources:
+  listeners:
+  - name: dashboard
+    address: { socket_address: { address: "::", port_value: 8443, ipv4_compat: true } }
+    # The TCP peer, which a client cannot forge: your auth proxy and the anonymous
+    # networks. Envoy closes the connection of every other peer.
+    filter_chain_matcher:
+      matcher_tree:
+        input:
+          name: peer
+          typed_config: { "@type": type.googleapis.com/envoy.extensions.matching.common_inputs.network.v3.DirectSourceIPInput }
+        custom_match:
+          name: peers
+          typed_config:
+            "@type": type.googleapis.com/xds.type.matcher.v3.IPMatcher
+            range_matchers:
+            - ranges:
+              - &proxy { address_prefix: 10.0.0.5, prefix_len: 32 }
+              - &anonymous_v4 { address_prefix: 10.20.0.0, prefix_len: 16 }
+              - &anonymous_v6 { address_prefix: "fd00:20::", prefix_len: 48 }
+              on_match: { action: { name: dashboard, typed_config: { "@type": type.googleapis.com/google.protobuf.StringValue, value: dashboard } } }
+    filter_chains:
+    - name: dashboard
+      # Leave this out only where the auth proxy terminates TLS and reaches the
+      # listener over a network nobody else shares.
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+          common_tls_context:
+            alpn_protocols: [h2, http/1.1]
+            tls_certificate_sds_secret_configs:
+            - name: dashboard
+              sds_config:
+                resource_api_version: V3
+                path_config_source: { path: "/etc/envoy/dashboard/sds-cert.json", watched_directory: { path: "/etc/envoy/dashboard/tls" } }
+      filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: dashboard
+          codec_type: AUTO
+          request_headers_timeout: 10s
+          use_remote_address: true
+          normalize_path: true
+          merge_slashes: true
+          path_with_escaped_slashes_action: UNESCAPE_AND_REDIRECT
+          forward_client_cert_details: SANITIZE
+          # Envoy picks the route before any filter runs, so Envoy itself removes the
+          # identity header from every peer but your proxy, as an internal-only header.
+          internal_address_config: { cidr_ranges: [*proxy] }
+          route_config:
+            name: dashboard
+            internal_only_headers: [x-forwarded-user]
+            # The farm's own config defines the worker clusters the log routes name.
+            validate_clusters: false
+            virtual_hosts:
+            - name: dashboard
+              # Not another host, so a page under another name cannot read the stream
+              # through a browser on an anonymous network. Any port, for the proxy's
+              # and the listener's own.
+              domains: [farm.example.com, "farm.example.com:*"]
+              # Envoy removes it here after the routes' own headers, which read it for
+              # the forwarded name.
+              request_headers_to_remove: [x-forwarded-user]
+              routes:
+              # A value outside these characters never reaches a subject.
+              - match: { prefix: /, headers: [{ name: x-forwarded-user, string_match: { safe_regex: { regex: "[A-Za-z0-9._@+-]{1,128}" } }, invert_match: true }] }
+                direct_response: { status: 403, body: { inline_string: Invalid identity header } }
+              # The users your proxy names, as dashboard-user-<name>. POST with a
+              # gRPC-web body only, so another site's preflight gets 404.
+              - match:
+                  prefix: /nix.remote.Events/
+                  headers:
+                  - &post { name: ":method", string_match: { exact: POST } }
+                  - &grpc_web_body { name: content-type, string_match: { prefix: application/grpc-web } }
+                  - &user { name: x-forwarded-user, string_match: { safe_regex: { regex: "[A-Za-z0-9._@+-]{1,128}" } } }
+                route: { cluster: dashboard, timeout: 0s, retry_policy: &retry { retry_on: "connect-failure,refused-stream", num_retries: 2 } }
+                request_headers_to_remove: &private [authorization, cookie]
+                # The nodes accept this name from the balancer only. One name per user,
+                # so the scheduler's cap of 8 streams per caller is per user.
+                request_headers_to_add: &user_name
+                - header: { key: x-forwarded-client-cert, value: 'Subject="CN=dashboard-user-%REQ(x-forwarded-user)%"' }
+                  append_action: OVERWRITE_IF_EXISTS_OR_ADD
+              - match: { path: /nix.remote.NixRemote/GetBuildLog, headers: [*post, *grpc_web_body, *user] }
+                route: { cluster: x86_64-linux, timeout: 0s, retry_policy: *retry }
+                request_headers_to_remove: *private
+                request_headers_to_add: *user_name
+              - match: { path: /dashboard.json, headers: [&get_or_head { name: ":method", string_match: { safe_regex: { regex: "GET|HEAD" } } }, *user] }
+                direct_response: { status: 200, body: { inline_string: '{"name":"Example farm","auth":"proxy","signOutUrl":"https://sso.example.com/logout"}' } }
+                response_headers_to_add: &json
+                - { header: { key: content-type, value: application/json }, append_action: OVERWRITE_IF_EXISTS_OR_ADD }
+                - { header: { key: cache-control, value: no-cache }, append_action: OVERWRITE_IF_EXISTS_OR_ADD }
+              # Viewers on the anonymous networks, as dashboard-anon-<address>.
+              - match: { prefix: /nix.remote.Events/, headers: [*post, *grpc_web_body, &no_user { name: x-forwarded-user, present_match: false }] }
+                route: { cluster: dashboard, timeout: 0s, retry_policy: *retry }
+                request_headers_to_remove: *private
+                request_headers_to_add: &anonymous_name
+                - header: { key: x-forwarded-client-cert, value: 'Subject="CN=dashboard-anon-%DOWNSTREAM_DIRECT_REMOTE_ADDRESS_WITHOUT_PORT%"' }
+                  append_action: OVERWRITE_IF_EXISTS_OR_ADD
+              - match: { path: /nix.remote.NixRemote/GetBuildLog, headers: [*post, *grpc_web_body, *no_user] }
+                route: { cluster: x86_64-linux, timeout: 0s, retry_policy: *retry }
+                request_headers_to_remove: *private
+                request_headers_to_add: *anonymous_name
+              - match: { path: /dashboard.json, headers: [*get_or_head, *no_user] }
+                direct_response: { status: 200, body: { inline_string: '{"name":"Example farm","auth":"anonymous"}' } }
+                response_headers_to_add: *json
+              # /<dir> to /<dir>/, so the page's relative asset paths resolve. Not 301,
+              # which browsers cache.
+              - match: { safe_regex: { regex: "/[^.]*[^/]" }, headers: [*get_or_head] }
+                redirect: { regex_rewrite: { pattern: { regex: "^(.*)$" }, substitution: '\1/' }, response_code: FOUND }
+              # The page's files from your files server, GET and HEAD only.
+              - match: { prefix: /_app/immutable/, headers: [*get_or_head] }
+                route: { cluster: dashboard-files }
+                request_headers_to_remove: &to_files [authorization, cookie, x-forwarded-user]
+                typed_per_filter_config:
+                  envoy.filters.http.header_mutation:
+                    "@type": type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutationPerRoute
+                    mutations: { response_mutations: [{ append: { header: { key: cache-control, value: "public, max-age=31536000, immutable" }, append_action: OVERWRITE_IF_EXISTS_OR_ADD } }] }
+              - match: { prefix: /, headers: [*get_or_head] }
+                route: { cluster: dashboard-files }
+                request_headers_to_remove: *to_files
+                typed_per_filter_config:
+                  envoy.filters.http.header_mutation:
+                    "@type": type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutationPerRoute
+                    mutations: { response_mutations: [{ append: { header: { key: cache-control, value: no-cache }, append_action: OVERWRITE_IF_EXISTS_OR_ADD } }] }
+              - match: { prefix: / }
+                direct_response: { status: 404 }
+          http_filters:
+          # Before the filters whose replies get these headers too, like the RBAC and
+          # CSRF filters' 403.
+          - name: envoy.filters.http.header_mutation
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutation
+              mutations:
+                # Envoy keeps the x-envoy-* headers of your proxy's requests, which
+                # would let a user pick retries, timeouts and stat names.
+                request_mutations: [{ remove_on_match: { key_matcher: { prefix: x-envoy- } } }]
+                response_mutations:
+                - append: { header: { key: x-content-type-options, value: nosniff }, append_action: OVERWRITE_IF_EXISTS_OR_ADD }
+                - append: { header: { key: referrer-policy, value: no-referrer }, append_action: OVERWRITE_IF_EXISTS_OR_ADD }
+                - append: { header: { key: x-frame-options, value: DENY }, append_action: OVERWRITE_IF_EXISTS_OR_ADD }
+          # Every request needs a viewer: your proxy's header, or a peer on an
+          # anonymous network.
+          - name: envoy.filters.http.rbac
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBAC
+              rules:
+                action: ALLOW
+                policies:
+                  viewers:
+                    permissions: [{ any: true }]
+                    principals:
+                    - direct_remote_ip: *anonymous_v4
+                    - direct_remote_ip: *anonymous_v6
+                    - header: { name: x-forwarded-user, present_match: true }
+          - name: envoy.filters.http.csrf
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.csrf.v3.CsrfPolicy
+              filter_enabled: { default_value: { numerator: 100, denominator: HUNDRED } }
+          - name: envoy.filters.http.grpc_web
+            typed_config: { "@type": type.googleapis.com/envoy.extensions.filters.http.grpc_web.v3.GrpcWeb }
+          - name: envoy.filters.http.compressor
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.compressor.v3.Compressor
+              response_direction_config:
+                common_config:
+                  content_type: [text/html, text/css, text/javascript, application/javascript, text/plain, application/json, application/manifest+json, image/svg+xml]
+              compressor_library:
+                name: br
+                typed_config: { "@type": type.googleapis.com/envoy.extensions.compression.brotli.compressor.v3.Brotli }
+          - name: envoy.filters.http.router
+            typed_config: { "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router }
+  clusters:
+  # The active scheduler, as the farm's sched cluster reaches it. It presents the
+  # balancer's client certificate, so the scheduler accepts the name in
+  # x-forwarded-client-cert, and it caps the streams of all viewers.
+  - name: dashboard
+    type: STRICT_DNS
+    connect_timeout: 5s
+    health_checks:
+    - timeout: 2s
+      interval: 5s
+      unhealthy_threshold: 2
+      healthy_threshold: 1
+      grpc_health_check: { service_name: nix.scheduler }
+    common_lb_config: { healthy_panic_threshold: { value: 0 } }
+    typed_extension_protocol_options:
+      envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+        "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+        explicit_http_config: { http2_protocol_options: {} }
+    circuit_breakers:
+      thresholds: [{ max_requests: 32, max_pending_requests: 1000000, max_connections: 1000000 }]
+    load_assignment:
+      cluster_name: dashboard
+      endpoints:
+      - lb_endpoints:
+        - endpoint: { address: { socket_address: { address: sched-1.example.com, port_value: 50051 } } }
+        - endpoint: { address: { socket_address: { address: sched-2.example.com, port_value: 50051 } } }
+    transport_socket:
+      name: envoy.transport_sockets.tls
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+        common_tls_context:
+          alpn_protocols: [h2]
+          tls_certificates:
+          - certificate_chain: { filename: /etc/envoy/tls/lb/tls.crt }
+            private_key: { filename: /etc/envoy/tls/lb/tls.key }
+          validation_context:
+            trusted_ca: { filename: /etc/envoy/tls/ca/ca.crt }
+  # Any HTTP server with the dashboard's files: a static file server, a sidecar or
+  # a CDN origin.
+  - name: dashboard-files
+    type: LOGICAL_DNS
+    connect_timeout: 5s
+    dns_lookup_family: ALL
+    load_assignment:
+      cluster_name: dashboard-files
+      endpoints: [{ lb_endpoints: [{ endpoint: { address: { socket_address: { address: 127.0.0.1, port_value: 8080 } } } }] }]
