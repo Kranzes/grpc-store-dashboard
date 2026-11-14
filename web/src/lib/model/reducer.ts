@@ -249,6 +249,11 @@ type HistoryState = {
 	 * after it comes only from RecentBuilds. null once a top-up read back to it.
 	 */
 	cutMs: { builds: number | null; failures: number | null };
+	/**
+	 * Per ring, the lowest FinishedBuild.seq RecentBuilds sent: the oldest
+	 * record, where the next page starts. null until a record came.
+	 */
+	oldestSeq: { builds: number | null; failures: number | null };
 };
 
 const freshHistory = (): HistoryState => ({
@@ -257,7 +262,8 @@ const freshHistory = (): HistoryState => ({
 	complete: false,
 	failuresComplete: false,
 	full: false,
-	cutMs: { builds: null, failures: null }
+	cutMs: { builds: null, failures: null },
+	oldestSeq: { builds: null, failures: null }
 });
 
 type WorkerRec = {
@@ -389,6 +395,7 @@ type PoolAcc = {
 	drainingLowDisk: number;
 	drainingStopping: number;
 	drainingLocalDaemon: number;
+	drainingPublishUnavailable: number;
 	offline: number;
 	running: number;
 	slots: number;
@@ -446,15 +453,16 @@ const NO_COUNTS: Counts = Object.freeze({ finished: 0, failed: 0 });
 /** The counter that adds up URLs past the scheduler's limits. Not a substituter. */
 const OTHER_URL = 'other';
 
+const DRAIN_REASONS: Partial<Record<WorkerState_DrainReason, DrainReason>> = {
+	[WorkerState_DrainReason.STOPPING]: 'stopping',
+	[WorkerState_DrainReason.LOW_DISK]: 'low-disk',
+	[WorkerState_DrainReason.LOCAL_DAEMON]: 'local-daemon',
+	[WorkerState_DrainReason.PUBLISH_UNAVAILABLE]: 'publish-unavailable'
+};
+
 function drainReasonOf(w: WorkerState): DrainReason | null {
 	if (!w.draining) return null;
-	return w.drainReason === WorkerState_DrainReason.STOPPING
-		? 'stopping'
-		: w.drainReason === WorkerState_DrainReason.LOW_DISK
-			? 'low-disk'
-			: w.drainReason === WorkerState_DrainReason.LOCAL_DAEMON
-				? 'local-daemon'
-				: 'unknown';
+	return DRAIN_REASONS[w.drainReason] ?? 'unknown';
 }
 
 /**
@@ -1993,6 +2001,7 @@ export class FarmReducer {
 					drainingLowDisk: 0,
 					drainingStopping: 0,
 					drainingLocalDaemon: 0,
+					drainingPublishUnavailable: 0,
 					offline: 0,
 					running: 0,
 					slots: 0,
@@ -2012,6 +2021,7 @@ export class FarmReducer {
 				if (w.drainReason === 'low-disk') p.drainingLowDisk++;
 				else if (w.drainReason === 'stopping') p.drainingStopping++;
 				else if (w.drainReason === 'local-daemon') p.drainingLocalDaemon++;
+				else if (w.drainReason === 'publish-unavailable') p.drainingPublishUnavailable++;
 			} else p.up++;
 			if (w.up) p.slots += w.maxJobs;
 			p.running += running;
@@ -2054,6 +2064,7 @@ export class FarmReducer {
 				drainingLowDisk: p.drainingLowDisk,
 				drainingStopping: p.drainingStopping,
 				drainingLocalDaemon: p.drainingLocalDaemon,
+				drainingPublishUnavailable: p.drainingPublishUnavailable,
 				offline: p.offline,
 				running: p.running,
 				slots: p.slots,
@@ -2420,7 +2431,10 @@ export class FarmReducer {
 		h.served = true;
 		const added = new Set<BuildRec>();
 		let touched = false;
+		const ring = failedOnly ? 'failures' : 'builds';
 		for (const f of batch.builds) {
+			const seq = Number(f.seq);
+			if (seq > 0 && seq < (h.oldestSeq[ring] ?? Infinity)) h.oldestSeq[ring] = seq;
 			// Rows the page has, as most of a reconnect's top-up is, need no record of their own.
 			const old = this.#buildKeys.get(buildKey(f.drvPath, Number(f.assignId)));
 			if (old) {
@@ -2480,11 +2494,6 @@ export class FarmReducer {
 			row: null,
 			rowOffset: 0
 		};
-	}
-
-	/** The oldest finish time in a ring, server clock, for the next page of history. 0 when empty. */
-	oldestBuildMs(failedOnly: boolean): number {
-		return (failedOnly ? this.#failures : this.#builds)[0]?.finishedMs ?? 0;
 	}
 
 	/**

@@ -1,4 +1,4 @@
-From 03eba1107fe4133fabfa2895fc7de06e81e04fe5 Mon Sep 17 00:00:00 2001
+From 22cd932acabeee633204dcbf27e3dcb8ee9e83fe Mon Sep 17 00:00:00 2001
 From: Ilan Joselevich <personal@ilanjoselevich.com>
 Date: Tue, 10 Nov 2026 19:31:36 +0100
 Subject: [PATCH 12/12] daemon: read a build log from the log store or the
@@ -18,6 +18,12 @@ tails work on them, and they share its two decode slots. Uploads are at
 most 64 MiB, so a node holds at most 128 MiB of store reads in memory.
 At shutdown the daemon destroys the decode cache before the log store.
 
+Their cache keys name the derivation, not a version of its log, and a
+rebuild replaces the copy. Calls join such an entry for a minute from
+the start of its decode. After that, once the decode ended, the next
+call decodes again, and readers that hold the old entry keep its bytes.
+A kept log's key carries its mtime, so its entry stays as before.
+
 A store or cache that cannot be read, through an outage or expired
 credentials, is passed over, so the other can still answer. When
 neither has the log, an unreadable one answers UNAVAILABLE rather than
@@ -30,7 +36,8 @@ Helm passes niks3.cacheURL to the builders too, and the buildLogStore
 option says that nodes read from the store.
 
 log-cache-test covers a missing log and one that stops partway, from a
-source that can and cannot be read. In checks.vm, one test server plays
+source that can and cannot be read, and a copy decoded again once its
+entry is old. In checks.vm, one test server plays
 the binary cache and the log stores. The mTLS daemon reads a zstd log
 through a cache URL with credentials and a query, from the start and
 from an offset, and gets NOT_FOUND for 403 and UNAVAILABLE for 401 with
@@ -43,16 +50,16 @@ may answer with the cache's copy of its log.
  .../helm/nix-grpc-farm/templates/worker.yaml  |   4 +
  nixos/common.nix                              |   3 +-
  proto/nix_remote.proto                        |   8 +-
- src/daemon/build-log-service.cc               | 244 +++++++++++++++---
- src/daemon/build-log-service.hh               |  40 ++-
- src/daemon/log-cache.hh                       |  17 +-
+ src/daemon/build-log-service.cc               | 246 +++++++++++++++---
+ src/daemon/build-log-service.hh               |  43 ++-
+ src/daemon/log-cache.hh                       |  42 ++-
  src/daemon/main.cc                            |  58 +++--
  src/daemon/options.hh                         |   3 +-
  tests/e2e/transfer.rs                         | 104 +++++++-
  tests/farm.nix                                |   4 +-
- tests/log-cache-test.cc                       |  79 +++++-
+ tests/log-cache-test.cc                       | 117 ++++++++-
  tests/nixos-test.nix                          |  86 ++++--
- 12 files changed, 528 insertions(+), 122 deletions(-)
+ 12 files changed, 592 insertions(+), 126 deletions(-)
 
 diff --git a/deploy/helm/nix-grpc-farm/templates/worker.yaml b/deploy/helm/nix-grpc-farm/templates/worker.yaml
 index 39e0785..f304d35 100644
@@ -84,7 +91,7 @@ index 694a3a2..0f73a79 100644
          waits up to a minute for the last uploads.
        '';
 diff --git a/proto/nix_remote.proto b/proto/nix_remote.proto
-index b8d39f5..53a3d35 100644
+index ed849b7..d6544c8 100644
 --- a/proto/nix_remote.proto
 +++ b/proto/nix_remote.proto
 @@ -128,9 +128,11 @@ message NarFrame {
@@ -103,7 +110,7 @@ index b8d39f5..53a3d35 100644
  // token by a minute, as Events.Watch does.
  //
 diff --git a/src/daemon/build-log-service.cc b/src/daemon/build-log-service.cc
-index d9bf6a0..430d51b 100644
+index d9bf6a0..bc167a9 100644
 --- a/src/daemon/build-log-service.cc
 +++ b/src/daemon/build-log-service.cc
 @@ -6,6 +6,7 @@
@@ -282,7 +289,7 @@ index d9bf6a0..430d51b 100644
 -        return file && bunzip2(file.get(), write);
 -    };
 -    return cache.start(key, std::move(decode), std::move(*slot));
-+    return cache.start(how.key, how.decode, std::move(*slot));
++    return cache.start(how.key, how.decode, std::move(*slot), how.versioned);
  }
  
  // Where a call on a cached decode starts, once the entry holds it: the
@@ -369,7 +376,7 @@ index d9bf6a0..430d51b 100644
          }
          if (call.cancelled()) {
              return clientGone();
-@@ -704,6 +796,80 @@ auto BuildLogService::decoded(Call & call, const std::filesystem::path & bz2, ui
+@@ -704,6 +796,82 @@ auto BuildLogService::decoded(Call & call, const std::filesystem::path & bz2, ui
      return grpc::Status::OK;
  }
  
@@ -394,6 +401,7 @@ index d9bf6a0..430d51b 100644
 +        // Messages go to watchers: no user, password or query.
 +        .name = reduceSubstituterUrl(cacheUrl) + "/log/" + call.request.drv_path(),
 +        .source = BuildLogInfo::SOURCE_CACHE,
++        .versioned = false,
 +        .decode = [url](const LogCache::Write & write) -> LogCache::Decoded {
 +            struct Stopped : std::exception
 +            {
@@ -427,6 +435,7 @@ index d9bf6a0..430d51b 100644
 +        .key = "store " + call.request.drv_path(),
 +        .name = "the log store's copy",
 +        .source = BuildLogInfo::SOURCE_STORE,
++        .versioned = false,
 +        .decode = [read = config.storeLog, drv = call.request.drv_path()](const LogCache::Write & write) -> LogCache::Decoded {
 +            std::optional<std::string> log;
 +            try {
@@ -450,7 +459,7 @@ index d9bf6a0..430d51b 100644
  auto BuildLogService::decodeSlot(Call & call) -> std::expected<DecodeSlots::Slot, grpc::Status>
  {
      auto slot = slots.acquire(call.caller.name, decodeWait, [&] -> bool { return call.cancelled(); });
-@@ -715,21 +881,16 @@ auto BuildLogService::decodeSlot(Call & call) -> std::expected<DecodeSlots::Slot
+@@ -715,21 +883,16 @@ auto BuildLogService::decodeSlot(Call & call) -> std::expected<DecodeSlots::Slot
  
  // A log the cache does not hold: decoded again for this call alone, from
  // the start, skipping what comes before `from`.
@@ -474,7 +483,7 @@ index d9bf6a0..430d51b 100644
          if (pos + data.size() <= from) {
              lines += countNewlines(data);
              pos += data.size();
-@@ -744,7 +905,7 @@ auto BuildLogService::direct(Call & call, const std::filesystem::path & bz2, uin
+@@ -744,7 +907,7 @@ auto BuildLogService::direct(Call & call, const std::filesystem::path & bz2, uin
          if (!infoSent) {
              infoSent = true;
              call.offset = from;
@@ -483,7 +492,7 @@ index d9bf6a0..430d51b 100644
          }
          data = data.substr(0, static_cast<size_t>(std::min<uint64_t>(left, data.size())));
          call.stream.add(data);
-@@ -755,9 +916,16 @@ auto BuildLogService::direct(Call & call, const std::filesystem::path & bz2, uin
+@@ -755,9 +918,16 @@ auto BuildLogService::direct(Call & call, const std::filesystem::path & bz2, uin
      if (call.cancelled()) {
          return clientGone();
      }
@@ -502,7 +511,7 @@ index d9bf6a0..430d51b 100644
      }
      if (!infoSent && pos < from) {
          return pastTheEnd();
-@@ -765,7 +933,7 @@ auto BuildLogService::direct(Call & call, const std::filesystem::path & bz2, uin
+@@ -765,7 +935,7 @@ auto BuildLogService::direct(Call & call, const std::filesystem::path & bz2, uin
      if (!infoSent) {
          // An offset at the very end: no bytes, but the info all the same.
          call.offset = from;
@@ -512,7 +521,7 @@ index d9bf6a0..430d51b 100644
      call.stream.finish(false);
      return grpc::Status::OK;
 diff --git a/src/daemon/build-log-service.hh b/src/daemon/build-log-service.hh
-index e74aa40..aca4429 100644
+index e74aa40..a36ae0d 100644
 --- a/src/daemon/build-log-service.hh
 +++ b/src/daemon/build-log-service.hh
 @@ -1,8 +1,10 @@
@@ -542,7 +551,7 @@ index e74aa40..aca4429 100644
          LogCache::Limits cache;
      };
  
-@@ -85,15 +93,31 @@ private:
+@@ -85,15 +93,34 @@ private:
      auto live(Call & call, const Builder::Running & run) -> grpc::Status;
      auto kept(Call & call, const std::filesystem::path & logDir, bool & found) -> grpc::Status;
      auto plain(Call & call, int file, const struct stat & stat) -> grpc::Status;
@@ -558,6 +567,9 @@ index e74aa40..aca4429 100644
 +        std::string name; // for messages
 +        nix::remote::BuildLogInfo::Source source = nix::remote::BuildLogInfo::SOURCE_UNSPECIFIED;
 +        uint64_t modifiedMs = 0;
++        // The key names the log's version, as a kept log's mtime does. A
++        // copy in the log store or the cache has none: a rebuild replaces it.
++        bool versioned = true;
 +        LogCache::Decode decode;
 +    };
 +    // `found`: false when the source has no such log, or could not be read
@@ -580,10 +592,26 @@ index e74aa40..aca4429 100644
      auto info(
          const Call & call,
 diff --git a/src/daemon/log-cache.hh b/src/daemon/log-cache.hh
-index 5ebbd8e..83ef26f 100644
+index 5ebbd8e..760f187 100644
 --- a/src/daemon/log-cache.hh
 +++ b/src/daemon/log-cache.hh
-@@ -164,9 +164,11 @@ public:
+@@ -147,6 +147,7 @@ public:
+     static constexpr uint64_t defaultStride = uint64_t{1} << 20U;
+     static constexpr std::chrono::hours defaultTooBigFor{1};
+     static constexpr size_t maxTooBig = 64;
++    static constexpr std::chrono::minutes defaultUnversionedFor{1};
+ 
+     struct Limits
+     {
+@@ -160,13 +161,19 @@ public:
+         // later calls for it decode on their own at once instead of
+         // evicting the other entries and filling the cache again.
+         std::chrono::milliseconds tooBigFor = defaultTooBigFor;
++        // How long calls join an entry whose key names no version of the
++        // log, from the start of its decode. Later calls decode again, once
++        // that decode ended, since a rebuild may have replaced the log.
++        std::chrono::milliseconds unversionedFor = defaultUnversionedFor;
+     };
  
      // Writes the decoded log through `write`, which returns false when the
      // decode should stop: nobody reads it any more, or it does not fit.
@@ -597,7 +625,7 @@ index 5ebbd8e..83ef26f 100644
  
      // What an entry holds at one moment.
      struct State
-@@ -174,6 +176,9 @@ public:
+@@ -174,6 +181,9 @@ public:
          uint64_t written = 0;
          bool complete = false; // the whole log is here: written is its size
          bool failed = false;   // it did not decode; written is what came before
@@ -607,7 +635,7 @@ index 5ebbd8e..83ef26f 100644
          // The cache dropped it: too big for the cache (this time, or lately),
          // or no temp file. The bytes written stay readable; the rest needs a
          // decode of its own.
-@@ -181,7 +186,7 @@ public:
+@@ -181,7 +191,7 @@ public:
  
          [[nodiscard]] auto ended() const -> bool
          {
@@ -616,7 +644,39 @@ index 5ebbd8e..83ef26f 100644
          }
      };
  
-@@ -443,8 +448,12 @@ private:
+@@ -287,6 +297,8 @@ public:
+         }
+ 
+         const std::string key;
++        // Unversioned entries only. Under the cache's mutex.
++        std::optional<std::chrono::steady_clock::time_point> staleAt;
+         UniqueFd file;
+         uint64_t stride = 0;
+         mutable std::mutex mutex;
+@@ -364,8 +376,10 @@ public:
+ 
+     // Decodes `key` on a thread of the cache, holding `slot` until it ends.
+     // When another call started the same key meanwhile, joins that one and
+-    // gives the slot back.
+-    auto start(const std::string & key, Decode decode, DecodeSlots::Slot slot) -> Reader
++    // gives the slot back. `versioned`: the key names the log's version, so
++    // the log under it never changes. Otherwise calls join the entry for
++    // `limits.unversionedFor`.
++    auto start(const std::string & key, Decode decode, DecodeSlots::Slot slot, bool versioned = true) -> Reader
+     {
+         const std::scoped_lock lock(mutex);
+         if (auto joined = joinLocked(key)) {
+@@ -373,6 +387,9 @@ public:
+         }
+         auto entry = std::make_shared<Entry>(key);
+         entry->stride = limits.stride;
++        if (!versioned) {
++            entry->staleAt = std::chrono::steady_clock::now() + limits.unversionedFor;
++        }
+         Reader reader(entry);
+         if (auto opened = openTempFile()) {
+             entry->file = std::move(*opened);
+@@ -443,8 +460,12 @@ private:
              // Too big, or nobody is left to see it.
              if (!fits || stopping || !read) {
                  entry.current.uncached = true;
@@ -630,8 +690,28 @@ index 5ebbd8e..83ef26f 100644
              } else {
                  entry.current.failed = true;
              }
+@@ -458,12 +479,17 @@ private:
+         }
+     }
+ 
+-    // As find() says, under the lock.
++    // As find() says, under the lock. A stale entry whose decode ended
++    // leaves the cache; its readers keep what it holds.
+     auto joinLocked(const std::string & key) -> std::optional<Reader>
+     {
+         sweepLocked();
+         if (auto const found = entries.find(key); found != entries.end()) {
+-            return Reader(found->second);
++            auto const & ent = *found->second;
++            if (!ent.staleAt || std::chrono::steady_clock::now() < *ent.staleAt || !ent.state().ended()) {
++                return Reader(found->second);
++            }
++            dropLocked(ent);
+         }
+         if (tooBigLocked(key)) {
+             return uncachedReader(key);
 diff --git a/src/daemon/main.cc b/src/daemon/main.cc
-index 9c3832e..3cd3621 100644
+index c4b274c..be8a440 100644
 --- a/src/daemon/main.cc
 +++ b/src/daemon/main.cc
 @@ -18,7 +18,7 @@
@@ -741,7 +821,7 @@ index 9c3832e..3cd3621 100644
      // Outputs built on another node live only in the cache. Clients read them back through us.
      void substituteIfRemote(nix::Store & store, const nix::StorePath & path) const
      {
-@@ -1311,7 +1325,7 @@ try {
+@@ -1314,7 +1328,7 @@ try {
           {"max_jobs", std::to_string(options.maxJobs)}});
      NixRemoteService service(
          options.socketPath, options.storeUri, options.workerName, metrics, idle, options.logLevel, auth, coord,
@@ -916,7 +996,7 @@ index 05195bf..15bd7d8 100644
      with subtest("viewers a proxy names read build logs and share their rule's metrics series"):
          # A dashboard's proxy names a signed-in viewer by user and any other
 diff --git a/tests/log-cache-test.cc b/tests/log-cache-test.cc
-index 7472773..e813ad3 100644
+index 7472773..cbe73f5 100644
 --- a/tests/log-cache-test.cc
 +++ b/tests/log-cache-test.cc
 @@ -43,14 +43,14 @@ auto numbered(std::size_t lines) -> std::string
@@ -996,7 +1076,7 @@ index 7472773..e813ad3 100644
      };
      {
          auto only = cache.start("g@1", endless, slot(slots));
-@@ -258,6 +258,61 @@ void theDecodeGoesOnWhileAnotherReaderRemains()
+@@ -258,6 +258,98 @@ void theDecodeGoesOnWhileAnotherReaderRemains()
      assert(!cache.find("g@1"));
  }
  
@@ -1055,15 +1135,53 @@ index 7472773..e813ad3 100644
 +    assert(readAll(cut) == "some\n" && cut->state().unavailable && !cut->state().failed);
 +}
 +
++// A copy from the log store or the cache has no version in its key, and a
++// rebuild may replace it. Once its entry is older than unversionedFor and
++// its decode ended, the next call decodes it again. Until then calls join
++// it, readers that hold it keep its bytes, and a versioned key is joined
++// however old.
++void anUnversionedEntryIsDecodedAgain()
++{
++    LogCache::Limits limits;
++    limits.unversionedFor = std::chrono::milliseconds(0);
++    DecodeSlots slots(4, 4);
++    LogCache cache(limits);
++    std::string text = "first\n";
++    std::atomic<int> runs{0};
++    std::atomic<bool> release{false};
++    auto const held = [&](const LogCache::Write & write) -> LogCache::Decoded {
++        runs++;
++        (void) write(text);
++        while (!release) {
++            std::this_thread::sleep_for(std::chrono::milliseconds(1));
++        }
++        return LogCache::Decoded::ok;
++    };
++    auto first = cache.start("store a.drv", held, slot(slots), false);
++    auto joined = cache.find("store a.drv");
++    assert(joined);
++    release = true;
++    assert(readAll(first) == "first\n");
++    text = "second\n";
++    assert(!cache.find("store a.drv"));
++    auto second = cache.start("store a.drv", decoder(text, runs), slot(slots), false);
++    assert(readAll(second) == "second\n" && runs == 2);
++    assert(readAll(*joined) == "first\n");
++    auto kept = cache.start("k@1", decoder(text, runs), slot(slots));
++    (void) readAll(kept);
++    assert(cache.find("k@1") && runs == 3);
++}
++
  void oldEntriesGoFirst()
  {
      LogCache::Limits limits;
-@@ -323,6 +378,8 @@ auto main() -> int
+@@ -323,6 +415,9 @@ auto main() -> int
          tailStartsAtALineStartAndFirstLineIsExact();
          anEntryOverTheSizeCapIsNotCached();
          theDecodeGoesOnWhileAnotherReaderRemains();
 +        aMissingLogIsNotKept();
 +        anUnreadableSourceIsNotKept();
++        anUnversionedEntryIsDecodedAgain();
          oldEntriesGoFirst();
          slotsPerCallerAndInAll();
      } catch (std::exception & err) {

@@ -146,7 +146,12 @@ export function hasUpstream(t: Pick<Topology, 'upstreamWorkers'>): boolean {
 export const UPSTREAM_CARD_ROWS = 8;
 
 /** Why a builder drains. 'unknown': it does not say. */
-export type DrainReason = 'stopping' | 'low-disk' | 'local-daemon' | 'unknown';
+export type DrainReason =
+	| 'stopping'
+	| 'low-disk'
+	| 'local-daemon'
+	| 'publish-unavailable'
+	| 'unknown';
 
 export type WorkerView = Readonly<{
 	addr: string;
@@ -226,10 +231,11 @@ export type PoolView = Readonly<{
 	up: number;
 	/** Connected and draining. */
 	draining: number;
-	/** Of those, the ones low on disk, stopping, and with no nix-daemon. */
+	/** Of those, the ones low on disk, stopping, with no nix-daemon, and failing to publish. */
 	drainingLowDisk: number;
 	drainingStopping: number;
 	drainingLocalDaemon: number;
+	drainingPublishUnavailable: number;
 	/** Disconnected without draining first, still shown for WORKER_LINGER_MS. */
 	offline: number;
 	/**

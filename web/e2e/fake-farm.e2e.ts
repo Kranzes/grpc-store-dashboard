@@ -1268,6 +1268,25 @@ test.describe('logs', () => {
 		expect(farm.historyCalls).toHaveLength(2);
 	});
 
+	test('scrolling to the end of the list pages older builds by seq', async ({ page, fakeFarm }) => {
+		// More builds than a first page of 1,000.
+		const farm = await fakeFarm({ ...ANONYMOUS, mock: { builders: 3, history: 2000 } });
+		await page.goto(`${farm.url}logs/`);
+		await expect(pill(page)).toHaveText('Live');
+		await expect(rows(page).first()).toBeVisible();
+		expect(farm.historyCalls.map((c) => c.beforeSeq)).toEqual([0, 0]);
+		// Each page starts below the last one's oldest row, until the ring has no more.
+		await expect
+			.poll(async () => {
+				await list(page).evaluate((el) => (el.scrollTop = el.scrollHeight));
+				return page.locator('.build-list .foot').textContent();
+			})
+			.toBe('The scheduler keeps the last 10,000 builds and 2,000 failures.');
+		const seqs = farm.historyCalls.filter((c) => !c.failedOnly).map((c) => c.beforeSeq);
+		expect(seqs.length).toBeGreaterThan(2);
+		expect(seqs.slice(1).every((q, i) => q > 0 && (i === 0 || q < seqs[i]))).toBe(true);
+	});
+
 	test("a search that finds no build links to the farm's log search", async ({
 		page,
 		fakeFarm

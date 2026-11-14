@@ -163,7 +163,7 @@ export class FakeFarm {
 	/** Every GetBuildLog call, in order. */
 	readonly logCalls: LogCallRecord[] = [];
 	/** Every RecentBuilds call's request, in order. */
-	readonly historyCalls: { failedOnly: boolean; beforeMs: number; drvPaths: string[] }[] = [];
+	readonly historyCalls: { failedOnly: boolean; beforeSeq: number; drvPaths: string[] }[] = [];
 	logOptions: FakeLogOptions;
 	/** Replace to script the stream. By default it streams `mock`. */
 	watch: WatchHandler = (call) => call.streamMock(this.mock);
@@ -309,7 +309,7 @@ export class FakeFarm {
 		const r = fromBinary(RecentBuildsRequestSchema, body);
 		this.historyCalls.push({
 			failedOnly: r.failedOnly,
-			beforeMs: Number(r.beforeMs),
+			beforeSeq: Number(r.beforeSeq),
 			drvPaths: [...r.drvPaths]
 		});
 		res.writeHead(200, headers);
@@ -338,7 +338,7 @@ export class FakeFarm {
 			return;
 		}
 		const batches = this.mock.recentBuilds({
-			beforeMs: Number(r.beforeMs),
+			beforeSeq: Number(r.beforeSeq),
 			limit: r.limit,
 			failedOnly: r.failedOnly,
 			withError: r.withError,

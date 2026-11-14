@@ -52,6 +52,9 @@ describe('cells', () => {
 		expect(cellOf('a', w('a', { draining: true, drainReason: 'local-daemon' })).title).toBe(
 			'a · 0/8 assigned · draining, no nix-daemon'
 		);
+		expect(cellOf('a', w('a', { draining: true, drainReason: 'publish-unavailable' })).title).toBe(
+			'a · 0/8 assigned · draining, publishing failing'
+		);
 		expect(cellOf('a', w('a', { up: false })).state).toBe('offline');
 		expect(cellOf('a', undefined).state).toBe('offline');
 	});

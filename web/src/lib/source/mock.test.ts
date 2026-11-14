@@ -1278,7 +1278,7 @@ describe('MockFarm.recentBuilds', () => {
 	const HISTORY = 300;
 	type Req = Parameters<MockFarm['recentBuilds']>[0];
 	const ask = (farm: MockFarm, req: Partial<Req> = {}) =>
-		farm.recentBuilds({ beforeMs: 0, limit: 1000, failedOnly: false, withError: false, ...req });
+		farm.recentBuilds({ beforeSeq: 0, limit: 1000, failedOnly: false, withError: false, ...req });
 	const rows = (farm: MockFarm, req: Partial<Req> = {}) => ask(farm, req).flatMap((b) => b.builds);
 	/** A farm a minute after the page opened. */
 	const farmOf = (history: number) => {
@@ -1298,11 +1298,11 @@ describe('MockFarm.recentBuilds', () => {
 		let before = 0;
 		let older60 = 0;
 		for (let page = 0; page < 50; page++) {
-			const batches = ask(farm, { beforeMs: before });
+			const batches = ask(farm, { beforeSeq: before });
 			const got = batches.flatMap((b) => b.builds);
 			older60 += got.filter((b) => Number(b.finishedMs) < T0 - 60_000).length;
 			if (batches.at(-1)!.complete || got.length === 0) break;
-			before = Number(got.at(-1)!.finishedMs);
+			before = Number(got.at(-1)!.seq);
 		}
 		expect(older60).toBeGreaterThanOrEqual(HISTORY);
 		// history=0: only what the farm built since it started.
@@ -1310,16 +1310,16 @@ describe('MockFarm.recentBuilds', () => {
 		expect(rows(none).every((b) => Number(b.finishedMs) >= T0 - 70_000)).toBe(true);
 	});
 
-	it('pages by before_ms, in batches of at most 256', () => {
+	it('pages by before_seq, in batches of at most 256', () => {
 		const farm = farmOf(HISTORY);
 		const batches = ask(farm);
 		expect(batches.length).toBeGreaterThan(1);
 		expect(batches.every((b) => b.builds.length <= BATCH)).toBe(true);
-		const times = batches.flatMap((b) => b.builds).map((b) => Number(b.finishedMs));
-		const older = rows(farm, { beforeMs: times[9], limit: 5 });
-		expect(older.map((b) => Number(b.finishedMs))).toEqual(
-			times.filter((t) => t < times[9]).slice(0, 5)
-		);
+		// One more per record, newest first.
+		const seqs = batches.flatMap((b) => b.builds).map((b) => Number(b.seq));
+		expect(seqs.every((q, i) => i === 0 || q === seqs[i - 1] - 1)).toBe(true);
+		const older = rows(farm, { beforeSeq: seqs[9], limit: 5 });
+		expect(older.map((b) => Number(b.seq))).toEqual(seqs.slice(10, 15));
 	});
 
 	it('sends failures with their text, at most 256', () => {

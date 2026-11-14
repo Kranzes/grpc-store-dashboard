@@ -469,7 +469,9 @@ permission for it, as for build logs in CI.
 
 Builders report this, their drain reason, their free disk and what they take from each
 substituter only with the patches applied on the builders too. The dashboard says "does not
-report" for a builder that runs an older nix-grpc-store.
+report" for a builder that runs an older nix-grpc-store. With the patches, a builder whose
+publishes to the cache fail 3 times in a row takes no builds for a minute, and its card says
+"Publishing failing".
 
 ## 9. Build logs
 
@@ -485,7 +487,8 @@ Draining builders keep serving the logs of the builds they still run and of thos
 - Logs hold whatever builds print. The masking of section 8 covers only the failure excerpt in the
   stream, never the log one click away.
 - A later build of the same derivation on the same builder replaces its log, on the builder and in
-  the log store. The viewer says so when it can tell.
+  the log store. The viewer says so when it can tell. A node that read a log from the log store or
+  the cache serves that copy for up to a minute before it reads it again.
 - Builders keep logs for `buildLogRetention`, 30 days by default. The list reaches back as far as
   the scheduler's rings, which hold the last 10,000 builds and 2,000 failures. Links to logs work as
   long as the builder or the log store keeps them.

@@ -527,6 +527,8 @@ type DoneRec = {
 	requestedBy: string[];
 	/** The builder fails most builds, by the `failing` option. */
 	failing: boolean;
+	/** FinishedBuild.seq: one more per record, in ring order. */
+	seq: number;
 };
 
 /** What the demo's log backend needs to make a build's log. */
@@ -745,6 +747,8 @@ export class MockFarm {
 	/** The scheduler's rings: builds that finished on a builder, and failures. Oldest first. */
 	#builds: DoneRec[] = [];
 	#failures: DoneRec[] = [];
+	/** The seq of the newest record. */
+	#recordSeq = 0;
 	readonly #ended = new Set<(path: string, assignId: number, ending: LogEnding) => void>();
 
 	constructor(options: MockOptions, startMs: number) {
@@ -790,7 +794,9 @@ export class MockFarm {
 		this.#scheduleHook();
 		if (options.churn > 0 && this.#cloudSize > 0) this.#scheduleChurn();
 
-		// Warm up quietly so the first snapshot shows a busy farm.
+		// Warm up quietly so the first snapshot shows a busy farm. Its records
+		// number from after the made-up history's, which is older.
+		this.#recordSeq = options.history;
 		this.#muted = true;
 		this.advance(startMs);
 		this.#muted = false;
@@ -885,7 +891,8 @@ export class MockFarm {
 				assignedMs: BigInt(Math.round(r.assignedMs)),
 				buildStartedMs: BigInt(Math.round(r.startedMs)),
 				finishedMs: BigInt(Math.round(r.finishedMs)),
-				requestedBy: r.requestedBy
+				requestedBy: r.requestedBy,
+				seq: BigInt(r.seq)
 			});
 		if (req.drvPaths?.length) {
 			const out: FinishedBuild[] = [];
@@ -904,12 +911,12 @@ export class MockFarm {
 		let i = ring.length - 1;
 		for (; i >= 0 && rows.length < limit; i--) {
 			const r = ring[i];
-			if (req.beforeMs && r.finishedMs >= req.beforeMs) continue;
+			if (req.beforeSeq && r.seq >= req.beforeSeq) continue;
 			rows.push(msg(r, withError));
 		}
 		// Complete: the ring holds nothing older than the last row sent.
 		let older = false;
-		for (; i >= 0; i--) if (!req.beforeMs || ring[i].finishedMs < req.beforeMs) older = true;
+		for (; i >= 0; i--) if (!req.beforeSeq || ring[i].seq < req.beforeSeq) older = true;
 		const batches: RecentBuildsBatch[] = [];
 		for (let k = 0; k < rows.length || k === 0; k += 256)
 			batches.push(create(RecentBuildsBatchSchema, { builds: rows.slice(k, k + 256) }));
@@ -1790,7 +1797,8 @@ export class MockFarm {
 				plannedMs: d.plannedMs,
 				requestedBy,
 				failing:
-					d.worker?.failing ?? this.#workers.find((w) => w.addr === workerAddr)?.failing ?? false
+					d.worker?.failing ?? this.#workers.find((w) => w.addr === workerAddr)?.failing ?? false,
+				seq: 0
 			});
 		}
 		this.#emit({
@@ -1882,8 +1890,9 @@ export class MockFarm {
 	}
 
 	#record(r: DoneRec) {
-		// Whole ms, as the scheduler sends them, so paging by before_ms is exact.
+		// Whole ms, as the scheduler sends them.
 		r.finishedMs = Math.round(r.finishedMs);
+		r.seq = ++this.#recordSeq;
 		r.assignedMs = Math.round(r.assignedMs);
 		r.startedMs = Math.round(r.startedMs);
 		this.#builds.push(r);
@@ -1948,7 +1957,9 @@ export class MockFarm {
 				finishedMs,
 				plannedMs,
 				requestedBy: [this.#ciRunners[h % this.#ciRunners.length]],
-				failing: w.failing
+				failing: w.failing,
+				// Newest first here, so the oldest takes seq 1.
+				seq: n - i
 			};
 			if (outcome === DrvGone_Outcome.FAILED)
 				rec.error = nixMessage(

@@ -1,4 +1,4 @@
-From 2004da5e742863fc462205ff90f346b62d1ddd70 Mon Sep 17 00:00:00 2001
+From 9ab2138d2aed1e911ef87938b1423eb09f7feda5 Mon Sep 17 00:00:00 2001
 From: Ilan Joselevich <personal@ilanjoselevich.com>
 Date: Tue, 10 Nov 2026 19:27:05 +0100
 Subject: [PATCH 09/12] daemon: follow running builds' logs and resume
@@ -16,7 +16,10 @@ file (KEPT), else NOT_FOUND. LIVE renders the spill as Nix keeps the
 log, so a line number taken while a build runs is the same line after
 it ends. The daemon's own messages become notes, which BuildDerivation
 clients still see but the build log leaves out. The spill keeps an
-index entry per 64 KiB, so a reader starts near any offset.
+index entry per 64 KiB, so a reader starts near any offset. A reader
+uses only the entries of records it can already read, and
+log-spill-race-test checks that under ThreadSanitizer where the compiler
+has it.
 
 A follow call waits on the build's condition variable and sends what
 arrived about ten times a second, with an empty message every 30 s on a
@@ -43,8 +46,8 @@ cn="dashboard-*", so viewers that a proxy names one by one add no series
 each. Every other caller keeps its own name.
 ---
  deploy/helm/nix-grpc-farm/values.yaml |   5 +-
- meson.build                           |  27 +-
- nix/packages/nix-grpc-store.nix       |   4 +-
+ meson.build                           |  39 +-
+ nix/packages/nix-grpc-store.nix       |   5 +-
  nixos/common.nix                      |   2 +-
  proto/nix_remote.proto                |  82 ++-
  src/build-log.hh                      |  10 +-
@@ -56,7 +59,7 @@ each. Every other caller keeps its own name.
  src/daemon/builder.cc                 |  91 ++-
  src/daemon/builder.hh                 |  23 +
  src/daemon/log-cache.hh               | 607 ++++++++++++++++++++
- src/daemon/log-spill.hh               | 284 ++++++++--
+ src/daemon/log-spill.hh               | 291 ++++++++--
  src/daemon/main.cc                    | 215 ++-----
  src/daemon/metrics.hh                 |  36 ++
  tests/acl-test.cc                     |  24 +-
@@ -67,9 +70,10 @@ each. Every other caller keeps its own name.
  tests/lib/build-log.nix               |   9 +
  tests/lib/build-log.py                | 248 +++++++++
  tests/log-cache-test.cc               | 333 +++++++++++
+ tests/log-spill-race-test.cc          |  46 ++
  tests/log-spill-test.cc               | 192 +++++++
  tests/nixos-test.nix                  |   8 +-
- 27 files changed, 3684 insertions(+), 300 deletions(-)
+ 28 files changed, 3750 insertions(+), 300 deletions(-)
  create mode 100644 src/daemon/build-log-service.cc
  create mode 100644 src/daemon/build-log-service.hh
  create mode 100644 src/daemon/log-cache.hh
@@ -77,6 +81,7 @@ each. Every other caller keeps its own name.
  create mode 100644 tests/lib/build-log.nix
  create mode 100644 tests/lib/build-log.py
  create mode 100644 tests/log-cache-test.cc
+ create mode 100644 tests/log-spill-race-test.cc
 
 diff --git a/deploy/helm/nix-grpc-farm/values.yaml b/deploy/helm/nix-grpc-farm/values.yaml
 index dd8979b..952634e 100644
@@ -95,7 +100,7 @@ index dd8979b..952634e 100644
      medium: "" # "Memory" for tmpfs builds
      sizeLimit: null
 diff --git a/meson.build b/meson.build
-index c659bf5..792d9eb 100644
+index c659bf5..8324dda 100644
 --- a/meson.build
 +++ b/meson.build
 @@ -219,6 +219,7 @@ if build_server
@@ -120,7 +125,26 @@ index c659bf5..792d9eb 100644
    ))
  
    test('xfcc', executable('xfcc-test',
-@@ -403,6 +404,13 @@ if build_server
+@@ -389,6 +390,18 @@ if build_server
+     cpp_args : ['-UNDEBUG'],
+   ))
+ 
++  # Readers racing the owner's index show only under ThreadSanitizer, which
++  # does not mix with ASan.
++  if not get_option('b_sanitize').contains('address') and cxx.has_multi_link_arguments('-fsanitize=thread')
++    test('log-spill-race', executable('log-spill-race-test',
++      sources : ['tests/log-spill-race-test.cc'],
++      include_directories : [src_inc, include_directories('src/daemon')],
++      dependencies : [threads_dep],
++      cpp_args : ['-UNDEBUG', '-fsanitize=thread'],
++      link_args : ['-fsanitize=thread'],
++    ), env : ['TSAN_OPTIONS=halt_on_error=1'])
++  endif
++
+   test('local-store', executable('local-store-test',
+     sources : ['tests/local-store-test.cc', gen],
+     include_directories : [gen_inc, src_inc, include_directories('src/daemon')],
+@@ -403,6 +416,13 @@ if build_server
      cpp_args : ['-UNDEBUG'],
    ))
  
@@ -134,7 +158,7 @@ index c659bf5..792d9eb 100644
    test('log-uploader', executable('log-uploader-test',
      sources : ['tests/log-uploader-test.cc'],
      include_directories : [src_inc, include_directories('src/daemon')],
-@@ -410,6 +418,19 @@ if build_server
+@@ -410,6 +430,19 @@ if build_server
      cpp_args : ['-UNDEBUG'],
    ))
  
@@ -155,12 +179,14 @@ index c659bf5..792d9eb 100644
      sources : ['tests/upload-spool-test.cc'],
      include_directories : [src_inc, include_directories('src/daemon')],
 diff --git a/nix/packages/nix-grpc-store.nix b/nix/packages/nix-grpc-store.nix
-index ffc9864..3f29a5c 100644
+index ffc9864..d7411cd 100644
 --- a/nix/packages/nix-grpc-store.nix
 +++ b/nix/packages/nix-grpc-store.nix
-@@ -73,9 +73,11 @@ stdenv.mkDerivation {
+@@ -72,10 +72,13 @@ stdenv.mkDerivation {
+         ../../tests/sbpl-test.cc
          ../../tests/sandbox-test.cc
          ../../tests/log-spill-test.cc
++        ../../tests/log-spill-race-test.cc
          ../../tests/daemon-probe-test.cc
 +        ../../tests/log-cache-test.cc
 +        ../../tests/log-uploader-test.cc
@@ -185,7 +211,7 @@ index 3a2e669..694a3a2 100644
                  `write` additionally allows signed imports (signature
                  checking is enforced) and server-side builds. `trusted`
 diff --git a/proto/nix_remote.proto b/proto/nix_remote.proto
-index fe16149..060d346 100644
+index 659a35b..e1c38ca 100644
 --- a/proto/nix_remote.proto
 +++ b/proto/nix_remote.proto
 @@ -119,16 +119,86 @@ message NarFrame {
@@ -1325,7 +1351,7 @@ index 0000000..e74aa40
 +
 +} // namespace nixgrpc
 diff --git a/src/daemon/builder.cc b/src/daemon/builder.cc
-index 92fd062..930a338 100644
+index ffb39d6..671cdaf 100644
 --- a/src/daemon/builder.cc
 +++ b/src/daemon/builder.cc
 @@ -10,6 +10,7 @@
@@ -1336,7 +1362,7 @@ index 92fd062..930a338 100644
  #include <utility>
  #include <vector>
  
-@@ -94,6 +95,7 @@ void Builder::giveBack(const std::vector<std::pair<std::string, uint64_t>> & drv
+@@ -95,6 +96,7 @@ void Builder::giveBack(const std::vector<std::pair<std::string, uint64_t>> & drv
  void Builder::onRevoke(const nix::remote::Revoke & rev)
  {
      uint64_t assignId = 0;
@@ -1344,7 +1370,7 @@ index 92fd062..930a338 100644
      {
          auto lck = state.lock();
          auto const found = lck->expected.find(rev.drv_path());
-@@ -107,11 +109,37 @@ void Builder::onRevoke(const nix::remote::Revoke & rev)
+@@ -108,11 +110,37 @@ void Builder::onRevoke(const nix::remote::Revoke & rev)
              return;
          }
          assignId = found->second.assignId;
@@ -1382,7 +1408,7 @@ index 92fd062..930a338 100644
  auto Builder::admit(const std::string & drvPath) -> std::optional<Admission>
  {
      auto lck = state.lock();
-@@ -143,6 +171,18 @@ void Builder::finished(
+@@ -144,6 +172,18 @@ void Builder::finished(
              assignId = found->second.assignId;
              shared = found->second.shared;
              lck->expected.erase(found);
@@ -1401,7 +1427,7 @@ index 92fd062..930a338 100644
          }
      }
      if (shared) {
-@@ -207,15 +247,27 @@ auto Builder::hello() -> WorkerMsg
+@@ -208,15 +248,27 @@ auto Builder::hello() -> WorkerMsg
      }
      hel->set_version(config.version);
      hel->set_min_free_bytes(config.minFree);
@@ -1438,7 +1464,7 @@ index 92fd062..930a338 100644
      }
      return msg;
  }
-@@ -282,15 +334,22 @@ auto Builder::takeUnclaimed(const std::function<bool(const Expected &)> & pred)
+@@ -305,15 +357,22 @@ auto Builder::takeUnclaimed(const std::function<bool(const Expected &)> & pred)
      -> std::vector<std::pair<std::string, uint64_t>>
  {
      std::vector<std::pair<std::string, uint64_t>> taken;
@@ -1469,7 +1495,7 @@ index 92fd062..930a338 100644
  }
  
 diff --git a/src/daemon/builder.hh b/src/daemon/builder.hh
-index f956102..ad3cb97 100644
+index 9f306ac..30670eb 100644
 --- a/src/daemon/builder.hh
 +++ b/src/daemon/builder.hh
 @@ -9,6 +9,7 @@
@@ -1513,7 +1539,7 @@ index f956102..ad3cb97 100644
      // Sent on every (re)connect. Reports the builds a client came for and
      // forgets the Expects nobody claimed.
      auto hello() -> nix::remote::WorkerMsg;
-@@ -179,7 +195,11 @@ private:
+@@ -190,7 +206,11 @@ private:
      {
          std::unordered_map<std::string, Expected> expected;
          uint64_t newestExpect = 0; // highest assign_id read in this session
@@ -1525,10 +1551,10 @@ index f956102..ad3cb97 100644
  
      mutable nix::Sync<State> state;
      SchedulerLink link;
-@@ -205,6 +225,9 @@ private:
-         const DoneInfo & info = {});
-     // Under unavailableMutex. False if the write failed.
+@@ -223,6 +243,9 @@ private:
      auto sendLoad() -> bool;
+     // Under publishMutex. Takes builds again when `until` is nullopt.
+     void pausePublishing(std::optional<Clock::time_point> until);
 +    // An Expect left the table without finishing: mark it, and wake whoever
 +    // follows its log.
 +    static void wake(Expected::Shared & shared);
@@ -2149,20 +2175,21 @@ index 0000000..5ebbd8e
 +
 +} // namespace nixgrpc
 diff --git a/src/daemon/log-spill.hh b/src/daemon/log-spill.hh
-index b28c0a6..e60c666 100644
+index b28c0a6..c58e770 100644
 --- a/src/daemon/log-spill.hh
 +++ b/src/daemon/log-spill.hh
-@@ -16,7 +16,9 @@
+@@ -16,7 +16,10 @@
  #include <cstdint>
  #include <expected>
  #include <filesystem>
 +#include <memory>
  #include <mutex>
 +#include <optional>
++#include <ranges>
  #include <span>
  #include <string>
  #include <string_view>
-@@ -30,7 +32,9 @@
+@@ -30,7 +33,9 @@
  namespace nixgrpc {
  
  // Same values as BuildEvent::Kind (build-log.hh), which main.cc asserts.
@@ -2173,7 +2200,7 @@ index b28c0a6..e60c666 100644
  
  class UniqueFd
  {
-@@ -65,6 +69,42 @@ private:
+@@ -65,6 +70,42 @@ private:
      int fd_ = -1;
  };
  
@@ -2216,7 +2243,7 @@ index b28c0a6..e60c666 100644
  // The directory follows TMPDIR: /tmp is a size-limited tmpfs on NixOS.
  // O_TMPFILE is Linux-only, and not every Linux filesystem has it, so fall
  // back to create-then-unlink.
-@@ -91,17 +131,38 @@ inline auto openTempFile() -> std::expected<UniqueFd, std::error_code>
+@@ -91,17 +132,38 @@ inline auto openTempFile() -> std::expected<UniqueFd, std::error_code>
      return {std::move(file)};
  }
  
@@ -2257,7 +2284,7 @@ index b28c0a6..e60c666 100644
      // Owner only.
      void append(SpillKind kind, std::string_view text)
      {
-@@ -110,7 +171,8 @@ public:
+@@ -110,7 +172,8 @@ public:
          }
          text = text.substr(0, kMaxText);
          auto const tail = written_.load(std::memory_order_relaxed);
@@ -2267,7 +2294,7 @@ index b28c0a6..e60c666 100644
              ended_ = true; // the marker is the last record
              kind = SpillKind::line;
              text = kTruncated;
-@@ -122,6 +184,7 @@ public:
+@@ -122,6 +185,7 @@ public:
                  return;
              }
              fd_ = std::move(*opened);
@@ -2275,7 +2302,7 @@ index b28c0a6..e60c666 100644
          }
          auto const len = std::bit_cast<std::array<std::byte, sizeof(std::uint32_t)>>(static_cast<std::uint32_t>(text.size()));
          std::array<std::byte, kHeader> header{};
-@@ -131,13 +194,96 @@ public:
+@@ -131,13 +195,96 @@ public:
              ended_ = true;
              return;
          }
@@ -2285,7 +2312,7 @@ index b28c0a6..e60c666 100644
 +        if (rendered >= nextMark_ && indexed_ < kIndexSize) {
 +            index_->at(indexed_) = {.file = tail, .rendered = rendered, .lines = lines_};
 +            indexed_++;
-+            indexedPublished_.store(indexed_, std::memory_order_relaxed);
++            indexedPublished_.store(indexed_, std::memory_order_release);
 +            nextMark_ = ((rendered / kStride) + 1) * kStride;
 +        }
 +        lines_ += kind == SpillKind::note ? 0 : 1;
@@ -2373,7 +2400,7 @@ index b28c0a6..e60c666 100644
      // Feeds every complete record at or after `offset` to emit(SpillKind,
      // string_view) and returns the offset to resume from. A record that cannot
      // be read is skipped along with everything after it.
-@@ -147,68 +293,122 @@ public:
+@@ -147,68 +294,128 @@ public:
          auto const end = written();
          std::string text;
          while (offset < end) {
@@ -2458,11 +2485,16 @@ index b28c0a6..e60c666 100644
 +        if (end == 0) {
 +            return 0; // nothing published yet, nor the index with it
 +        }
-+        auto const count = std::min(indexedPublished_.load(std::memory_order_relaxed), kIndexSize);
++        auto const count = std::min(indexedPublished_.load(std::memory_order_acquire), kIndexSize);
 +        if (count > 0) {
++            // The count may be newer than `end`. Only entries of records
++            // that start before it are ours to read from.
 +            auto const entries = std::span(*index_).first(count);
-+            auto const after = std::ranges::upper_bound(entries, from, {}, &IndexEntry::rendered);
-+            if (after != entries.begin()) {
++            auto const seen = std::ranges::subrange(
++                entries.begin(),
++                std::ranges::partition_point(entries, [&](const IndexEntry & entry) -> bool { return entry.file < end; }));
++            auto const after = std::ranges::upper_bound(seen, from, {}, &IndexEntry::rendered);
++            if (after != seen.begin()) {
 +                start = *std::prev(after);
              }
 -            if (count <= 0) {
@@ -2521,8 +2553,9 @@ index b28c0a6..e60c666 100644
      UniqueFd fd_; // owner writes it before the first release store of written_
      std::atomic<std::size_t> written_{0};
 +    std::atomic<std::size_t> rendered_{0};
-+    // Allocated with the file. Entries are written before the release store
-+    // of written_ that covers them, and never change after.
++    // Allocated with the file. Entries are written before the release
++    // stores of indexedPublished_ that counts them and of written_ that
++    // covers them, and never change after.
 +    std::unique_ptr<std::array<IndexEntry, kIndexSize>> index_;
 +    std::atomic<std::size_t> indexedPublished_{0};
      bool ended_ = false; // owner only: truncated, or the temp file failed
@@ -2534,7 +2567,7 @@ index b28c0a6..e60c666 100644
  
  // A reader's side of the protocol: replay `spill` to emit(SpillKind, text) and
 diff --git a/src/daemon/main.cc b/src/daemon/main.cc
-index 4b02fa4..bc59a6c 100644
+index 39d70e7..696066a 100644
 --- a/src/daemon/main.cc
 +++ b/src/daemon/main.cc
 @@ -9,8 +9,6 @@
@@ -2849,7 +2882,7 @@ index 4b02fa4..bc59a6c 100644
              nixgrpc::Metrics::Held const building(metrics, "build_slot");
              res = backends.storedBuild(cancelled, localStore, drvPath, mode, limits, log);
              phase.done();
-@@ -1462,7 +1313,7 @@ try {
+@@ -1465,7 +1316,7 @@ try {
           {"max_jobs", std::to_string(options.maxJobs)}});
      NixRemoteService service(
          options.socketPath, options.storeUri, options.workerName, metrics, idle, options.logLevel, auth, coord,
@@ -2859,7 +2892,7 @@ index 4b02fa4..bc59a6c 100644
      grpc::EnableDefaultHealthCheckService(true);
      grpc::ServerBuilder builder;
 diff --git a/src/daemon/metrics.hh b/src/daemon/metrics.hh
-index 01f7a4b..21ad878 100644
+index a74f9bd..3b4e85e 100644
 --- a/src/daemon/metrics.hh
 +++ b/src/daemon/metrics.hh
 @@ -148,6 +148,21 @@ class Metrics
@@ -2884,7 +2917,7 @@ index 01f7a4b..21ad878 100644
      prometheus::Family<prometheus::Counter> * buildLogUploads =
          &prometheus::BuildCounter()
               .Name("nix_grpc_build_log_uploads_total")
-@@ -231,6 +246,11 @@ public:
+@@ -232,6 +247,11 @@ public:
          {
              gauge->Increment();
          }
@@ -2896,7 +2929,7 @@ index 01f7a4b..21ad878 100644
          Held(const Held &) = delete;
          Held(Held &&) = delete;
          auto operator=(const Held &) -> Held & = delete;
-@@ -241,6 +261,22 @@ public:
+@@ -242,6 +262,22 @@ public:
          }
      };
  
@@ -4546,6 +4579,58 @@ index 0000000..7472773
 +        return 1;
 +    }
 +    return 0;
++}
+diff --git a/tests/log-spill-race-test.cc b/tests/log-spill-race-test.cc
+new file mode 100644
+index 0000000..6d3c899
+--- /dev/null
++++ b/tests/log-spill-race-test.cc
+@@ -0,0 +1,46 @@
++// A spill read while it grows, built with ThreadSanitizer. The owner appends
++// one index stride per line up to the cap, so every append adds an index
++// entry, while three readers count lines. A reader may use only the index
++// entries the written() it loaded covers.
++
++#include <atomic>
++#include <cassert>
++#include <cstddef>
++#include <cstdint>
++#include <string>
++#include <thread>
++#include <vector>
++
++#include "log-spill.hh"
++
++using nixgrpc::LogSpill;
++using nixgrpc::SpillKind;
++
++auto main() -> int
++{
++    constexpr int readerCount = 3;
++    constexpr std::size_t lines = LogSpill::kDefaultCap / LogSpill::kStride;
++    LogSpill spill;
++    std::atomic<bool> done{false};
++    std::vector<std::thread> readers;
++    readers.reserve(readerCount);
++    for (int idx = 0; idx < readerCount; idx++) {
++        readers.emplace_back([&] -> void {
++            std::size_t seen = 0;
++            while (!done) {
++                auto const now = spill.linesBefore(SIZE_MAX);
++                assert(now >= seen && now <= lines);
++                seen = now;
++            }
++        });
++    }
++    std::string const line(LogSpill::kStride - 1, 'x');
++    for (std::size_t idx = 0; idx < lines; idx++) {
++        spill.append(SpillKind::line, line);
++    }
++    done = true;
++    for (auto & reader : readers) {
++        reader.join();
++    }
++    return spill.linesBefore(SIZE_MAX) == lines ? 0 : 1;
 +}
 diff --git a/tests/log-spill-test.cc b/tests/log-spill-test.cc
 index 9532070..da9692c 100644

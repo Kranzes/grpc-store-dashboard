@@ -65,8 +65,14 @@ message RecentBuildsRequest {
   // Fill FinishedBuild.error. Only with failed_only.
   bool with_error = 4;
   // Only these derivations (base names, at most 16), the newest record of
-  // each, error included. before_ms, limit and failed_only are ignored.
+  // each, error included. before_ms, before_seq, limit and failed_only are
+  // ignored.
   repeated string drv_paths = 5;
+  // Only records older than this one: FinishedBuild.seq below it. 0 = no
+  // bound. Applies together with before_ms. Paging with the last record's
+  // seq returns each record once, also when several finished in the same
+  // millisecond.
+  uint64 before_seq = 6;
 }
 
 message RecentBuildsBatch {
@@ -94,6 +100,10 @@ message FinishedBuild {
   uint64 finished_ms = 10;
   // Identities of the clients that waited on it when it finished, at most 4.
   repeated string requested_by = 11;
+  // One more for each record the scheduler keeps, starting at 1, and the
+  // same for a failure in both rings. A new term empties the rings but does
+  // not reset it. Restarts with the scheduler instance (Reset.instance).
+  uint64 seq = 12;
 }
 
 // Events are batched per stream message, like the scheduler's other streams.
@@ -159,14 +169,15 @@ message WorkerState {
   repeated string features = 3;
   uint32 max_jobs = 4;
   bool up = 5;
-  // Stopping, low on disk or without its local nix-daemon. drain_reason
-  // says which when the builder reports it.
+  // Stopping, low on disk, without its local nix-daemon or failing to
+  // publish. drain_reason says which when the builder reports it.
   bool draining = 6;
   enum DrainReason {
     DRAIN_REASON_UNSPECIFIED = 0;
     DRAIN_REASON_STOPPING = 1;
     DRAIN_REASON_LOW_DISK = 2;
     DRAIN_REASON_LOCAL_DAEMON = 3;
+    DRAIN_REASON_PUBLISH_UNAVAILABLE = 4;
   }
   // While draining. UNSPECIFIED: the builder does not say.
   DrainReason drain_reason = 7;

@@ -16,8 +16,8 @@ export interface SourceSink {
 
 /** What the build list asks Events.RecentBuilds. Times are the scheduler's clock. */
 export type RecentBuildsRequest = Readonly<{
-	/** Only builds that finished before this. 0 means now. */
-	beforeMs: number;
+	/** Only records older than this one, by FinishedBuild.seq. 0 means from the newest. */
+	beforeSeq: number;
 	limit: number;
 	failedOnly: boolean;
 	withError: boolean;

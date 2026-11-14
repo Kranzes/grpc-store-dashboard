@@ -349,7 +349,7 @@ export function startLiveSource(o: LiveSourceOptions): LiveSource {
 	async function* recentBuilds(req: RecentBuildsRequest, signal: AbortSignal) {
 		yield* client.recentBuilds(
 			{
-				beforeMs: BigInt(Math.max(0, Math.round(req.beforeMs))),
+				beforeSeq: BigInt(req.beforeSeq),
 				limit: req.limit,
 				failedOnly: req.failedOnly,
 				withError: req.withError,

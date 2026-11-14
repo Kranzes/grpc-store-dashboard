@@ -15,10 +15,10 @@ lives in this repository's NixOS module (`nixosModules.default`).
 | 0005 | The scheduler's state and every change to it, as the `Events.Watch` stream. |
 | 0006 | Counters and a `Stats` event once a second, and streams that end when their token expires. |
 | 0007 | `nix-grpc-daemon watch --json`. |
-| 0008 | Builders report why a build failed, why they drain (stopping, low disk or no local nix-daemon), their free disk and their substituter traffic, and the scheduler sends it as events. |
+| 0008 | Builders report why a build failed, why they drain (stopping, low disk, no local nix-daemon or publishes that keep failing), their free disk and their substituter traffic, and the scheduler sends it as events. A builder whose publishes fail 3 times in a row takes no builds for a minute. |
 | 0009 | `GetBuildLog` follows a running build and resumes at an offset. |
 | 0010 | Builders report each running build's phase. |
-| 0011 | `Events.RecentBuilds`: the last 10,000 builds and 2,000 failures. |
+| 0011 | `Events.RecentBuilds`: the last 10,000 builds and 2,000 failures. Each record has a `seq`, and `before_seq` pages by it, so builds that finished in the same millisecond come once each. |
 | 0012 | `GetBuildLog` reads from the log store and the binary cache when a node has no log. |
 
 Each commit message explains its change. Each commit builds and passes nix-grpc-store's tests on

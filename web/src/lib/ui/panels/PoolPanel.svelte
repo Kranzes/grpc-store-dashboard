@@ -12,7 +12,7 @@
 		type WorkerView
 	} from '#lib/model/types.ts';
 	import type { LineKind } from '#lib/flow/kinds.ts';
-	import { drainRow, poolDrains } from '../drain.ts';
+	import { drainRow, knownDrains, poolDrains } from '../drain.ts';
 	import { formatBytes, formatCount } from '../format.ts';
 	import { Hold } from '../hold.svelte.ts';
 	import Segmented from '../Segmented.svelte';
@@ -129,7 +129,7 @@
 				</div>
 			</dl>
 		</div>
-		{#if p.drainingLowDisk + p.drainingStopping + p.drainingLocalDaemon > 0}
+		{#if knownDrains(p) > 0}
 			<p class="p-caption">Draining: {poolDrains(p)}.</p>
 		{/if}
 		<p class="p-caption">

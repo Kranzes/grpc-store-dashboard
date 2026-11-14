@@ -36,6 +36,7 @@ const POOL: PoolView = {
 	drainingLowDisk: 0,
 	drainingStopping: 0,
 	drainingLocalDaemon: 0,
+	drainingPublishUnavailable: 0,
 	offline: 0,
 	running: 4,
 	slots: 16,
@@ -107,13 +108,14 @@ describe('PoolPanel', () => {
 	it('counts draining builders by reason', () => {
 		const body = renderPool({
 			...POOL,
-			draining: 4,
+			draining: 5,
 			drainingLowDisk: 1,
 			drainingStopping: 1,
-			drainingLocalDaemon: 1
+			drainingLocalDaemon: 1,
+			drainingPublishUnavailable: 1
 		});
 		expect(body).toContain(
-			'Draining: 1 low on disk, 1 stopping, 1 with no nix-daemon, 1 without a reason.'
+			'Draining: 1 low on disk, 1 stopping, 1 with no nix-daemon, 1 with publishing failing, 1 without a reason.'
 		);
 	});
 

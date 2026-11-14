@@ -390,6 +390,8 @@ message Load {
     DRAIN_REASON_STOPPING = 1;     // a stop signal
     DRAIN_REASON_LOW_DISK = 2;     // free space below --min-free
     DRAIN_REASON_LOCAL_DAEMON = 3; // the local nix-daemon does not answer
+    // Publishing its outputs to the cache failed several times in a row.
+    DRAIN_REASON_PUBLISH_UNAVAILABLE = 4;
   }
   // While draining. A builder sends Load again when the reason changes.
   DrainReason drain_reason = 2;

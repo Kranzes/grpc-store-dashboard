@@ -514,21 +514,37 @@ describe('build history', () => {
 		finishedMs: bigint;
 		outcome?: Outcome;
 		error?: string;
+		seq?: bigint;
 	};
 	const built = (name: string, ago: number): FinishedBuildInit => ({
 		drvPath: drvPath(name),
 		finishedMs: BigInt(T0 - ago),
 		outcome: Outcome.BUILT
 	});
-	type Rings = { builds: FinishedBuildInit[]; failures: FinishedBuildInit[] };
-	/** Answers from the scheduler's two rings, newest first, in batches of 256. */
-	const fromRings = (rings: Rings) => (req: RecentBuildsRequest) => {
-		const page = (req.failedOnly ? rings.failures : rings.builds)
-			.filter((b) => !req.beforeMs || Number(b.finishedMs) < req.beforeMs)
+	let lastSeq = 0n;
+	/**
+	 * Gives a ring's new records (newest first, so from its end) the next seqs,
+	 * as the scheduler numbers records it keeps. One in both rings keeps one.
+	 */
+	const stamp = (ring: FinishedBuildInit[]) => {
+		for (let i = ring.length - 1; i >= 0; i--) ring[i].seq ??= ++lastSeq;
+		return ring;
+	};
+	/** A page of a ring, newest first, below before_seq, in batches of 256. */
+	const pageOf = (ring: FinishedBuildInit[], req: RecentBuildsRequest) => {
+		const page = ring
+			.filter((b) => !req.beforeSeq || Number(b.seq) < req.beforeSeq)
 			.slice(0, req.limit);
 		const out: FinishedBuildInit[][] = [];
 		for (let i = 0; i < page.length; i += 256) out.push(page.slice(i, i + 256));
 		return out.length ? out : [[]];
+	};
+	type Rings = { builds: FinishedBuildInit[]; failures: FinishedBuildInit[] };
+	/** Answers from the scheduler's two rings. */
+	const fromRings = (rings: Rings) => (req: RecentBuildsRequest) => {
+		stamp(rings.builds);
+		stamp(rings.failures);
+		return pageOf(req.failedOnly ? rings.failures : rings.builds, req);
 	};
 	/** A build that finishes live on A. */
 	const gone = (name: string) => E.gone(drvPath(name), Outcome.BUILT, { workerAddr: A });
@@ -568,7 +584,7 @@ describe('build history', () => {
 		store.sink.events(new Stream(s.seq + 10n).snapshot(E.reset(), E.worker(A)));
 		store.ensureHistory();
 		await settle();
-		expect(h.calls.slice(first.length).map((c) => [c.req.beforeMs, c.req.failedOnly])).toEqual([
+		expect(h.calls.slice(first.length).map((c) => [c.req.beforeSeq, c.req.failedOnly])).toEqual([
 			[0, false],
 			[0, true]
 		]);
@@ -655,7 +671,7 @@ describe('build history', () => {
 		rings.builds.unshift(built('after', -5000));
 		reconnect(store, s, T0 + 5000, gone('after'));
 		await settle();
-		// Pages smaller than a first page, from now back, each one past the last's oldest
+		// Pages smaller than a first page, from now back, each one below the last's oldest
 		// row. They stop at l0, the newest finish the page had before the cut, not at the
 		// build that came live after it. The failures take one page.
 		const topUp = h.calls.slice(asked);
@@ -663,11 +679,12 @@ describe('build history', () => {
 		const page = builds[0].req.limit;
 		expect(page).toBeLessThan(firstLimit);
 		expect(builds.every((c) => c.req.limit === page)).toBe(true);
-		expect(builds[0].req.beforeMs).toBe(0);
+		expect(builds[0].req.beforeSeq).toBe(0);
+		const seqOf = new Map(rings.builds.map((b) => [b.drvPath, Number(b.seq)]));
 		for (let i = 1; i < builds.length; i++)
-			expect(builds[i].req.beforeMs).toBeLessThan(builds[i - 1].req.beforeMs || Infinity);
+			expect(builds[i].req.beforeSeq).toBe(seqOf.get(builds[i - 1].paths.at(-1)!));
 		expect(builds.findIndex((c) => c.paths.includes(drvPath('l0')))).toBe(builds.length - 1);
-		expect(topUp.filter((c) => c.req.failedOnly).map((c) => [c.req.beforeMs, c.sent])).toEqual([
+		expect(topUp.filter((c) => c.req.failedOnly).map((c) => [c.req.beforeSeq, c.sent])).toEqual([
 			[0, 1]
 		]);
 		const rows = store.builds(all).rows.filter((r) => r.state !== 'assigned');
@@ -686,7 +703,7 @@ describe('build history', () => {
 		const before = h.calls.length;
 		reconnect(store, s, T0 + 9000);
 		await settle();
-		expect(h.calls.slice(before).map((c) => [c.req.beforeMs, c.sent])).toEqual([
+		expect(h.calls.slice(before).map((c) => [c.req.beforeSeq, c.sent])).toEqual([
 			[0, 1],
 			[0, 1]
 		]);
@@ -755,15 +772,8 @@ describe('build history', () => {
 	it('loadOlderBuilds pages by the oldest row and stops at complete', async () => {
 		const { store, s } = setup();
 		// 1,500 rows in the scheduler's builds ring, one a second.
-		const ring = Array.from({ length: 1500 }, (_, i) => built(`b${i}`, (i + 1) * 1000));
-		const h = history((req) => {
-			if (req.failedOnly) return [[]];
-			const older = ring.filter((b) => !req.beforeMs || Number(b.finishedMs) < req.beforeMs);
-			const page = older.slice(0, req.limit);
-			const out: FinishedBuildInit[][] = [];
-			for (let i = 0; i < page.length; i += 256) out.push(page.slice(i, i + 256));
-			return out.length ? out : [[]];
-		});
+		const ring = stamp(Array.from({ length: 1500 }, (_, i) => built(`b${i}`, (i + 1) * 1000)));
+		const h = history((req) => (req.failedOnly ? [[]] : pageOf(ring, req)));
 		store.attachHistory(h.fn);
 		live(store, s);
 		store.ensureHistory();
@@ -775,14 +785,33 @@ describe('build history', () => {
 		expect(store.builds(all).coverage).toMatchObject({ source: 'scheduler', complete: false });
 		store.loadOlderBuilds(false);
 		await settle();
-		// The scheduler pages strictly before beforeMs, which is one past the oldest row the page has.
-		expect(h.calls.at(-1)!.req.beforeMs).toBe(Number(ring[limit - 1].finishedMs) + 1);
+		// The next page starts below the oldest row's seq.
+		expect(h.calls.at(-1)!.req.beforeSeq).toBe(Number(ring[limit - 1].seq));
 		expect(store.builds(all).rows.filter((r) => r.state !== 'assigned')).toHaveLength(ring.length);
 		expect(store.builds(all).coverage.complete).toBe(true);
 		const n = h.calls.length;
 		store.loadOlderBuilds(false);
 		await settle();
 		expect(h.calls).toHaveLength(n);
+		store.destroy();
+	});
+
+	it('loadOlderBuilds reads past builds that finished in the same millisecond', async () => {
+		const { store, s } = setup();
+		// 1,500 builds that all finished in one millisecond, more than a first page.
+		const ring = stamp(Array.from({ length: 1500 }, (_, i) => built(`b${i}`, 1000)));
+		const h = history((req) => (req.failedOnly ? [[]] : pageOf(ring, req)));
+		store.attachHistory(h.fn);
+		live(store, s);
+		store.ensureHistory();
+		await settle();
+		store.loadOlderBuilds(false);
+		await settle();
+		const all = { ...ANY_QUERY };
+		const rows = store.builds(all).rows.filter((r) => r.state !== 'assigned');
+		expect(new Set(rows.map((r) => r.drvPath)).size).toBe(ring.length);
+		expect(rows).toHaveLength(ring.length);
+		expect(store.builds(all).coverage.complete).toBe(true);
 		store.destroy();
 	});
 
@@ -794,7 +823,8 @@ describe('build history', () => {
 			if (!req.failedOnly) return [[]];
 			const out = Array.from({ length: req.limit }, () => ({
 				...built(`f${next}`, (++next + 1) * 1000),
-				outcome: Outcome.FAILED
+				outcome: Outcome.FAILED,
+				seq: BigInt(1_000_000 - next)
 			}));
 			return [out];
 		});

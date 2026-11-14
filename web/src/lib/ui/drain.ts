@@ -1,19 +1,25 @@
 // Why a builder drains, in the words of its card, its cell and the panels.
 
-import type { PoolView, WorkerView } from '#lib/model/types.ts';
+import type { DrainReason, PoolView, WorkerView } from '#lib/model/types.ts';
 import { formatBytes, formatCount } from './format.ts';
 
 type Drain = Pick<WorkerView, 'drainReason' | 'diskFree' | 'minFree'>;
 
-/** The card's badge while draining: "Low disk", "Stopping", "No nix-daemon" or "Draining". */
+/** Each known reason in a few words, as the badge, the panel's state and the pool row say it. */
+const REASON: Readonly<Record<Exclude<DrainReason, 'unknown'>, string>> = {
+	'low-disk': 'low disk',
+	stopping: 'stopping',
+	'local-daemon': 'no nix-daemon',
+	'publish-unavailable': 'publishing failing'
+};
+
+const reasonOf = (w: Drain): string | null =>
+	w.drainReason === null || w.drainReason === 'unknown' ? null : REASON[w.drainReason];
+
+/** The card's badge while draining: "Low disk", "Stopping", "No nix-daemon", "Publishing failing" or "Draining". */
 export function drainBadge(w: Drain): string {
-	return w.drainReason === 'low-disk'
-		? 'Low disk'
-		: w.drainReason === 'stopping'
-			? 'Stopping'
-			: w.drainReason === 'local-daemon'
-				? 'No nix-daemon'
-				: 'Draining';
+	const r = reasonOf(w);
+	return r === null ? 'Draining' : r[0].toUpperCase() + r.slice(1);
 }
 
 /** The badge's tooltip, with the full reason. */
@@ -22,6 +28,8 @@ export function drainTitle(w: Drain): string {
 		return 'Stopping: the builder was told to stop. It finishes its builds, then disconnects.';
 	if (w.drainReason === 'local-daemon')
 		return "No nix-daemon: the builder's nix-daemon does not answer. It takes no new work until it does.";
+	if (w.drainReason === 'publish-unavailable')
+		return "Publishing failing: the builder's last publishes to the cache failed. It takes no new work for a while, then tries again.";
 	if (w.drainReason !== 'low-disk')
 		return 'Draining: the builder takes no new work. It does not say why.';
 	const below =
@@ -31,15 +39,13 @@ export function drainTitle(w: Drain): string {
 	return `Low on disk: ${below}. It takes no new work until it has more.`;
 }
 
-/** The builder panel's state: "Draining (low disk)", "Draining (stopping)", "Draining (no nix-daemon)" or "Draining". */
+/**
+ * The builder panel's state: "Draining (low disk)", "Draining (stopping)",
+ * "Draining (no nix-daemon)", "Draining (publishing failing)" or "Draining".
+ */
 export function drainState(w: Drain): string {
-	return w.drainReason === 'low-disk'
-		? 'Draining (low disk)'
-		: w.drainReason === 'stopping'
-			? 'Draining (stopping)'
-			: w.drainReason === 'local-daemon'
-				? 'Draining (no nix-daemon)'
-				: 'Draining';
+	const r = reasonOf(w);
+	return r === null ? 'Draining' : `Draining (${r})`;
 }
 
 /** The builder panel's caption while draining. */
@@ -50,40 +56,57 @@ export function drainCaption(w: Drain): string {
 		return 'Stopping: the builder was told to stop. It finishes the builds it has, then disconnects.';
 	if (w.drainReason === 'local-daemon')
 		return "No nix-daemon: the builder's nix-daemon does not answer, so it takes no new work. It takes work again once its nix-daemon answers.";
-	return 'Stopping, low on disk or no nix-daemon. Takes no new work.';
+	if (w.drainReason === 'publish-unavailable')
+		return "Publishing failing: the builder's publishes to the cache keep failing, so it takes no new work. It tries again after a while.";
+	return 'Stopping, low on disk, no nix-daemon or publishing failing. Takes no new work.';
 }
 
 /** A pool cell's state after its load: "draining, low on disk, 3.1 GiB free". */
 export function drainCell(w: Drain): string {
 	if (w.drainReason === 'stopping') return 'draining, stopping';
 	if (w.drainReason === 'local-daemon') return 'draining, no nix-daemon';
+	if (w.drainReason === 'publish-unavailable') return 'draining, publishing failing';
 	if (w.drainReason !== 'low-disk') return 'draining';
 	return w.diskFree === null
 		? 'draining, low on disk'
 		: `draining, low on disk, ${formatBytes(w.diskFree)} free`;
 }
 
-/** The pool row's badge: "Draining · low disk", "Draining · stopping", "Draining · no nix-daemon" or "Draining". */
+/**
+ * The pool row's badge: "Draining · low disk", "Draining · stopping",
+ * "Draining · no nix-daemon", "Draining · publishing failing" or "Draining".
+ */
 export function drainRow(w: Drain): string {
-	return w.drainReason === 'low-disk'
-		? 'Draining · low disk'
-		: w.drainReason === 'stopping'
-			? 'Draining · stopping'
-			: w.drainReason === 'local-daemon'
-				? 'Draining · no nix-daemon'
-				: 'Draining';
+	const r = reasonOf(w);
+	return r === null ? 'Draining' : `Draining · ${r}`;
+}
+
+type PoolDrains = Pick<
+	PoolView,
+	| 'draining'
+	| 'drainingLowDisk'
+	| 'drainingStopping'
+	| 'drainingLocalDaemon'
+	| 'drainingPublishUnavailable'
+>;
+
+/** How many of a pool's builders drain for a reason they gave. */
+export function knownDrains(p: PoolDrains): number {
+	return (
+		p.drainingLowDisk + p.drainingStopping + p.drainingLocalDaemon + p.drainingPublishUnavailable
+	);
 }
 
 /** A pool's draining builders by reason: "1 low on disk, 1 stopping". '' with none. */
-export function poolDrains(
-	p: Pick<PoolView, 'draining' | 'drainingLowDisk' | 'drainingStopping' | 'drainingLocalDaemon'>
-) {
-	const unknown = p.draining - p.drainingLowDisk - p.drainingStopping - p.drainingLocalDaemon;
+export function poolDrains(p: PoolDrains) {
+	const unknown = p.draining - knownDrains(p);
 	const parts: string[] = [];
 	if (p.drainingLowDisk > 0) parts.push(`${formatCount(p.drainingLowDisk)} low on disk`);
 	if (p.drainingStopping > 0) parts.push(`${formatCount(p.drainingStopping)} stopping`);
 	if (p.drainingLocalDaemon > 0)
 		parts.push(`${formatCount(p.drainingLocalDaemon)} with no nix-daemon`);
+	if (p.drainingPublishUnavailable > 0)
+		parts.push(`${formatCount(p.drainingPublishUnavailable)} with publishing failing`);
 	if (unknown > 0) parts.push(`${formatCount(unknown)} without a reason`);
 	return parts.join(', ');
 }

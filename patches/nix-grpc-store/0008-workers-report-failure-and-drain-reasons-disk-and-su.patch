@@ -1,4 +1,4 @@
-From f90eab3ed7ea3b6782dfd9a845a74144bd266117 Mon Sep 17 00:00:00 2001
+From 8b7681ff691e28a0c727922e3921f77438e9279c Mon Sep 17 00:00:00 2001
 From: Ilan Joselevich <personal@ilanjoselevich.com>
 Date: Tue, 10 Nov 2026 19:20:21 +0100
 Subject: [PATCH 08/12] workers: report failure and drain reasons, disk and
@@ -18,9 +18,15 @@ variables and quoted keys, private key blocks), then cuts the text to
 4096 bytes as the first two lines, "[...]" and the end. A failure
 without a BuildResult is STATUS_WORKER_ERROR with the error message.
 Load carries the reason too, stopping first, then low disk, then the
-local nix-daemon, and goes out again when the reason changes. A Load
-that does not change whether a worker drains no longer wakes Envoy's
-watchers or runs a dispatch pass.
+local nix-daemon, then publishing, and goes out again when the reason
+changes. A Load that does not change whether a worker drains no longer
+wakes Envoy's watchers or runs a dispatch pass.
+
+A builder whose outputs fail to publish 3 times in a row now takes no
+builds for a minute, with the reason DRAIN_REASON_PUBLISH_UNAVAILABLE.
+Each of those builds still fails, as before. After the minute it takes
+builds again, and one more failure stops it again at once. A success
+clears the count.
 
 A logger that wraps nix::logger tallies the nix-daemon's substitution
 activities per substituter: NAR bytes, wire bytes, paths that arrived
@@ -49,28 +55,29 @@ nix_grpc_sched_failures_total{reason} and the draining kinds of
 nix_grpc_sched on the scheduler.
 
 build-report-test covers the status names, the masks and the cut, and
-builder-test the reason in each Load. Older schedulers ignore the new
+builder-test the reason in each Load and the pause after failed
+publishes. Older schedulers ignore the new
 fields. Older builders send none, and their status reads unreported.
 ---
  .../nix-grpc-farm/templates/scheduler.yaml    |   4 +
  meson.build                                   |  17 +
  nix/packages/nix-grpc-store.nix               |   3 +
  nixos/daemon-args.nix                         |   2 +
- proto/events.proto                            |  88 ++-
- proto/nix_remote.proto                        |  76 +++
+ proto/events.proto                            |  89 ++-
+ proto/nix_remote.proto                        |  78 +++
  src/build-log.hh                              |  72 ++-
  src/daemon/backend.cc                         |  10 +-
  src/daemon/backend.hh                         |   2 +
  src/daemon/build-report.hh                    | 607 ++++++++++++++++++
- src/daemon/builder.cc                         |  86 ++-
- src/daemon/builder.hh                         |  39 +-
+ src/daemon/builder.cc                         | 119 +++-
+ src/daemon/builder.hh                         |  57 +-
  src/daemon/coordinator.cc                     |  33 +-
  src/daemon/coordinator.hh                     |   6 +-
  src/daemon/dispatcher-events.cc               | 134 +++-
- src/daemon/dispatcher.cc                      | 144 ++++-
+ src/daemon/dispatcher.cc                      | 146 ++++-
  src/daemon/dispatcher.hh                      |  51 +-
- src/daemon/main.cc                            |  77 ++-
- src/daemon/metrics.hh                         | 107 ++-
+ src/daemon/main.cc                            |  80 ++-
+ src/daemon/metrics.hh                         | 118 +++-
  src/daemon/options.cc                         |   2 +
  src/daemon/options.hh                         |   2 +
  src/daemon/sched-reactor.hh                   |  50 +-
@@ -81,16 +88,16 @@ fields. Older builders send none, and their status reads unreported.
  src/nix-compat.hh                             |  36 ++
  tests/build-log-test.cc                       |  43 +-
  tests/build-report-test.cc                    | 214 ++++++
- tests/builder-test.cc                         |  32 +-
+ tests/builder-test.cc                         |  85 ++-
  tests/e2e/farm/helpers.rs                     |  20 +-
  tests/e2e/farm/serial.rs                      |  55 ++
  tests/events-grpc-test.cc                     | 165 ++++-
- tests/events-test.cc                          | 556 +++++++++++++++-
+ tests/events-test.cc                          | 558 +++++++++++++++-
  tests/farm-sim-test.cc                        |   4 +
  tests/scheduler-test.cc                       |   7 +-
  tests/substituter-tally-test.cc               | 303 +++++++++
  tests/valid-utf8.hh                           |  36 ++
- 38 files changed, 3599 insertions(+), 120 deletions(-)
+ 38 files changed, 3723 insertions(+), 121 deletions(-)
  create mode 100644 src/daemon/build-report.hh
  create mode 100644 src/daemon/scheduler-link.hh
  create mode 100644 src/daemon/substituter-tally.hh
@@ -183,7 +190,7 @@ index 1fbad81..8dac91b 100644
      (lib.escapeShellArgs ([ (lib.getExe cfg.niks3.package) "push" ] ++ cfg.niks3.pushFlags))
    ]
 diff --git a/proto/events.proto b/proto/events.proto
-index c9bd595..33ec6c1 100644
+index c9bd595..551a994 100644
 --- a/proto/events.proto
 +++ b/proto/events.proto
 @@ -27,6 +27,12 @@ package nix.remote;
@@ -220,19 +227,20 @@ index c9bd595..33ec6c1 100644
  message WorkerState {
    // The address the balancer reaches it at (its --advertise).
    string addr = 1;
-@@ -97,8 +108,45 @@ message WorkerState {
+@@ -97,8 +108,46 @@ message WorkerState {
    repeated string features = 3;
    uint32 max_jobs = 4;
    bool up = 5;
 -  // Stopping, or low on disk. The scheduler cannot tell which.
-+  // Stopping, low on disk or without its local nix-daemon. drain_reason
-+  // says which when the builder reports it.
++  // Stopping, low on disk, without its local nix-daemon or failing to
++  // publish. drain_reason says which when the builder reports it.
    bool draining = 6;
 +  enum DrainReason {
 +    DRAIN_REASON_UNSPECIFIED = 0;
 +    DRAIN_REASON_STOPPING = 1;
 +    DRAIN_REASON_LOW_DISK = 2;
 +    DRAIN_REASON_LOCAL_DAEMON = 3;
++    DRAIN_REASON_PUBLISH_UNAVAILABLE = 4;
 +  }
 +  // While draining. UNSPECIFIED: the builder does not say.
 +  DrainReason drain_reason = 7;
@@ -267,7 +275,7 @@ index c9bd595..33ec6c1 100644
  }
  
  // One Schedule stream: a build client. Hook-mode builds open one per
-@@ -208,6 +256,36 @@ message DrvGone {
+@@ -208,6 +257,36 @@ message DrvGone {
    string worker_addr = 3;
    // BUILT only. These have been published to the cache.
    repeated Output outputs = 4;
@@ -304,7 +312,7 @@ index c9bd595..33ec6c1 100644
  }
  
  message Output {
-@@ -254,6 +332,10 @@ message Counters {
+@@ -254,6 +333,10 @@ message Counters {
    // a bound either way: it leaves out inputs nobody here built, and counts an
    // input again for every build that needs it, even once the worker has it.
    uint64 fetched_bytes_estimate = 11;
@@ -316,7 +324,7 @@ index c9bd595..33ec6c1 100644
  
  message CounterSample {
 diff --git a/proto/nix_remote.proto b/proto/nix_remote.proto
-index 6cad119..fe16149 100644
+index 6cad119..659a35b 100644
 --- a/proto/nix_remote.proto
 +++ b/proto/nix_remote.proto
 @@ -244,6 +244,15 @@ message Hello {
@@ -335,7 +343,7 @@ index 6cad119..fe16149 100644
  }
  
  message Done {
-@@ -265,15 +274,75 @@ message Done {
+@@ -265,15 +274,77 @@ message Done {
      UNREACHABLE = 4; // no client came for it
      TRANSIENT_FAILURE = 5; // e.g. ENOSPC
    }
@@ -383,6 +391,8 @@ index 6cad119..fe16149 100644
 +    DRAIN_REASON_STOPPING = 1;     // a stop signal
 +    DRAIN_REASON_LOW_DISK = 2;     // free space below --min-free
 +    DRAIN_REASON_LOCAL_DAEMON = 3; // the local nix-daemon does not answer
++    // Publishing its outputs to the cache failed several times in a row.
++    DRAIN_REASON_PUBLISH_UNAVAILABLE = 4;
 +  }
 +  // While draining. A builder sends Load again when the reason changes.
 +  DrainReason drain_reason = 2;
@@ -411,7 +421,7 @@ index 6cad119..fe16149 100644
  }
  
  message WorkerMsg {
-@@ -281,6 +350,7 @@ message WorkerMsg {
+@@ -281,6 +352,7 @@ message WorkerMsg {
      Hello hello = 1;
      Done done = 2;
      Load load = 3;
@@ -419,7 +429,7 @@ index 6cad119..fe16149 100644
    }
  }
  
-@@ -293,11 +363,17 @@ message Revoke {
+@@ -293,11 +365,17 @@ message Revoke {
    string drv_path = 1;
  }
  
@@ -1206,7 +1216,7 @@ index 0000000..7e824f8
 +
 +} // namespace nixgrpc
 diff --git a/src/daemon/builder.cc b/src/daemon/builder.cc
-index d096179..92fd062 100644
+index d096179..ffb39d6 100644
 --- a/src/daemon/builder.cc
 +++ b/src/daemon/builder.cc
 @@ -16,6 +16,7 @@
@@ -1217,20 +1227,22 @@ index d096179..92fd062 100644
  
  namespace nixgrpc {
  
-@@ -24,10 +25,12 @@ using nix::remote::WorkerMsg;
+@@ -24,10 +25,13 @@ using nix::remote::WorkerMsg;
  Builder::Builder(Config config, Metrics & metrics)
      : config(std::move(config))
      , metrics(metrics)
 +    , link(this->config.tally, this->config.minFree)
  {
-     for (auto const why : {Unavailable::stopping, Unavailable::lowDisk, Unavailable::localDaemonDown}) {
+-    for (auto const why : {Unavailable::stopping, Unavailable::lowDisk, Unavailable::localDaemonDown}) {
++    for (auto const why :
++         {Unavailable::stopping, Unavailable::lowDisk, Unavailable::localDaemonDown, Unavailable::publishFailing}) {
          metrics.unavailable(name(why), false);
      }
 +    metrics.minFree(this->config.minFree);
  }
  
  void Builder::onExpect(const nix::remote::Expect & exp)
-@@ -128,7 +131,8 @@ void Builder::finished(
+@@ -128,7 +132,8 @@ void Builder::finished(
      nix::remote::Done::Outcome outcome,
      const std::vector<std::pair<std::string, uint64_t>> & outputs,
      std::string resultWire,
@@ -1240,7 +1252,7 @@ index d096179..92fd062 100644
  {
      uint64_t assignId = 0;
      std::shared_ptr<Expected::Shared> shared;
-@@ -147,7 +151,7 @@ void Builder::finished(
+@@ -147,7 +152,7 @@ void Builder::finished(
          shared->resultWire = std::move(resultWire);
          shared->cv.notify_all();
      }
@@ -1249,7 +1261,7 @@ index d096179..92fd062 100644
  }
  
  void Builder::sendDone(
-@@ -155,7 +159,8 @@ void Builder::sendDone(
+@@ -155,7 +160,8 @@ void Builder::sendDone(
      uint64_t assignId,
      nix::remote::Done::Outcome outcome,
      const std::vector<std::pair<std::string, uint64_t>> & outputs,
@@ -1259,7 +1271,7 @@ index d096179..92fd062 100644
  {
      WorkerMsg msg;
      auto * done = msg.mutable_done();
-@@ -163,6 +168,12 @@ void Builder::sendDone(
+@@ -163,6 +169,12 @@ void Builder::sendDone(
      done->set_assign_id(assignId);
      done->set_outcome(outcome);
      done->set_reason(reason);
@@ -1272,7 +1284,7 @@ index d096179..92fd062 100644
      for (const auto & [path, size] : outputs) {
          auto * out = done->add_outputs();
          out->set_path(path);
-@@ -186,6 +197,16 @@ auto Builder::hello() -> WorkerMsg
+@@ -186,6 +198,16 @@ auto Builder::hello() -> WorkerMsg
          hel->add_features(feat);
      }
      hel->set_max_jobs(config.maxJobs);
@@ -1289,7 +1301,7 @@ index d096179..92fd062 100644
      auto lck = state.lock();
      lck->newestExpect = 0; // a new session, maybe of a new scheduler, counts anew
      // A slot nobody claimed is dropped, not reported: the scheduler would
-@@ -206,12 +227,34 @@ auto Builder::greet() -> bool
+@@ -206,12 +228,56 @@ auto Builder::greet() -> bool
          return false;
      }
      greeted_ = true;
@@ -1316,7 +1328,29 @@ index d096179..92fd062 100644
 +    if (holds(Unavailable::localDaemonDown)) {
 +        return nix::remote::Load::DRAIN_REASON_LOCAL_DAEMON;
 +    }
++    if (holds(Unavailable::publishFailing)) {
++        return nix::remote::Load::DRAIN_REASON_PUBLISH_UNAVAILABLE;
++    }
 +    return nix::remote::Load::DRAIN_REASON_UNSPECIFIED;
++}
++
++void Builder::published(bool succeeded)
++{
++    const std::scoped_lock lock(publishMutex);
++    publishFailures = succeeded ? 0 : publishFailures + 1;
++    bool const pause = publishFailures >= publishFailuresToDrain;
++    if (pause != publishPausedUntil.has_value()) {
++        pausePublishing(pause ? std::optional(config.now() + publishPause) : std::nullopt);
++    }
++}
++
++void Builder::pausePublishing(std::optional<Clock::time_point> until)
++{
++    publishPausedUntil = until;
++    logLine(
++        LogLevel::info,
++        {{"event", until ? "unhealthy" : "healthy"}, {"reason", std::string(name(Unavailable::publishFailing))}});
++    setUnavailable(Unavailable::publishFailing, until.has_value());
 +}
 +
 +auto Builder::sendLoad() -> bool
@@ -1329,7 +1363,7 @@ index d096179..92fd062 100644
  }
  
  void Builder::setUnavailable(Unavailable why, bool holds)
-@@ -225,14 +268,12 @@ void Builder::setUnavailable(Unavailable why, bool holds)
+@@ -225,14 +291,12 @@ void Builder::setUnavailable(Unavailable why, bool holds)
          unavailable_ &= static_cast<uint8_t>(~bit);
      }
      metrics.unavailable(name(why), holds);
@@ -1348,7 +1382,7 @@ index d096179..92fd062 100644
          giveBack(takeUnclaimed([](const Expected &) -> bool { return true; }), nix::remote::Done::DRAINING);
      }
  }
-@@ -257,13 +298,23 @@ void Builder::setSend(SendFn send)
+@@ -257,23 +321,42 @@ void Builder::setSend(SendFn send)
  {
      std::scoped_lock const lock(unavailableMutex);
      greeted_ = false;
@@ -1375,7 +1409,18 @@ index d096179..92fd062 100644
  }
  
  void Builder::tick()
-@@ -274,6 +325,7 @@ void Builder::tick()
+ {
+     const auto now = config.now();
++    {
++        // The builder tries again, and the next failure stops it again.
++        const std::scoped_lock lock(publishMutex);
++        if (publishPausedUntil && now >= *publishPausedUntil) {
++            publishFailures = publishFailuresToDrain - 1;
++            pausePublishing(std::nullopt);
++        }
++    }
+     // While draining, also what an Expect racing setUnavailable() left behind.
+     bool const draining = this->draining();
      giveBack(
          takeUnclaimed([&](const Expected & ent) -> bool { return draining || now - ent.since > expectTimeout; }),
          draining ? nix::remote::Done::DRAINING : nix::remote::Done::UNREACHABLE);
@@ -1384,7 +1429,7 @@ index d096179..92fd062 100644
  
  } // namespace nixgrpc
 diff --git a/src/daemon/builder.hh b/src/daemon/builder.hh
-index dc38a6b..f956102 100644
+index dc38a6b..9f306ac 100644
 --- a/src/daemon/builder.hh
 +++ b/src/daemon/builder.hh
 @@ -24,6 +24,8 @@
@@ -1438,14 +1483,39 @@ index dc38a6b..f956102 100644
      [[nodiscard]] auto holding() const -> size_t;
  
      // Sent on every (re)connect. Reports the builds a client came for and
-@@ -142,8 +155,17 @@ public:
+@@ -121,6 +134,7 @@ public:
+         stopping = 1U << 0U,
+         lowDisk = 1U << 1U,
+         localDaemonDown = 1U << 2U,
++        publishFailing = 1U << 3U,
+     };
+     void setUnavailable(Unavailable why, bool holds);
+     // The `reason` label of nix_grpc_unavailable.
+@@ -133,6 +147,8 @@ public:
+             return "low_disk";
+         case Unavailable::localDaemonDown:
+             return "local_daemon";
++        case Unavailable::publishFailing:
++            return "publish";
+         }
+         return "";
+     }
+@@ -142,8 +158,25 @@ public:
          return unavailable_ != 0;
      }
  
 -    // Give back unclaimed Expects nobody came for. Called from the serve loop.
 +    // The reason Load carries. Stopping wins, then low disk, then the local
-+    // nix-daemon.
++    // nix-daemon, then publishing.
 +    [[nodiscard]] auto reason() const -> nix::remote::Load::DrainReason;
++
++    // Whether publishing a build's outputs to the cache worked. After
++    // publishFailuresToDrain failures in a row the builder takes no builds
++    // for publishPause, then tries again: a success clears the count, and
++    // one more failure stops it again at once.
++    void published(bool succeeded);
++    static constexpr unsigned publishFailuresToDrain = 3;
++    static constexpr std::chrono::seconds publishPause{60};
 +
 +    // Give back unclaimed Expects nobody came for, and send a WorkerReport
 +    // when one is due. Called from the serve loop.
@@ -1457,7 +1527,7 @@ index dc38a6b..f956102 100644
  
      // Swapped by the session thread on every (re)connect.
      void setSend(SendFn send);
-@@ -160,12 +182,14 @@ private:
+@@ -160,12 +193,19 @@ private:
      };
  
      mutable nix::Sync<State> state;
@@ -1470,10 +1540,15 @@ index dc38a6b..f956102 100644
      bool greeted_ = false;
 +    // The reason the scheduler last got, by Load. A Hello resets it.
 +    nix::remote::Load::DrainReason sentReason = nix::remote::Load::DRAIN_REASON_UNSPECIFIED;
++    // Publishes that failed in a row, and while publishing holds, when the
++    // pause ends. Taken before unavailableMutex.
++    std::mutex publishMutex;
++    unsigned publishFailures = 0;
++    std::optional<Clock::time_point> publishPausedUntil;
      static constexpr std::chrono::seconds expectTimeout{60};
      // How long a call waits for an Expect the scheduler has sent but this
      // worker has not read yet.
-@@ -177,7 +201,10 @@ private:
+@@ -177,7 +217,12 @@ private:
          uint64_t assignId,
          nix::remote::Done::Outcome outcome,
          const std::vector<std::pair<std::string, uint64_t>> & outputs,
@@ -1482,6 +1557,8 @@ index dc38a6b..f956102 100644
 +        const DoneInfo & info = {});
 +    // Under unavailableMutex. False if the write failed.
 +    auto sendLoad() -> bool;
++    // Under publishMutex. Takes builds again when `until` is nullopt.
++    void pausePublishing(std::optional<Clock::time_point> until);
      void giveBack(const std::vector<std::pair<std::string, uint64_t>> & drvs, nix::remote::Done::Reason reason);
      auto takeUnclaimed(const std::function<bool(const Expected &)> & pred) -> std::vector<std::pair<std::string, uint64_t>>;
  };
@@ -1841,7 +1918,7 @@ index 71356e5..ff6dd9f 100644
      default:
          drvGoneLocked(done.drv_path(), DrvGone::CANCELLED, wid);
 diff --git a/src/daemon/dispatcher.cc b/src/daemon/dispatcher.cc
-index 4754ce2..9daeb20 100644
+index 4754ce2..600d038 100644
 --- a/src/daemon/dispatcher.cc
 +++ b/src/daemon/dispatcher.cc
 @@ -25,11 +25,13 @@
@@ -1858,7 +1935,7 @@ index 4754ce2..9daeb20 100644
  
  namespace nixgrpc {
  
-@@ -38,6 +40,22 @@ using nix::remote::SchedMsg;
+@@ -38,6 +40,24 @@ using nix::remote::SchedMsg;
  
  namespace {
  constexpr double statsEveryMs = 1000;
@@ -1874,6 +1951,8 @@ index 4754ce2..9daeb20 100644
 +        return "low_disk";
 +    case nix::remote::Load::DRAIN_REASON_LOCAL_DAEMON:
 +        return "local_daemon";
++    case nix::remote::Load::DRAIN_REASON_PUBLISH_UNAVAILABLE:
++        return "publish";
 +    default:
 +        return "unspecified";
 +    }
@@ -1881,7 +1960,7 @@ index 4754ce2..9daeb20 100644
  constexpr double msPerSecond = 1000;
  // A client whose stream broke reconnects within its backoff and Wants its
  // assigned drvs again. Until then their builds keep running.
-@@ -105,6 +123,8 @@ void Dispatcher::tickLocked()
+@@ -105,6 +125,8 @@ void Dispatcher::tickLocked()
          metrics.schedRested(core.resting());
      }
      sampleLocked();
@@ -1890,7 +1969,7 @@ index 4754ce2..9daeb20 100644
      if (statsPending || !eventWatchers.empty()) {
          // One O(entries) pass serves the gauges and the Stats event.
          auto const stats = core.stats();
-@@ -339,8 +359,15 @@ auto Dispatcher::lookup(const nix::remote::ClientMsgs & msgs) const -> std::vect
+@@ -339,8 +361,15 @@ auto Dispatcher::lookup(const nix::remote::ClientMsgs & msgs) const -> std::vect
      return cached;
  }
  
@@ -1906,7 +1985,7 @@ index 4754ce2..9daeb20 100644
      // A dropped worker's derivations are queued again, so go round once more.
      // Each round with a drop has one worker fewer.
      while (dispatchOnceLocked()) {
-@@ -754,13 +781,54 @@ void Dispatcher::workerMsgs(Worker & worker, const nix::remote::WorkerMsgs & msg
+@@ -754,13 +783,54 @@ void Dispatcher::workerMsgs(Worker & worker, const nix::remote::WorkerMsgs & msg
      if (!worker.id && !msgs.msgs(0).has_hello()) {
          throw nix::Error("WorkerSession: first message must be Hello");
      }
@@ -1938,10 +2017,7 @@ index 4754ce2..9daeb20 100644
 +
 +void Dispatcher::exportDrainingLocked()
 +{
-+    size_t stopping = 0;
-+    size_t lowDisk = 0;
-+    size_t localDaemon = 0;
-+    size_t unreported = 0;
++    Metrics::Draining draining;
 +    for (size_t idx = 0; idx < core.workerCount(); idx++) {
 +        auto const wid = static_cast<sched::WorkerId>(idx);
 +        const auto & wkr = core.worker(wid);
@@ -1950,23 +2026,26 @@ index 4754ce2..9daeb20 100644
 +        }
 +        switch (infoLocked(wid).drainReason) {
 +        case nix::remote::Load::DRAIN_REASON_STOPPING:
-+            stopping++;
++            draining.stopping++;
 +            break;
 +        case nix::remote::Load::DRAIN_REASON_LOW_DISK:
-+            lowDisk++;
++            draining.lowDisk++;
 +            break;
 +        case nix::remote::Load::DRAIN_REASON_LOCAL_DAEMON:
-+            localDaemon++;
++            draining.localDaemon++;
++            break;
++        case nix::remote::Load::DRAIN_REASON_PUBLISH_UNAVAILABLE:
++            draining.publish++;
 +            break;
 +        default:
-+            unreported++;
++            draining.unreported++;
 +        }
 +    }
-+    metrics.schedDraining(stopping, lowDisk, localDaemon, unreported);
++    metrics.schedDraining(draining);
  }
  
  void Dispatcher::onHello(Worker & worker, const nix::remote::Hello & hel)
-@@ -795,6 +863,23 @@ void Dispatcher::onHello(Worker & worker, const nix::remote::Hello & hel)
+@@ -795,6 +865,23 @@ void Dispatcher::onHello(Worker & worker, const nix::remote::Hello & hel)
           .running = std::move(running)},
          superseded);
      workers[*worker.id] = &worker;
@@ -1990,7 +2069,7 @@ index 4754ce2..9daeb20 100644
      adoptedLocked(*worker.id, hel, before);
      membershipChangedLocked();
      for (auto const sup : superseded) {
-@@ -807,7 +892,9 @@ void Dispatcher::onHello(Worker & worker, const nix::remote::Hello & hel)
+@@ -807,7 +894,9 @@ void Dispatcher::onHello(Worker & worker, const nix::remote::Hello & hel)
           {"addr", hel.addr()},
           {"systems", nix::concatStringsSep(",", core.worker(*worker.id).systems)},
           {"max_jobs", std::to_string(hel.max_jobs())},
@@ -2001,7 +2080,7 @@ index 4754ce2..9daeb20 100644
  }
  
  // `workers` and Worker::id name each other, so they change together. A
-@@ -830,6 +917,9 @@ void Dispatcher::onDone(sched::WorkerId wid, const nix::remote::Done & done)
+@@ -830,6 +919,9 @@ void Dispatcher::onDone(sched::WorkerId wid, const nix::remote::Done & done)
  {
      sched::Core::Lease const lease{.worker = wid, .drvPath = done.drv_path(), .assignId = done.assign_id()};
      metrics.event("done_" + nix::remote::Done::Outcome_Name(done.outcome()));
@@ -2011,7 +2090,7 @@ index 4754ce2..9daeb20 100644
      if (done.outcome() == nix::remote::Done::GIVEN_BACK || done.outcome() == nix::remote::Done::NO_SHOW) {
          bool const held = core.giveBack(
              lease, done.reason() == nix::remote::Done::DRAINING ? sched::GaveBack::worker : sched::GaveBack::drv);
-@@ -859,20 +949,49 @@ void Dispatcher::onDone(sched::WorkerId wid, const nix::remote::Done & done)
+@@ -859,20 +951,49 @@ void Dispatcher::onDone(sched::WorkerId wid, const nix::remote::Done & done)
      doneLocked(wid, done, assigned);
  }
  
@@ -2067,7 +2146,7 @@ index 4754ce2..9daeb20 100644
  }
  
  void Dispatcher::workerGone(Worker & worker)
-@@ -889,6 +1008,7 @@ void Dispatcher::workerGone(Worker & worker)
+@@ -889,6 +1010,7 @@ void Dispatcher::workerGone(Worker & worker)
      placeabilityChangedLocked();
      metrics.schedWorkers(core.workersUp());
      metrics.schedRested(core.resting());
@@ -2159,7 +2238,7 @@ index f17a532..5044ebb 100644
      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void onCancel(Client & client, const nix::remote::Cancel & cancel);
  
 diff --git a/src/daemon/main.cc b/src/daemon/main.cc
-index 8065eae..4b02fa4 100644
+index 8065eae..39d70e7 100644
 --- a/src/daemon/main.cc
 +++ b/src/daemon/main.cc
 @@ -67,6 +67,7 @@
@@ -2272,7 +2351,17 @@ index 8065eae..4b02fa4 100644
          if (nixcompat::succeeded(res)) {
              std::vector<std::string> built;
              built.reserve(outPaths.size());
-@@ -1162,22 +1184,28 @@ public:
+@@ -1116,6 +1138,9 @@ public:
+                 outputs.clear();
+                 res = nixcompat::failed(nixcompat::FailureStatus::MiscFailure, err.what());
+             }
++            if (coord.builder) {
++                coord.builder->published(outcome == nix::remote::Done::BUILT);
++            }
+             phase.done();
+         } else if (nixcompat::failureStatus(res) == nixcompat::FailureStatus::TransientFailure && nixcompat::isSandboxed(drv)) {
+             // ENOSPC and the like: not the build's fault, let the scheduler place it again.
+@@ -1162,22 +1187,28 @@ public:
  
              nix::remote::BuildDerivationChunk chunk;
              nixgrpc::Metrics::Inputs inputs;
@@ -2310,7 +2399,7 @@ index 8065eae..4b02fa4 100644
              return grpc::Status::OK;
          });
      }
-@@ -1373,6 +1401,25 @@ try {
+@@ -1373,6 +1404,25 @@ try {
      nix::initLibStore();
  
      auto options = nixgrpc::parseOptions(argList);
@@ -2336,7 +2425,7 @@ index 8065eae..4b02fa4 100644
      auto const listenFds = nixgrpc::systemdListenFds();
      if (options.sandbox) {
          nixgrpc::sandbox::apply(sandboxPolicy(options, listenFds.empty()));
-@@ -1403,7 +1450,7 @@ try {
+@@ -1403,7 +1453,7 @@ try {
          oidc.emplace(std::move(cfg));
      }
      nixgrpc::Auth auth{.acl = options.acl, .proxies = options.proxies, .oidc = &oidc, .metrics = &metrics};
@@ -2346,7 +2435,7 @@ index 8065eae..4b02fa4 100644
          nixgrpc::LogLevel::info,
          {{"event", "roles"},
 diff --git a/src/daemon/metrics.hh b/src/daemon/metrics.hh
-index fffa2af..01f7a4b 100644
+index fffa2af..a74f9bd 100644
 --- a/src/daemon/metrics.hh
 +++ b/src/daemon/metrics.hh
 @@ -1,17 +1,22 @@
@@ -2438,18 +2527,19 @@ index fffa2af..01f7a4b 100644
      prometheus::Family<prometheus::Counter> * buildLogUploads =
          &prometheus::BuildCounter()
               .Name("nix_grpc_build_log_uploads_total")
-@@ -117,6 +170,10 @@ class Metrics
+@@ -117,6 +170,11 @@ class Metrics
      prometheus::Gauge * schedWorkersGauge = &sched->Add({{"kind", "workers"}});
      prometheus::Gauge * schedRestedGauge = &sched->Add({{"kind", "rested"}});
      prometheus::Gauge * schedLeaderGauge = &sched->Add({{"kind", "leader"}});
 +    prometheus::Gauge * schedDrainingStopping = &sched->Add({{"kind", "draining_stopping"}});
 +    prometheus::Gauge * schedDrainingLowDisk = &sched->Add({{"kind", "draining_low_disk"}});
 +    prometheus::Gauge * schedDrainingLocalDaemon = &sched->Add({{"kind", "draining_local_daemon"}});
++    prometheus::Gauge * schedDrainingPublish = &sched->Add({{"kind", "draining_publish"}});
 +    prometheus::Gauge * schedDrainingUnreported = &sched->Add({{"kind", "draining_unreported"}});
  
      // NOLINTNEXTLINE(*-magic-numbers)
      prometheus::Histogram::BucketBoundaries buckets{0.05, 0.25, 1, 2, 5, 10, 30, 60, 120, 300, 900, 3600};
-@@ -202,6 +259,40 @@ public:
+@@ -202,6 +260,40 @@ public:
      {
          buildFailures->Add({{"reason", std::string(reason)}}).Increment();
      }
@@ -2490,22 +2580,32 @@ index fffa2af..01f7a4b 100644
      void buildLogUpload(std::string_view result)
      {
          buildLogUploads->Add({{"result", std::string(result)}}).Increment();
-@@ -303,6 +394,14 @@ public:
+@@ -303,6 +395,24 @@ public:
      {
          return schedWorkersGauge->Value();
      }
 +    // Draining workers by the reason they gave.
-+    void schedDraining(size_t stopping, size_t lowDisk, size_t localDaemon, size_t unreported) const
++    // Connected builders that drain, by the reason they gave.
++    struct Draining
 +    {
-+        schedDrainingStopping->Set(static_cast<double>(stopping));
-+        schedDrainingLowDisk->Set(static_cast<double>(lowDisk));
-+        schedDrainingLocalDaemon->Set(static_cast<double>(localDaemon));
-+        schedDrainingUnreported->Set(static_cast<double>(unreported));
++        size_t stopping = 0;
++        size_t lowDisk = 0;
++        size_t localDaemon = 0;
++        size_t publish = 0;
++        size_t unreported = 0;
++    };
++    void schedDraining(const Draining & draining) const
++    {
++        schedDrainingStopping->Set(static_cast<double>(draining.stopping));
++        schedDrainingLowDisk->Set(static_cast<double>(draining.lowDisk));
++        schedDrainingLocalDaemon->Set(static_cast<double>(draining.localDaemon));
++        schedDrainingPublish->Set(static_cast<double>(draining.publish));
++        schedDrainingUnreported->Set(static_cast<double>(draining.unreported));
 +    }
      void schedLeader(bool leader) const
      {
          schedLeaderGauge->Set(leader ? 1 : 0);
-@@ -324,6 +423,12 @@ public:
+@@ -324,6 +434,12 @@ public:
          sched->Add({{"kind", "clients"}}).Increment(delta);
      }
  
@@ -3666,10 +3766,10 @@ index 0000000..88fc602
 +    return 0;
 +}
 diff --git a/tests/builder-test.cc b/tests/builder-test.cc
-index b6ba439..23c0851 100644
+index b6ba439..067d494 100644
 --- a/tests/builder-test.cc
 +++ b/tests/builder-test.cc
-@@ -67,6 +67,29 @@ auto staleCallIsRefusedAtOnce() -> bool
+@@ -67,6 +67,78 @@ auto staleCallIsRefusedAtOnce() -> bool
      return call.wait_for(atOnce) == std::future_status::ready && !call.get();
  }
  
@@ -3696,10 +3796,59 @@ index b6ba439..23c0851 100644
 +    return reasons == std::vector<int>{Load::DRAIN_REASON_LOCAL_DAEMON, Load::DRAIN_REASON_LOW_DISK, -1};
 +}
 +
++// Publishing that fails 3 times in a row stops the builder for a minute,
++// with its own reason. Then it takes builds again, and one more failure
++// stops it again. A success clears the count, and the other reasons win.
++auto failedPublishesPauseIt() -> bool
++{
++    using Load = nix::remote::Load;
++    nixgrpc::Metrics metrics{""};
++    nixgrpc::Clock::time_point now;
++    Builder builder(
++        {.advertise = "w:0",
++         .systems = {"x86_64-linux"},
++         .features = {},
++         .maxJobs = 1,
++         .now = [&] -> nixgrpc::Clock::time_point { return now; }},
++        metrics);
++    std::vector<int> reasons; // -1: a Load that ends the drain
++    builder.setSend([&](const nix::remote::WorkerMsg & msg) -> bool {
++        if (msg.has_load()) {
++            reasons.push_back(msg.load().draining() ? msg.load().drain_reason() : -1);
++        }
++        return true;
++    });
++    builder.greet();
++    builder.published(false);
++    builder.published(false);
++    builder.published(true);
++    builder.published(false);
++    builder.published(false);
++    if (!reasons.empty()) {
++        return false;
++    }
++    builder.published(false);
++    if (reasons != std::vector<int>{Load::DRAIN_REASON_PUBLISH_UNAVAILABLE} || metrics.unavailableNow("publish") != 1) {
++        return false;
++    }
++    builder.setUnavailable(Builder::Unavailable::lowDisk, true);
++    builder.setUnavailable(Builder::Unavailable::lowDisk, false);
++    now += Builder::publishPause - std::chrono::seconds(1);
++    builder.tick();
++    now += std::chrono::seconds(1);
++    builder.tick();
++    builder.published(false);
++    builder.published(true);
++    return reasons
++               == std::vector<int>{Load::DRAIN_REASON_PUBLISH_UNAVAILABLE, Load::DRAIN_REASON_LOW_DISK,
++                                   Load::DRAIN_REASON_PUBLISH_UNAVAILABLE, -1, Load::DRAIN_REASON_PUBLISH_UNAVAILABLE, -1}
++           && metrics.unavailableNow("publish") == 0;
++}
++
  auto run() -> int
  {
      if (!earlyCallWaits()) {
-@@ -77,6 +100,10 @@ auto run() -> int
+@@ -77,6 +149,14 @@ auto run() -> int
          std::println("FAIL a call for an assignment that is over waits for it");
          return EXIT_FAILURE;
      }
@@ -3707,10 +3856,14 @@ index b6ba439..23c0851 100644
 +        std::println("FAIL a Load does not name the reason, or does not go out when the reason changes");
 +        return EXIT_FAILURE;
 +    }
++    if (!failedPublishesPauseIt()) {
++        std::println("FAIL failed publishes do not pause the builder, or the pause does not end");
++        return EXIT_FAILURE;
++    }
      if (!greetsFirst()) {
          std::println("FAIL a worker that takes no builds from the start says so before its Hello");
          return EXIT_FAILURE;
-@@ -95,7 +122,8 @@ auto run() -> int
+@@ -95,7 +175,8 @@ auto run() -> int
      builder.setUnavailable(Builder::Unavailable::lowDisk, true);
      builder.setUnavailable(Builder::Unavailable::stopping, true);
      builder.setUnavailable(Builder::Unavailable::lowDisk, false);
@@ -3720,7 +3873,7 @@ index b6ba439..23c0851 100644
          std::println("FAIL a stopping worker takes builds again once its disk has room");
          return EXIT_FAILURE;
      }
-@@ -105,7 +133,7 @@ auto run() -> int
+@@ -105,7 +186,7 @@ auto run() -> int
          return EXIT_FAILURE;
      }
      builder.setUnavailable(Builder::Unavailable::stopping, false);
@@ -4065,7 +4218,7 @@ index f25ff4d..15fa2fa 100644
      testService();
      testForwardedViewer(args.at(1));
 diff --git a/tests/events-test.cc b/tests/events-test.cc
-index e00a87a..49ea135 100644
+index e00a87a..bbe51d9 100644
 --- a/tests/events-test.cc
 +++ b/tests/events-test.cc
 @@ -6,6 +6,7 @@
@@ -4346,7 +4499,7 @@ index e00a87a..49ea135 100644
          }
          rpc::WorkerMsg msg;
          msg.mutable_load()->set_draining(chance(0.5));
-+        msg.mutable_load()->set_drain_reason(static_cast<rpc::Load::DrainReason>(pick(3)));
++        msg.mutable_load()->set_drain_reason(static_cast<rpc::Load::DrainReason>(pick(5)));
          send(wkr, msg);
          if (!settle()) {
              return;
@@ -4362,7 +4515,7 @@ index e00a87a..49ea135 100644
      }
  
      void workerGone(SimWorker & wkr)
-@@ -1134,6 +1283,391 @@ void testRehello()
+@@ -1134,6 +1283,393 @@ void testRehello()
      disp.unwatch(*watcher);
  }
  
@@ -4540,6 +4693,8 @@ index e00a87a..49ea135 100644
 +    // A stop during a low-disk drain: the builder sends Load again.
 +    state = load(true, rpc::Load::DRAIN_REASON_STOPPING);
 +    assert(state.draining() && state.drain_reason() == rpc::WorkerState::DRAIN_REASON_STOPPING);
++    state = load(true, rpc::Load::DRAIN_REASON_PUBLISH_UNAVAILABLE);
++    assert(state.draining() && state.drain_reason() == rpc::WorkerState::DRAIN_REASON_PUBLISH_UNAVAILABLE);
 +    // Not draining has no reason, whatever is sent.
 +    state = load(false, rpc::Load::DRAIN_REASON_LOW_DISK);
 +    assert(!state.draining() && state.drain_reason() == rpc::WorkerState::DRAIN_REASON_UNSPECIFIED);
@@ -4754,7 +4909,7 @@ index e00a87a..49ea135 100644
  void testRandom()
  {
      for (unsigned seed = 1; seed <= 8; seed++) {
-@@ -1153,7 +1687,10 @@ void testRandom()
+@@ -1153,7 +1689,10 @@ void testRandom()
      }
      for (auto const * kind :
           {"CAUSE_WANTED", "CAUSE_FOLLOWERS", "CAUSE_ASSIGNED", "CAUSE_ADOPTED", "CAUSE_REQUEUED", "CAUSE_PLACEABILITY",
@@ -4762,11 +4917,11 @@ index e00a87a..49ea135 100644
 +          "unplaceable", "undeliverable", "BUILT", "FAILED", "CANCELLED", "DROPPED", "report",
 +          "status STATUS_UNSPECIFIED", "status STATUS_BUILT", "status STATUS_SUBSTITUTED", "status STATUS_TIMED_OUT",
 +          "status STATUS_WORKER_ERROR", "drain DRAIN_REASON_LOW_DISK", "drain DRAIN_REASON_STOPPING",
-+          "drain DRAIN_REASON_UNSPECIFIED"}) {
++          "drain DRAIN_REASON_PUBLISH_UNAVAILABLE", "drain DRAIN_REASON_UNSPECIFIED"}) {
          assert(seen[kind] > 0);
      }
      for (auto const kind :
-@@ -1170,6 +1707,11 @@ auto main() -> int
+@@ -1170,6 +1709,11 @@ auto main() -> int
  try {
      testLifecycle();
      testRehello();

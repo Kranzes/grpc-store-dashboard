@@ -1,4 +1,4 @@
-From ddddaf982d530f2de81ab0c48009290cdc727c06 Mon Sep 17 00:00:00 2001
+From e18587bb2bb93089cbc4ae16ef93191827ca5eb8 Mon Sep 17 00:00:00 2001
 From: Ilan Joselevich <personal@ilanjoselevich.com>
 Date: Tue, 10 Nov 2026 19:27:48 +0100
 Subject: [PATCH 10/12] workers: report each running build's phase, and show it
@@ -42,7 +42,7 @@ assignments, requeues, and long or invalid phase names.
  11 files changed, 445 insertions(+), 17 deletions(-)
 
 diff --git a/proto/events.proto b/proto/events.proto
-index 33ec6c1..2dfd6f6 100644
+index 551a994..53a6407 100644
 --- a/proto/events.proto
 +++ b/proto/events.proto
 @@ -56,7 +56,8 @@ message WatchEvent {
@@ -55,7 +55,7 @@ index 33ec6c1..2dfd6f6 100644
    uint64 time_ms = 2;
    oneof event {
      Reset reset = 3;
-@@ -164,14 +165,17 @@ message ClientGone {
+@@ -165,14 +166,17 @@ message ClientGone {
  }
  
  // A derivation the scheduler is tracking: queued or assigned. Upsert keyed by
@@ -75,7 +75,7 @@ index 33ec6c1..2dfd6f6 100644
      PHASE_ASSIGNED = 2;
    }
    // What made the scheduler send this update.
-@@ -199,6 +203,8 @@ message DrvState {
+@@ -200,6 +204,8 @@ message DrvState {
      CAUSE_REQUEUED = 5;
      // `phase` switched between PHASE_QUEUED and PHASE_UNPLACEABLE.
      CAUSE_PLACEABILITY = 6;
@@ -84,7 +84,7 @@ index 33ec6c1..2dfd6f6 100644
    }
    string drv_path = 1; // base name, "<hash>-<name>.drv"
    Phase phase = 2;
-@@ -230,6 +236,15 @@ message DrvState {
+@@ -231,6 +237,15 @@ message DrvState {
    // inputs_unknown.
    repeated InputSource input_sources = 15;
    uint32 inputs_unknown = 16;
@@ -101,10 +101,10 @@ index 33ec6c1..2dfd6f6 100644
  
  message InputSource {
 diff --git a/proto/nix_remote.proto b/proto/nix_remote.proto
-index 060d346..b8d39f5 100644
+index e1c38ca..ed849b7 100644
 --- a/proto/nix_remote.proto
 +++ b/proto/nix_remote.proto
-@@ -413,6 +413,19 @@ message WorkerReport {
+@@ -415,6 +415,19 @@ message WorkerReport {
    // on this session or an earlier one, per substituter, only those with
    // traffic. At most 32.
    repeated Substituter substituters = 3;
@@ -125,7 +125,7 @@ index 060d346..b8d39f5 100644
  
  message WorkerMsg {
 diff --git a/src/daemon/builder.cc b/src/daemon/builder.cc
-index 930a338..e29c160 100644
+index 671cdaf..bde20a0 100644
 --- a/src/daemon/builder.cc
 +++ b/src/daemon/builder.cc
 @@ -17,6 +17,7 @@
@@ -136,7 +136,7 @@ index 930a338..e29c160 100644
  #include "substituter-url.hh"
  
  namespace nixgrpc {
-@@ -384,7 +385,34 @@ void Builder::tick()
+@@ -415,7 +416,34 @@ void Builder::tick()
      giveBack(
          takeUnclaimed([&](const Expected & ent) -> bool { return draining || now - ent.since > expectTimeout; }),
          draining ? nix::remote::Done::DRAINING : nix::remote::Done::UNREACHABLE);
@@ -173,7 +173,7 @@ index 930a338..e29c160 100644
  
  } // namespace nixgrpc
 diff --git a/src/daemon/builder.hh b/src/daemon/builder.hh
-index ad3cb97..12ec336 100644
+index 30670eb..6d44644 100644
 --- a/src/daemon/builder.hh
 +++ b/src/daemon/builder.hh
 @@ -22,6 +22,7 @@
@@ -236,7 +236,7 @@ index ad3cb97..12ec336 100644
      };
  
      std::shared_ptr<Shared> shared = std::make_shared<Shared>();
-@@ -228,6 +258,8 @@ private:
+@@ -246,6 +276,8 @@ private:
      // An Expect left the table without finishing: mark it, and wake whoever
      // follows its log.
      static void wake(Expected::Shared & shared);
@@ -335,7 +335,7 @@ index 5044ebb..fb6bd18 100644
      // The entry for `url` in Counters.substituters, kept sorted by URL.
      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) auto farmTrafficLocked(const std::string & url) -> nix::remote::SubstituterTraffic &;
 diff --git a/src/daemon/main.cc b/src/daemon/main.cc
-index bc59a6c..9c3832e 100644
+index 696066a..c4b274c 100644
 --- a/src/daemon/main.cc
 +++ b/src/daemon/main.cc
 @@ -945,9 +945,7 @@ public:
@@ -728,10 +728,10 @@ index ecf8a9e..e771739 100644
          std::cerr << "error: " << err.what() << "\n";
          return 1;
 diff --git a/tests/events-test.cc b/tests/events-test.cc
-index 49ea135..1bc1ea7 100644
+index bbe51d9..ecf49c2 100644
 --- a/tests/events-test.cc
 +++ b/tests/events-test.cc
-@@ -1700,6 +1700,113 @@ void testRandom()
+@@ -1702,6 +1702,113 @@ void testRandom()
      }
  }
  
@@ -845,7 +845,7 @@ index 49ea135..1bc1ea7 100644
  } // namespace
  // NOLINTEND(*-magic-numbers, *-avoid-unchecked-container-access, bugprone-unchecked-optional-access, readability-identifier-length, cert-msc32-c, cert-msc51-cpp, bugprone-random-generator-seed, misc-use-internal-linkage)
  
-@@ -1712,6 +1819,7 @@ try {
+@@ -1714,6 +1821,7 @@ try {
      testDrainReasons();
      testVersionCut();
      testReports();

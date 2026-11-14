@@ -2274,6 +2274,7 @@ describe('drain reasons and disk', () => {
 					version: '0.4.0'
 				}),
 				E.worker('d', { draining: true, drainReason: Drain.LOCAL_DAEMON }),
+				E.worker('p', { draining: true, drainReason: Drain.PUBLISH_UNAVAILABLE }),
 				E.worker('u', { draining: true }),
 				// A reason without draining means nothing.
 				E.worker('up', { drainReason: Drain.LOW_DISK })
@@ -2290,14 +2291,16 @@ describe('drain reasons and disk', () => {
 			version: '0.4.0'
 		});
 		expect(v.workers.get('d')!.drainReason).toBe('local-daemon');
+		expect(v.workers.get('p')!.drainReason).toBe('publish-unavailable');
 		expect(v.workers.get('u')!.drainReason).toBe('unknown');
 		expect(v.workers.get('up')).toMatchObject({ drainReason: null, diskFree: null, minFree: 0 });
 		// Pools count each reason.
 		expect(v.pools.get('x86_64-linux')).toMatchObject({
-			draining: 4,
+			draining: 5,
 			drainingLowDisk: 1,
 			drainingStopping: 1,
-			drainingLocalDaemon: 1
+			drainingLocalDaemon: 1,
+			drainingPublishUnavailable: 1
 		});
 	});
 

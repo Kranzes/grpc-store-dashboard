@@ -117,14 +117,15 @@ type HistoryPage = {
 	reachedFloor: boolean;
 	/** The ring holds nothing older than the last row sent. */
 	complete: boolean;
-	oldestMs: number | null;
+	/** FinishedBuild.seq of the last row sent, the oldest, where the next page starts. */
+	lastSeq: number | null;
 	/** Why the call failed. */
 	error?: unknown;
 };
 
 /** One page of the build history: every build, or the failures with their text. */
-const historyRequest = (failedOnly: boolean, beforeMs = 0): RecentBuildsRequest => ({
-	beforeMs,
+const historyRequest = (failedOnly: boolean, beforeSeq = 0): RecentBuildsRequest => ({
+	beforeSeq,
 	limit: failedOnly ? HISTORY_FAILURES : HISTORY_BUILDS,
 	failedOnly,
 	withError: failedOnly
@@ -374,12 +375,11 @@ export class ReducerFarmStore implements FarmStore {
 		const h = r.history;
 		if (!this.#history || !r.complete || this.#loading > 0 || !h.served || h.full) return;
 		if (failedOnly ? h.failuresComplete : h.complete) return;
-		// The scheduler pages strictly before before_ms: one past the oldest row, so
-		// rows of that same millisecond come again, and the merge drops repeats.
-		const oldest = r.oldestBuildMs(failedOnly);
-		if (!oldest) return;
-		const beforeMs = oldest + 1;
-		void this.#load(historyRequest(failedOnly, beforeMs));
+		// Below the oldest record the scheduler sent, by seq, so builds that finished
+		// in the same millisecond come once each.
+		const seq = failedOnly ? h.oldestSeq.failures : h.oldestSeq.builds;
+		if (!seq) return;
+		void this.#load(historyRequest(failedOnly, seq));
 	}
 
 	async finishedBuild(drvPath: string, signal: AbortSignal): Promise<FinishedBuildView | null> {
@@ -387,7 +387,7 @@ export class ReducerFarmStore implements FarmStore {
 		if (!fn) return null;
 		try {
 			for await (const batch of fn(
-				{ beforeMs: 0, limit: 1, failedOnly: false, withError: true, drvPaths: [drvPath] },
+				{ beforeSeq: 0, limit: 1, failedOnly: false, withError: true, drvPaths: [drvPath] },
 				signal
 			)) {
 				const f = batch.builds.find((b) => b.drvPath === drvPath);
@@ -418,9 +418,9 @@ export class ReducerFarmStore implements FarmStore {
 		const instance = r.instance;
 		const one = async (failedOnly: boolean, floorMs: number) => {
 			const most = historyRequest(failedOnly).limit;
-			let beforeMs = 0;
+			let beforeSeq = 0;
 			for (let read = 0; read < most; read += TOP_UP_PAGE) {
-				const req = { ...historyRequest(failedOnly, beforeMs), limit: TOP_UP_PAGE };
+				const req = { ...historyRequest(failedOnly, beforeSeq), limit: TOP_UP_PAGE };
 				const page = await this.#read(fn, req, ctl.signal, floorMs);
 				if (page.error !== undefined) {
 					if (ctl.signal.aborted || this.#destroyed) return;
@@ -431,9 +431,8 @@ export class ReducerFarmStore implements FarmStore {
 					return;
 				}
 				if (page.gone) return;
-				if (page.reachedFloor || page.complete || page.oldestMs === null) break;
-				// Strictly before, one past the oldest row, so rows of that millisecond come again.
-				beforeMs = page.oldestMs + 1;
+				if (page.reachedFloor || page.complete || page.lastSeq === null) break;
+				beforeSeq = page.lastSeq;
 			}
 			// Read back to the cut, or a first page's worth of builds that finished during it.
 			if (!ctl.signal.aborted && r.instance === instance) r.closeCut(failedOnly);
@@ -455,7 +454,7 @@ export class ReducerFarmStore implements FarmStore {
 		// Nothing else asks for a first page again, and without it the list lacks the
 		// scheduler's rings. So ask again with backoff, as after the scheduler's cap on
 		// calls per caller refused it, but not once the source stopped.
-		if (req.beforeMs === 0 && code !== Code.Canceled && this.#reducer.instance === instance) {
+		if (req.beforeSeq === 0 && code !== Code.Canceled && this.#reducer.instance === instance) {
 			const base = Math.min(HISTORY_RETRY_MAX_MS, HISTORY_RETRY_MS * 2 ** tries);
 			const t = setTimeout(
 				() => {
@@ -481,7 +480,7 @@ export class ReducerFarmStore implements FarmStore {
 	): Promise<HistoryPage> {
 		const r = this.#reducer;
 		const instance = r.instance;
-		const page: HistoryPage = { gone: false, reachedFloor: false, complete: false, oldestMs: null };
+		const page: HistoryPage = { gone: false, reachedFloor: false, complete: false, lastSeq: null };
 		this.#loading++;
 		this.#request();
 		try {
@@ -491,9 +490,9 @@ export class ReducerFarmStore implements FarmStore {
 				r.mergeHistory(batch, req.failedOnly);
 				this.#request();
 				for (const b of batch.builds) {
-					const at = Number(b.finishedMs);
-					if (page.oldestMs === null || at < page.oldestMs) page.oldestMs = at;
-					if (at <= floorMs) page.reachedFloor = true;
+					// Newest first. A scheduler that sends no seq leaves nothing to page by.
+					page.lastSeq = Number(b.seq) || null;
+					if (Number(b.finishedMs) <= floorMs) page.reachedFloor = true;
 				}
 				page.complete = batch.complete;
 				if (page.reachedFloor) break;
