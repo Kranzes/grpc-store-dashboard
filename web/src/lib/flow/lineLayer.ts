@@ -1,18 +1,24 @@
-// Every line of the map on one canvas: the base, the band whose width shows
-// traffic, the dots and failure bars travelling along it, and the cache hits
-// lookup. The canvas is the size of the visible map and draws from the
-// layout's geometry through the viewport transform, so its cost follows the
-// lines in view, not how many pixels they cover at the zoom.
+// Every line of the map: the base, the band whose width shows traffic, the
+// dots and failure bars travelling along it, and the cache hits lookup. The
+// canvases are the size of the visible map and draw from the layout's
+// geometry through the viewport transform, so their cost follows the lines in
+// view, not how many pixels they cover at the zoom.
 //
 // Lines paint in traffic.ts's paint order, each one whole before the next, as
 // separate SVG groups did. Dots travel as the particles of particles.ts. A
 // line's band fades in and out when it turns active or idle, its width eases,
 // and focus dims it, all on the clock of motion.ts. Dimmed lines keep moving.
+//
+// Strokes stay the same while only dots move, so they draw on a canvas of
+// their own, under the one with the dots and bars. A tick draws the dots
+// alone. While widths and bands ease, or the lookup's dashes creep, the
+// strokes draw at most STROKE_FPS times a second, and once more when they
+// land. A move of the view draws both at once.
 
 import type { LineKind } from './kinds.ts';
 import type { LineGeom } from './geometry.ts';
 import { SLOTS, barSize, dotSize, isFailSlot, markScale } from './marks.ts';
-import { EASE_MS, Ease, FADE_MS, Frames, HALO_MS, type FrameEnv } from './motion.ts';
+import { EASE_MS, Ease, FADE_MS, Frames, HALO_MS, SLACK, type FrameEnv } from './motion.ts';
 import { SPEED, Stream, seed, spacing } from './particles.ts';
 import { TrackWalker, trackOf, type Track } from './track.ts';
 import type { LineLook } from './traffic.ts';
@@ -76,6 +82,14 @@ const LOOKUP_DASH = [5, 4];
 const LOOKUP_PERIOD = LOOKUP_DASH[0] + LOOKUP_DASH[1];
 /** Room around the view for marks that stick out of their line, flow px. */
 const MARGIN = 12;
+/**
+ * How often the strokes draw while widths and bands ease, a second. At 50
+ * builders some line eases almost all the time. A 0.5 px width step moves
+ * under 0.2 px between draws, and the lookup's dashes under 0.4 screen px
+ * at zoom 1, so they look the same at half the strokes.
+ */
+export const STROKE_FPS = 30;
+const STROKE_STEP = 1000 / STROKE_FPS;
 
 const IDLE: LineLook = {
 	active: false,
@@ -144,7 +158,16 @@ let serials = 0;
 export class LineLayer {
 	#env: FrameEnv;
 	#frames: Frames;
+	/** The strokes' canvas. */
 	#ctx: Ctx | null = null;
+	/** The dots' and bars' canvas over it. */
+	#marks: Ctx | null = null;
+	/** #ctx shows every stroke at the current view and colors. */
+	#stroked = false;
+	/** A stroke changed since #ctx drew them; while strokes ease it may wait. */
+	#stale = false;
+	/** Clock ms the strokes last drew. */
+	#strokedAt = -Infinity;
 	#lines = new Map<string, LineState>();
 	#order: LineState[] = [];
 	/** The lines in view this frame, in paint order. Kept to spare an array per frame. */
@@ -165,6 +188,8 @@ export class LineLayer {
 	#firstData = Infinity;
 	/** Draws so far, for the test hook. */
 	draws = 0;
+	/** Draws that stroked the lines, for the test hook. */
+	strokeDraws = 0;
 	/** Time spent drawing, ms, for the test hook. */
 	drawMs = 0;
 
@@ -173,14 +198,21 @@ export class LineLayer {
 		this.#frames = new Frames(env, (now) => this.#draw(now));
 	}
 
-	attach(ctx: Ctx | null) {
+	/**
+	 * The canvas for the strokes, and one of the same size over it for the
+	 * dots and bars, which the caller sizes with it. Without either nothing draws.
+	 */
+	attach(ctx: Ctx | null, marks: Ctx | null) {
 		this.#ctx = ctx;
+		this.#marks = marks;
+		this.#stroked = false;
 		this.#frames.soon();
 	}
 
 	destroy() {
 		this.#frames.destroy();
 		this.#ctx = null;
+		this.#marks = null;
 	}
 
 	/** The lines of a new layout, in layout order. Lines that stay keep their dots. */
@@ -219,6 +251,7 @@ export class LineLayer {
 		}
 		this.#lines = next;
 		this.#order = [...next.values()];
+		this.#stroked = false;
 		this.#frames.soon();
 	}
 
@@ -247,6 +280,7 @@ export class LineLayer {
 			const old = line.look;
 			if (sameLook(look, old)) continue;
 			changed = true;
+			if (!sameStroke(look, old)) this.#stale = true;
 			line.look = look;
 			if (look.active) {
 				// From fully idle the band takes its width at once and fades in.
@@ -277,6 +311,7 @@ export class LineLayer {
 		}
 		if (ordered.length === this.#lines.size && ordered.some((l, i) => l !== this.#order[i])) {
 			this.#order = ordered;
+			this.#stroked = false;
 			changed = true;
 		}
 		// The store publishes up to 30 times a second; only a new look draws.
@@ -299,7 +334,9 @@ export class LineLayer {
 			line.fade.set(to, now, this.#reduced);
 			changed = true;
 		}
-		if (changed) this.#frames.wake();
+		if (!changed) return;
+		this.#stroked = false;
+		this.#frames.wake();
 	}
 
 	/** The viewport transform. Draws at once, in the frame that moves the cards. */
@@ -307,17 +344,20 @@ export class LineLayer {
 		const v = this.#view;
 		if (v.x === x && v.y === y && v.zoom === zoom) return;
 		this.#view = { x, y, zoom };
+		this.#stroked = false;
 		this.#drawNow();
 	}
 
 	/** Canvas size in CSS px and the device pixel ratio. The caller sizes the canvas itself. */
 	setSize(w: number, h: number, dpr: number) {
 		this.#size = { w, h, dpr };
+		this.#stroked = false;
 		this.#drawNow();
 	}
 
 	setColors(colors: Colors) {
 		this.#colors = colors;
+		this.#stroked = false;
 		this.#frames.soon();
 	}
 
@@ -325,6 +365,7 @@ export class LineLayer {
 	setReduced(reduced: boolean) {
 		if (reduced === this.#reduced) return;
 		this.#reduced = reduced;
+		this.#stroked = false;
 		const now = this.#env.now();
 		if (reduced) {
 			for (const line of this.#lines.values()) {
@@ -451,15 +492,12 @@ export class LineLayer {
 	/** Draws everything at clock time `now`. Returns whether something still moves. */
 	#draw(now: number): boolean {
 		const ctx = this.#ctx;
+		const marks = this.#marks;
 		const colors = this.#colors;
-		const { w, h, dpr } = this.#size;
-		if (!ctx || !colors || !(w > 0 && h > 0) || this.#hidden) return false;
+		const { w, h } = this.#size;
+		if (!ctx || !marks || !colors || !(w > 0 && h > 0) || this.#hidden) return false;
 		const started = this.#env.now();
 		const { x, y, zoom } = this.#view;
-		const k = dpr * zoom;
-		ctx.setTransform(1, 0, 0, 1, 0, 0);
-		ctx.clearRect(0, 0, Math.round(w * dpr), Math.round(h * dpr));
-		ctx.setTransform(k, 0, 0, k, dpr * x, dpr * y);
 		// What the view shows, in flow px.
 		const view = {
 			x0: -x / zoom - MARGIN,
@@ -470,34 +508,56 @@ export class LineLayer {
 		const travel = this.#travel(now);
 		const moving = this.#pauses === 0 && !this.#reduced;
 		let busy = false;
+		/** A stroke in view changes on its own this frame. */
+		let strokesMove = false;
+		/** A line in view fades with focus, which the strokes follow on every tick. */
+		let fades = false;
 		const inView = this.#inView;
 		inView.length = 0;
 		for (const line of this.#order) {
 			const t = travel;
 			if (!this.#reduced) line.stream.advance(t);
-			if (
-				line.width.moving(now) ||
-				line.halo.moving(now) ||
-				line.fade.moving(now) ||
-				line.dotsIn.moving(now)
-			)
-				busy = true;
-			if (moving && (line.stream.busy || line.driftFrom !== null)) busy = true;
+			const fade = line.fade.moving(now);
+			const eases = fade || line.width.moving(now) || line.halo.moving(now);
+			const creeps = moving && line.driftFrom !== null;
+			if (eases || creeps || line.dotsIn.moving(now) || (moving && line.stream.busy)) busy = true;
 			const tr = line.track;
 			if (tr.maxX < view.x0 || tr.minX > view.x1 || tr.maxY < view.y0 || tr.minY > view.y1)
 				continue;
 			inView.push(line);
+			if (eases || creeps) strokesMove = true;
+			if (fade) fades = true;
 		}
-		// Every stroke first, then every line's dots, then every line's failure
-		// bars, so a line painted later never covers another line's marks where
-		// their tracks overlap.
-		for (const line of inView) this.#stroke(ctx, colors, line, now, travel);
-		for (const line of inView) this.#marks(ctx, colors, line, now, travel, view, false);
-		for (const line of inView) this.#marks(ctx, colors, line, now, travel, view, true);
-		ctx.globalAlpha = 1;
+		if (strokesMove) this.#stale = true;
+		const due = now - this.#strokedAt >= STROKE_STEP - SLACK;
+		if (!this.#stroked || (this.#stale && (fades || !strokesMove || due))) {
+			this.#clear(ctx);
+			for (const line of inView) this.#stroke(ctx, colors, line, now, travel);
+			ctx.globalAlpha = 1;
+			this.#stroked = true;
+			this.#stale = false;
+			this.#strokedAt = now;
+			this.strokeDraws++;
+		}
+		// Every line's dots, then every line's failure bars, over every stroke,
+		// so a line painted later never covers another line's marks where their
+		// tracks overlap.
+		this.#clear(marks);
+		for (const line of inView) this.#drawMarks(marks, colors, line, now, travel, view, false);
+		for (const line of inView) this.#drawMarks(marks, colors, line, now, travel, view, true);
+		marks.globalAlpha = 1;
 		this.draws++;
 		this.drawMs += this.#env.now() - started;
 		return busy;
+	}
+
+	/** Clear a canvas and set the view's transform on it. */
+	#clear(ctx: Ctx) {
+		const { w, h, dpr } = this.#size;
+		const { x, y, zoom } = this.#view;
+		ctx.setTransform(1, 0, 0, 1, 0, 0);
+		ctx.clearRect(0, 0, Math.round(w * dpr), Math.round(h * dpr));
+		ctx.setTransform(dpr * zoom, 0, 0, dpr * zoom, dpr * x, dpr * y);
 	}
 
 	#stroke(ctx: Ctx, colors: Colors, line: LineState, now: number, t: number) {
@@ -545,7 +605,7 @@ export class LineLayer {
 	}
 
 	/** A line's dots, or with `bars` its failure bars. */
-	#marks(
+	#drawMarks(
 		ctx: Ctx,
 		colors: Colors,
 		line: LineState,
@@ -609,15 +669,12 @@ function within(
 }
 
 function sameLook(a: LineLook, b: LineLook): boolean {
-	return (
-		a === b ||
-		(a.active === b.active &&
-			a.level === b.level &&
-			a.width === b.width &&
-			a.fails === b.fails &&
-			a.lookup === b.lookup &&
-			a.hits === b.hits)
-	);
+	return a === b || (sameStroke(a, b) && a.level === b.level && a.fails === b.fails);
+}
+
+/** Whether two looks stroke a line the same way; dots and bars aside. */
+function sameStroke(a: LineLook, b: LineLook): boolean {
+	return a.active === b.active && a.width === b.width && a.lookup === b.lookup && a.hits === b.hits;
 }
 
 /** Trace a track's path, rounded corners included. */

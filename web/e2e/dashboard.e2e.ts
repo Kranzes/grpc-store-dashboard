@@ -927,29 +927,35 @@ test.describe('pools', () => {
 		await expect(toggle).toBeFocused();
 	});
 
-	test('every line draws on one canvas, also after a toggle', async ({ page }) => {
+	test('every line draws on one canvas and its dots on one over it, also after a toggle', async ({
+		page
+	}) => {
 		await demo(page, 'builders=60');
 		const layout = () =>
 			page.evaluate(() => {
 				const canvases = [...document.querySelectorAll<HTMLCanvasElement>('canvas.line-canvas')];
-				const c = canvases[0];
+				const map = document.querySelector('.line-layer')!.parentElement!;
 				const ids = (window as unknown as ProbeWindow).__lines.report().map((l) => l.id);
 				return {
 					canvases: canvases.length,
+					marksOnTop: canvases[1]?.classList.contains('marks') ?? false,
 					// Svelte Flow draws no edges of its own.
 					edges: document.querySelectorAll('.svelte-flow__edge, .svelte-flow__edge-wrapper').length,
-					// The canvas covers the map at the screen's pixel ratio.
-					sized:
-						c.width === Math.round(c.clientWidth * devicePixelRatio) &&
-						c.height === Math.round(c.clientHeight * devicePixelRatio) &&
-						c.clientWidth === c.parentElement!.clientWidth,
+					// The canvases cover the map at the screen's pixel ratio.
+					sized: canvases.every(
+						(c) =>
+							c.width === Math.round(c.clientWidth * devicePixelRatio) &&
+							c.height === Math.round(c.clientHeight * devicePixelRatio) &&
+							c.clientWidth === map.clientWidth
+					),
 					lines: ids.length,
 					unique: new Set(ids).size
 				};
 			});
 		const check = async () => {
 			const l = await layout();
-			expect(l.canvases).toBe(1);
+			expect(l.canvases).toBe(2);
+			expect(l.marksOnTop).toBe(true);
 			expect(l.edges).toBe(0);
 			expect(l.sized).toBe(true);
 			expect(l.unique).toBe(l.lines);
@@ -958,7 +964,8 @@ test.describe('pools', () => {
 		await expect(page.locator('.svelte-flow__node-pool')).toHaveCount(2);
 		const pooled = await check();
 		await page.evaluate(() => {
-			(document.querySelector('canvas.line-canvas') as unknown as { tag: number }).tag = 1;
+			for (const c of document.querySelectorAll('canvas.line-canvas'))
+				(c as unknown as { tag: number }).tag = 1;
 		});
 		const toggle = poolToggle(page, 'aarch64-linux');
 		await toggle.click();
@@ -967,12 +974,14 @@ test.describe('pools', () => {
 		await toggle.click();
 		await expect(page.locator('.svelte-flow__node-builder')).toHaveCount(0);
 		await expect.poll(check).toBe(pooled);
-		// The same canvas throughout.
+		// The same canvases throughout.
 		expect(
-			await page.evaluate(
-				() => (document.querySelector('canvas.line-canvas') as unknown as { tag?: number }).tag
+			await page.evaluate(() =>
+				[...document.querySelectorAll('canvas.line-canvas')].map(
+					(c) => (c as unknown as { tag?: number }).tag
+				)
 			)
-		).toBe(1);
+		).toEqual([1, 1]);
 	});
 
 	test("lines meet the cache's handles after a toggle moves the buses", async ({ page }) => {

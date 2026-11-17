@@ -129,12 +129,11 @@ export function fakeFrames() {
 	};
 }
 
-/**
- * A 2D context that only counts what it is asked to do: strokes with their
- * colors, fills, arcs, and the most arcs any one fill took in its path.
- */
-export function fakeContext() {
-	const calls = {
+/** What fake contexts record. */
+type Calls = ReturnType<typeof fakeCalls>;
+
+function fakeCalls() {
+	return {
 		clear: 0,
 		stroke: 0,
 		fill: 0,
@@ -152,6 +151,14 @@ export function fakeContext() {
 			this.radii.length = 0;
 		}
 	};
+}
+
+/**
+ * A 2D context that only counts what it is asked to do: strokes with their
+ * colors, fills, arcs, and the most arcs any one fill took in its path. It
+ * counts into `calls`, which several contexts may share.
+ */
+export function fakeContext(calls: Calls = fakeCalls()) {
 	let arcs = 0;
 	const ctx: Ctx = {
 		globalAlpha: 1,

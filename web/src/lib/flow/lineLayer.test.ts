@@ -8,10 +8,11 @@ import {
 	HOVER_FADED,
 	LOOKUP_SPEED,
 	LineLayer,
+	STROKE_FPS,
 	WARM_MS,
 	type Colors
 } from './lineLayer.ts';
-import { FADE_MS, HALO_MS } from './motion.ts';
+import { EASE_MS, FADE_MS, HALO_MS } from './motion.ts';
 import { SPEED } from './particles.ts';
 import { trackOf } from './track.ts';
 import { lineLooks, paintOrder } from './traffic.ts';
@@ -37,10 +38,12 @@ const ev = (rate: number, finished = 0, failed = 0): EdgeView => ({
 /** The default demo's lines on a canvas, with every line at `rate` unless `rates` says otherwise. */
 function setup(rates: (id: string) => EdgeView | undefined = () => ev(1)) {
 	const f = fakeFrames();
+	// The strokes' canvas and the marks' over it, counted together in paint order.
 	const { ctx, calls } = fakeContext();
+	const { ctx: marks } = fakeContext(calls);
 	const lines = lineGeometry(demo12());
 	const layer = new LineLayer(f.env);
-	layer.attach(ctx);
+	layer.attach(ctx, marks);
 	layer.setLines(lines);
 	layer.setColors(COLORS);
 	layer.setSize(1800, 1000, 1);
@@ -61,6 +64,12 @@ function setup(rates: (id: string) => EdgeView | undefined = () => ev(1)) {
 
 const A = 'assign:10.0.0.13:50051';
 const B = 'assign:10.0.0.10:50051';
+/** The cache hits line. */
+const C = 'cached:scheduler';
+/** Every line at rate 1 but the cache hits line, whose dashes then stand still. */
+const noHits = (id: string) => ev(id === C ? 0 : 1);
+/** Past every ease that setup starts, and the tick after it. */
+const SETTLED = HALO_MS + 100;
 
 describe('LineLayer', () => {
 	it('stops drawing once every line is idle and its dots ran out', () => {
@@ -398,7 +407,6 @@ describe('LineLayer', () => {
 	});
 
 	it('the cache hits line creeps while hits come in and stands still when none do', () => {
-		const C = 'cached:scheduler';
 		let hits = true;
 		const { f, layer, look, line } = setup((id) => (id === C ? ev(hits ? 4 : 0) : ev(0)));
 		f.run(1000);
@@ -431,5 +439,92 @@ describe('LineLayer', () => {
 		// Under reduced motion its dashes sit still at their place at rest.
 		layer.setReduced(true);
 		expect(line(C).dashOffset).toBe(0);
+	});
+
+	it('while only dots move, a tick draws the dots and leaves the strokes as they are', () => {
+		const { f, layer, calls } = setup(noHits);
+		f.run(SETTLED);
+		calls.reset();
+		const n = layer.draws;
+		const strokes = layer.strokeDraws;
+		f.run(SETTLED + 1000);
+		expect(layer.draws - n).toBeGreaterThan(50);
+		expect(layer.strokeDraws).toBe(strokes);
+		expect(calls.stroke).toBe(0);
+		expect(calls.arc).toBeGreaterThan(0);
+		// One clear a tick: the marks' canvas.
+		expect(calls.clear).toBe(layer.draws - n);
+	});
+
+	it("the lookup's dashes creep on the strokes' canvas STROKE_FPS times a second", () => {
+		const { f, layer } = setup((id) => (id === C ? ev(4) : ev(1)));
+		f.run(SETTLED);
+		const n = layer.draws;
+		const strokes = layer.strokeDraws;
+		f.run(SETTLED + 1000);
+		expect(layer.draws - n).toBeGreaterThan(50);
+		expect(layer.strokeDraws - strokes).toBeGreaterThanOrEqual(STROKE_FPS - 1);
+		expect(layer.strokeDraws - strokes).toBeLessThanOrEqual(STROKE_FPS + 1);
+	});
+
+	it('a view move draws the strokes and the dots at once', () => {
+		const { f, layer, calls, lines } = setup(noHits);
+		f.run(SETTLED);
+		calls.reset();
+		const strokes = layer.strokeDraws;
+		layer.setView(90, 120, 0.9);
+		expect(layer.strokeDraws).toBe(strokes + 1);
+		expect(calls.stroke).toBeGreaterThanOrEqual(lines.length / 2);
+		expect(calls.arc).toBeGreaterThan(0);
+		expect(calls.clear).toBe(2);
+		// The next ticks draw the dots alone again.
+		f.run(SETTLED + 500);
+		expect(layer.strokeDraws).toBe(strokes + 1);
+	});
+
+	it('while widths ease the strokes draw on every other tick, and once more as they land', () => {
+		const { f, layer, look, line, ctx } = setup(noHits);
+		f.run(SETTLED);
+		// Busier, so A's band widens over EASE_MS and every other line's thins.
+		look((id) => (id === A ? ev(50) : id === C ? ev(0) : ev(1)));
+		const n = layer.draws;
+		const strokes = layer.strokeDraws;
+		f.run(SETTLED + EASE_MS - 20);
+		const ticks = layer.draws - n;
+		expect(ticks).toBeGreaterThan(10);
+		const every = (ticks * STROKE_FPS) / 60;
+		expect(layer.strokeDraws - strokes).toBeGreaterThanOrEqual(every - 1);
+		expect(layer.strokeDraws - strokes).toBeLessThanOrEqual(every + 1);
+		// The strokes from here on: the last draw has A at its new width, which
+		// no draw on the way there reaches.
+		const widths: number[] = [];
+		const stroke = ctx.stroke;
+		ctx.stroke = function () {
+			widths.push(this.lineWidth);
+			stroke.call(this);
+		};
+		f.run(SETTLED + EASE_MS + 100);
+		expect(Math.max(...widths)).toBe(line(A).targetWidth);
+		const landed = layer.strokeDraws;
+		f.run(SETTLED + EASE_MS + 600);
+		expect(layer.strokeDraws).toBe(landed);
+	});
+
+	it('a focus fade draws the strokes on every tick, until it lands', () => {
+		const { f, layer, calls } = setup(noHits);
+		f.run(SETTLED);
+		const n = layer.draws;
+		const strokes = layer.strokeDraws;
+		layer.setFocus(new Set([A]));
+		f.run(SETTLED + FADE_MS);
+		expect(layer.draws - n).toBeGreaterThan(4);
+		expect(layer.strokeDraws - strokes).toBe(layer.draws - n);
+		f.run(SETTLED + FADE_MS + 100);
+		const landed = layer.strokeDraws;
+		calls.reset();
+		f.run(SETTLED + FADE_MS + 600);
+		expect(layer.strokeDraws).toBe(landed);
+		expect(calls.stroke).toBe(0);
+		expect(calls.arc).toBeGreaterThan(0);
 	});
 });

@@ -30,6 +30,7 @@
 	const layer = env ? new LineLayer(env) : null;
 	onDestroy(() => layer?.destroy());
 	let canvas: HTMLCanvasElement | undefined = $state();
+	let marksCanvas: HTMLCanvasElement | undefined = $state();
 	let swatches: HTMLElement | undefined = $state();
 
 	// In this order on mount: the lines, then their looks.
@@ -49,17 +50,21 @@
 
 	$effect(() => {
 		const el = canvas;
-		if (!el || !layer) return;
+		const marksEl = marksCanvas;
+		if (!el || !marksEl || !layer) return;
 		const ctx = el.getContext('2d');
-		layer.attach(ctx);
+		const marks = marksEl.getContext('2d');
+		layer.attach(ctx, marks);
 		const resize = () => {
 			const dpr = window.devicePixelRatio || 1;
 			const w = el.clientWidth;
 			const h = el.clientHeight;
 			const pw = Math.round(w * dpr);
 			const ph = Math.round(h * dpr);
-			if (el.width !== pw) el.width = pw;
-			if (el.height !== ph) el.height = ph;
+			for (const c of [el, marksEl]) {
+				if (c.width !== pw) c.width = pw;
+				if (c.height !== ph) c.height = ph;
+			}
 			layer.setSize(w, h, dpr);
 		};
 		const ro = new ResizeObserver(resize);
@@ -84,14 +89,15 @@
 		const onReduced = () => layer.setReduced(reduced.matches);
 		reduced.addEventListener('change', onReduced);
 		onReduced();
-		// A GPU reset clears the canvas; draw again once it is back.
-		const onRestored = () => layer.attach(ctx);
+		// A GPU reset clears the canvases; draw again once they are back.
+		const onRestored = () => layer.attach(ctx, marks);
 		el.addEventListener('contextrestored', onRestored);
+		marksEl.addEventListener('contextrestored', onRestored);
 		if (probeOn()) {
 			const probe: LineProbe = {
 				report: () => layer.report(),
 				order: () => layer.order,
-				draws: () => ({ count: layer.draws, ms: layer.drawMs }),
+				draws: () => ({ count: layer.draws, ms: layer.drawMs, strokeDraws: layer.strokeDraws }),
 				travel: () => layer.travel(),
 				flow: (id, s) => layer.point(id, s),
 				client: (id, s) => {
@@ -112,7 +118,8 @@
 			document.removeEventListener('visibilitychange', onVisibility);
 			reduced.removeEventListener('change', onReduced);
 			el.removeEventListener('contextrestored', onRestored);
-			layer.attach(null);
+			marksEl.removeEventListener('contextrestored', onRestored);
+			layer.attach(null, null);
 		};
 	});
 
@@ -141,11 +148,15 @@
 </script>
 
 <!--
-	Every line, its dots and its failure marks, on one canvas the size of the
-	visible map, drawn by lineLayer.ts. It sits under the cards and takes no
-	pointer events; clicks and hover reach lines through LineInput's hit test.
+	Every line on one canvas the size of the visible map, and its dots and
+	failure marks on another over it, drawn by lineLayer.ts. They sit under the
+	cards and take no pointer events; clicks and hover reach lines through
+	LineInput's hit test.
 -->
-<canvas class="line-canvas" bind:this={canvas} aria-hidden="true"></canvas>
+<div class="line-layer" aria-hidden="true">
+	<canvas class="line-canvas" bind:this={canvas}></canvas>
+	<canvas class="line-canvas marks" bind:this={marksCanvas}></canvas>
+</div>
 <div class="swatches" bind:this={swatches} aria-hidden="true">
 	{#each LINE_KINDS as kind (kind)}<i class="flow-{kind}"></i>{/each}
 	<i class="idle"></i>
@@ -153,13 +164,18 @@
 </div>
 
 <style>
-	.line-canvas {
+	.line-layer {
 		position: absolute;
 		inset: 0;
 		z-index: -1;
+		pointer-events: none;
+	}
+
+	.line-canvas {
+		position: absolute;
+		inset: 0;
 		width: 100%;
 		height: 100%;
-		pointer-events: none;
 	}
 
 	.swatches {

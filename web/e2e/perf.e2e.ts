@@ -329,7 +329,7 @@ for (const variant of ['labels off', 'labels on', 'labels on, builder focused'] 
 	});
 }
 
-// What the line canvas asks of its 2D context, counted on the real one:
+// What the line canvases ask of their 2D contexts, counted on the real ones:
 // strokes, dot arcs, and the most arcs any one fill took. A count, not a
 // time: headless Chromium's software canvas draws everything, or one path of
 // every dot, about as fast as it draws what is in view one dot at a time,
@@ -337,7 +337,7 @@ for (const variant of ['labels off', 'labels on', 'labels on, builder focused'] 
 type Paint = { strokes: number; arcs: number; arcsPerFill: number };
 type PaintWindow = ProbeWindow & {
 	__paint: Paint;
-	__phase: Paint & { count: number; ms: number; frames: number; on: boolean };
+	__phase: Paint & ReturnType<ProbeWindow['__lines']['draws']> & { frames: number; on: boolean };
 };
 
 function countPaint() {
@@ -386,6 +386,8 @@ async function paintDuring(page: Page, act: () => Promise<unknown>) {
 			draws,
 			frames: then.frames,
 			strokesPerDraw: per(now.strokes - then.strokes),
+			// Draws that stroked the lines in view, not only their dots.
+			strokeDraws: d.strokeDraws - then.strokeDraws,
 			arcsPerDraw: per(now.arcs - then.arcs),
 			arcsPerFill: now.arcsPerFill,
 			msPerDraw: Math.round(((d.ms - then.ms) / Math.max(1, draws)) * 100) / 100
@@ -438,6 +440,9 @@ test('panning at zoom 2 draws once per view move, and fast', async ({ page }) =>
 	// A pan draws once per view move, never more than once a frame on the whole.
 	expect(pan.draws).toBeGreaterThan(30);
 	expect(pan.draws).toBeLessThanOrEqual(pan.frames + 2);
+	// At rest a tick strokes the lines at most every other time, while some
+	// line eases; the dots draw on every one.
+	for (const r of [fit, rest]) expect(r.strokeDraws).toBeLessThanOrEqual(r.draws / 2 + 2);
 	// Headless draws take 0.5 to 1 ms here, counting included; this catches
 	// a draw that grows several times over.
 	for (const r of [fit, rest, pan]) expect(r.msPerDraw).toBeLessThan(3);

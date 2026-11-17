@@ -255,8 +255,8 @@
 		transition: filter var(--dur-slow);
 	}
 
-	/* The lines sit on a canvas outside the viewport, so they lose saturation and fade too. */
-	.map.stale :global(.line-canvas) {
+	/* The lines sit on canvases outside the viewport, so they lose saturation and fade too. */
+	.map.stale :global(.line-layer) {
 		filter: saturate(0.4);
 		opacity: 0.45;
 		transition:

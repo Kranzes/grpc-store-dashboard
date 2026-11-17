@@ -21,7 +21,7 @@ export const FADE_MS = 120;
 
 const STEP = 1000 / MAX_FPS;
 /** A frame this close before the next tick takes it, so a 60 Hz screen ticks every frame. */
-const SLACK = 2;
+export const SLACK = 2;
 /** Until this long before the next tick, wait on a timer instead of on every frame. */
 const EARLY = 8;
 

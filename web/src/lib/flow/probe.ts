@@ -11,8 +11,8 @@ export type LineProbe = {
 	report(): LineReport[];
 	/** Paint order, bottom first. */
 	order(): string[];
-	/** Draws so far, and ms spent in them. */
-	draws(): { count: number; ms: number };
+	/** Draws so far, ms spent in them, and how many of them stroked every line. */
+	draws(): { count: number; ms: number; strokeDraws: number };
 	/** Travel time: the canvas clock without pauses, ms. */
 	travel(): number;
 	/** The point `s` flow px along a line, in page px. A negative `s` counts from its end. */
