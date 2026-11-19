@@ -210,9 +210,11 @@
 		font-weight: 600;
 	}
 
-	/* The slots bar keeps the room the load text leaves. */
+	/* The slots bar keeps the room the load text leaves. The row is a line of
+	   text high with or without it, so pools that report none line up. */
 	.fill {
 		gap: 8px;
+		min-height: 10px;
 	}
 
 	.fill .meter {

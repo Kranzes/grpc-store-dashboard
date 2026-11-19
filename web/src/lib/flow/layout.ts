@@ -73,8 +73,12 @@ export const POOL_GRID = {
 	pad: 12,
 	/** Node border. */
 	border: 1,
-	/** From the node's top to the grid: the summary lines. Joins and leaves are in the panel. */
-	head: 88,
+	/**
+	 * From the node's top to the grid: the summary lines, one of them the
+	 * slots bar with the CPU and memory text beside it. Joins and leaves are
+	 * in the panel.
+	 */
+	head: 96,
 	/** From the grid to the node's bottom: its padding and border. The map's legend explains the cells. */
 	foot: 11
 } as const;
