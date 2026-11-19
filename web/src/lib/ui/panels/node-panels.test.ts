@@ -160,17 +160,17 @@ describe('PoolPanel', () => {
 		expect(facts(body)[4]).toEqual(['Needed now', 'Unknown']);
 	});
 
-	it('puts CPU and memory under the slots, and says how many builders report them', () => {
+	it('puts CPU and RAM under the slots, and says how many builders report them', () => {
 		const GiB = 1024 ** 3;
 		const load = { cpuBusy: 4, cpuIowait: 2, cpuCores: 16, memUsed: 8 * GiB, memTotal: 32 * GiB };
 		let body = renderPool({ ...POOL, ...load, loadBuilders: 1 });
 		expect(facts(body).slice(5, 7)).toEqual([
 			['CPU', '25%'],
-			['Memory', '25%']
+			['RAM', '25%']
 		]);
 		expect(facts(body)).toContainEqual(['I/O wait', '13%']);
 		expect(meterIn(body, 'CPU')).toBeCloseTo(0.25);
-		expect(body).toContain('CPU and memory of 1 of 2 builders: the others do not report them.');
+		expect(body).toContain('CPU and RAM of 1 of 2 builders: the others do not report them.');
 		body = renderPool({ ...POOL, ...load, loadBuilders: 2 });
 		expect(body).not.toContain('do not report them');
 		// No builder reports: neither shows.

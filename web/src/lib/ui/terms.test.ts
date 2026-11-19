@@ -16,9 +16,10 @@ const sources = import.meta.glob(['../flow/**/*.{ts,svelte}', './**/*.{ts,svelte
  * state, as in "No builders connected" and the connection pill, so the test
  * catches only their use for builders coming and going. "Sent" and "client
  * uploads" stay too, for the demo's network and for inputs a client sends.
+ * RAM is the one word for a builder's memory.
  */
 const NOT =
-	/\b(workers?|machines?|platforms?|jobs?|drvs?|wants?|wanted|dispatch\w*|builds\/s|cache answers?|answered from the cache|upstream caches?|pending|given back|clusters?|canvas|edges?|leaders?|that (?:dis)?connected|connected or disconnected|send|sending|downloads?|downloaded|hosts?|arch)\b/i;
+	/\b(workers?|machines?|platforms?|jobs?|drvs?|wants?|wanted|dispatch\w*|builds\/s|cache answers?|answered from the cache|upstream caches?|pending|given back|clusters?|canvas|edges?|leaders?|that (?:dis)?connected|connected or disconnected|send|sending|downloads?|downloaded|hosts?|arch|mem|memory)\b/i;
 
 /** Test files and fixtures hold model data, not text people see. */
 const skip = (path: string) => /\.test\.ts$|fixtures\.ts$|fake-store\.ts$|probe\.ts$/.test(path);

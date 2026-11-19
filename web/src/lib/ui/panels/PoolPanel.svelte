@@ -51,13 +51,13 @@
 	const fill = $derived(p && p.slots > 0 ? Math.min(1, p.running / p.slots) : 0);
 	const collapsed = $derived(pools.collapsed(system));
 	const ioWait = $derived(p ? loadShares(p).io : null);
-	// CPU and Memory, each while some builder reports it.
+	// CPU and RAM, each while some builder reports it.
 	const meters = $derived.by(() => {
 		if (!p) return [];
 		const { cpu, mem } = loadShares(p);
 		const list: [string, number | null][] = [
 			['CPU', cpu],
-			['Memory', mem]
+			['RAM', mem]
 		];
 		return list.filter((m): m is [string, number] => m[1] !== null);
 	});
@@ -198,7 +198,7 @@
 		</dl>
 		{#if coverage}
 			<p class="p-caption num">
-				CPU and memory of {formatCount(coverage.reporting)} of {formatCount(coverage.connected)} builders:
+				CPU and RAM of {formatCount(coverage.reporting)} of {formatCount(coverage.connected)} builders:
 				the others do not report them.
 			</p>
 		{/if}
@@ -340,7 +340,7 @@
 		grid-column: span 2;
 	}
 
-	/* The builders' CPU and memory in muted ink, as on their cards: blue is for slots. */
+	/* The builders' CPU and RAM in muted ink, as on their cards: blue is for slots. */
 	.facts .load {
 		--fill: var(--fg-muted);
 	}

@@ -6,7 +6,7 @@ import { formatBytes, formatCount, formatCpus, formatPercent } from './format.ts
 
 type Load = Pick<WorkerView, 'cpuBusy' | 'cpuIowait' | 'cpuCores' | 'memUsed' | 'memTotal'>;
 
-/** Busy CPUs, CPUs in I/O wait and memory in use as shares, 0 to 1, null where not reported. */
+/** Busy CPUs, CPUs in I/O wait and RAM in use as shares, 0 to 1, null where not reported. */
 export function loadShares(l: Load): { cpu: number | null; io: number | null; mem: number | null } {
 	return {
 		cpu: shareOf(l.cpuBusy, l.cpuCores),
@@ -15,13 +15,13 @@ export function loadShares(l: Load): { cpu: number | null; io: number | null; me
 	};
 }
 
-/** "CPU 34% · mem 61%", or null when neither is reported. */
+/** "CPU 34% · RAM 61%", or null when neither is reported. */
 export function loadText(l: Load): string | null {
 	const { cpu, mem } = loadShares(l);
 	if (cpu === null && mem === null) return null;
 	const parts = [];
 	if (cpu !== null) parts.push(`CPU ${formatPercent(cpu)}`);
-	if (mem !== null) parts.push(`mem ${formatPercent(mem)}`);
+	if (mem !== null) parts.push(`RAM ${formatPercent(mem)}`);
 	return parts.join(' · ');
 }
 
@@ -35,7 +35,7 @@ export function loadTitle(l: Load): string {
 		);
 	}
 	if (l.memUsed !== null && l.memTotal !== null)
-		parts.push(`${formatBytes(l.memUsed)} of ${formatBytes(l.memTotal)} memory in use`);
+		parts.push(`${formatBytes(l.memUsed)} of ${formatBytes(l.memTotal)} RAM in use`);
 	return `${parts.join(', ')}. Every process on the builder counts, not only its builds.`;
 }
 

@@ -38,7 +38,7 @@
 		const { cpu, mem } = loadShares(w);
 		const list: [string, number | null][] = [
 			['CPU', cpu],
-			['mem', mem]
+			['RAM', mem]
 		];
 		return list.filter((b): b is [string, number] => b[1] !== null);
 	});
@@ -181,7 +181,7 @@
 		gap: 3px;
 	}
 
-	/* The host's CPU and memory: as thin as the slots bar, in muted ink, draining or not. */
+	/* The host's CPU and RAM: as thin as the slots bar, in muted ink, draining or not. */
 	.builder .meter.mini {
 		--fill: var(--fg-muted);
 		width: 18px;

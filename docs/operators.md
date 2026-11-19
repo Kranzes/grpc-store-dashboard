@@ -473,7 +473,7 @@ report" for a builder that runs an older nix-grpc-store. With the patches, a bui
 publishes to the cache fail 3 times in a row takes no builds for a minute, and its card says
 "Publishing failing".
 
-The same goes for CPU and memory. Patched Linux builders read them from `/proc` for the whole
+The same goes for CPU and RAM. Patched Linux builders read them from `/proc` for the whole
 host, so anything else running there counts too, and average the CPU over the last minute. Time a
 CPU spends idle waiting on its disk shows apart, as I/O wait. macOS builders report none. A pool whose
 builders do not all report says how many do, as in "170 of 177 builders".

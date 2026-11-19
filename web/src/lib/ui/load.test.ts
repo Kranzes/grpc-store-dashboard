@@ -9,9 +9,9 @@ describe('load', () => {
 	it('says busy CPUs and memory in use as shares, and nothing without a report', () => {
 		const l = { cpuBusy: 4.5, cpuIowait: 2, cpuCores: 16, memUsed: 16 * GiB, memTotal: 64 * GiB };
 		expect(loadShares(l)).toEqual({ cpu: 4.5 / 16, io: 2 / 16, mem: 0.25 });
-		expect(loadText(l)).toBe('CPU 28% · mem 25%');
+		expect(loadText(l)).toBe('CPU 28% · RAM 25%');
 		expect(loadTitle(l)).toBe(
-			'4.5 of 16 CPUs busy and 2 waiting on I/O over the last minute, 16 GiB of 64 GiB memory in use. Every process on the builder counts, not only its builds.'
+			'4.5 of 16 CPUs busy and 2 waiting on I/O over the last minute, 16 GiB of 64 GiB RAM in use. Every process on the builder counts, not only its builds.'
 		);
 		expect(loadTitle({ ...l, cpuBusy: 60.4, cpuIowait: 0, cpuCores: 1400 })).toMatch(
 			/^60 of 1,400 CPUs busy over the last minute,/
@@ -34,6 +34,6 @@ describe('load', () => {
 		expect(poolLoadCoverage(pool(170))).toEqual({ reporting: 170, connected: 177 });
 		expect(poolLoadCoverage(pool(177))).toBeNull();
 		expect(poolLoadCoverage(pool(0))).toBeNull();
-		expect(loadText(pool(170))).toBe('CPU 4% · mem 40%');
+		expect(loadText(pool(170))).toBe('CPU 4% · RAM 40%');
 	});
 });
