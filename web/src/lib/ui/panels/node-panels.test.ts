@@ -173,6 +173,10 @@ describe('PoolPanel', () => {
 		expect(body).toContain('CPU and RAM of 1 of 2 builders: the others do not report them.');
 		body = renderPool({ ...POOL, ...load, loadBuilders: 2 });
 		expect(body).not.toContain('do not report them');
+		// Builders that measure no I/O wait, as on macOS: no figure rather than 0%.
+		body = renderPool({ ...POOL, ...load, cpuIowait: null, loadBuilders: 2 });
+		expect(facts(body).map(([label]) => label)).toContain('CPU');
+		expect(facts(body).map(([label]) => label)).not.toContain('I/O wait');
 		// No builder reports: neither shows.
 		body = renderPool(POOL);
 		expect(facts(body).map(([label]) => label)).not.toContain('CPU');

@@ -490,8 +490,9 @@ export type WorkerState = Message<"nix.remote.WorkerState"> & {
    * iowait, each averaged over about the last minute, in thousandths of a
    * CPU, and its online CPUs; memory in use and in all. Host-wide, so every
    * process on the host counts, not only the builder's builds. Unset: the
-   * builder does not report them, as older builders and hosts without /proc
-   * do. Hello clears them until the session's first report.
+   * builder does not report them, as older builders do. cpu_iowait_millicores
+   * alone is unset where the host does not measure it, as on macOS. Hello
+   * clears them until the session's first report.
    *
    * @generated from field: optional uint64 cpu_busy_millicores = 13;
    */
@@ -1395,7 +1396,8 @@ export type PoolSample = Message<"nix.remote.PoolSample"> & {
 
   /**
    * Summed over the builders whose WorkerState has them. Unset while none
-   * does.
+   * does; cpu_iowait_millicores sums the builders that send it, so a pool of
+   * macOS builders has none.
    *
    * @generated from field: optional uint64 cpu_busy_millicores = 6;
    */

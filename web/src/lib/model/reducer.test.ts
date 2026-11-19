@@ -1510,6 +1510,27 @@ describe('host load', () => {
 		});
 	});
 
+	it('leaves I/O wait out for a builder that measures none, as on macOS', () => {
+		const mac = { ...load(3000, 8, 10, 32), cpuIowaitMillicores: undefined };
+		const { r } = started(
+			{},
+			E.reset(),
+			E.worker('m1', { systems: ['aarch64-darwin'], ...mac }),
+			E.worker('m2', { systems: ['aarch64-darwin'], ...mac }),
+			E.worker('x1', load(4000, 16, 20, 64)),
+			E.worker('x2', { ...load(2000, 16, 20, 64), cpuIowaitMillicores: undefined })
+		);
+		const v = r.views(T0, 15);
+		expect(v.workers.get('m1')).toMatchObject({ cpuBusy: 3, cpuIowait: null, cpuCores: 8 });
+		expect(v.pools.get('aarch64-darwin')).toMatchObject({
+			cpuBusy: 6,
+			cpuIowait: null,
+			cpuCores: 16
+		});
+		// A pool sums I/O wait over the builders that send it.
+		expect(v.pools.get('x86_64-linux')).toMatchObject({ cpuBusy: 6, cpuIowait: 1, cpuCores: 32 });
+	});
+
 	it('sums nothing while no builder reports', () => {
 		const { r } = farm();
 		expect(r.views(T0, 15).pools.get('x86_64-linux')).toMatchObject({

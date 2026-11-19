@@ -339,7 +339,8 @@ export type PoolView = Readonly<{
 	/**
 	 * CPU and memory summed over connected builders that report them,
 	 * draining ones included: busy CPUs, CPUs in iowait and all CPUs, bytes in
-	 * use and in all. null while none does.
+	 * use and in all. null while none does; cpuIowait is null while none
+	 * sends it, as macOS builders do not.
 	 */
 	cpuBusy: number | null;
 	cpuIowait: number | null;

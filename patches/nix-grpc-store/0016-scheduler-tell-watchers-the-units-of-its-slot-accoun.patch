@@ -1,4 +1,4 @@
-From da37c5abf4ef04fed0ac552b3f2b07afbbef0b24 Mon Sep 17 00:00:00 2001
+From 512120520009569044a71afd02a4bb7aa29858d4 Mon Sep 17 00:00:00 2001
 From: Ilan Joselevich <personal@ilanjoselevich.com>
 Date: Thu, 19 Nov 2026 09:58:08 +0100
 Subject: [PATCH 16/16] scheduler: tell watchers the units of its slot
@@ -27,10 +27,10 @@ its builders that take work.
  3 files changed, 86 insertions(+)
 
 diff --git a/proto/events.proto b/proto/events.proto
-index 87fb692..719697d 100644
+index 688c5be..23697cf 100644
 --- a/proto/events.proto
 +++ b/proto/events.proto
-@@ -213,6 +213,11 @@ message WorkerState {
+@@ -214,6 +214,11 @@ message WorkerState {
    // for each further give-back, up to 10 minutes. Its builds in progress go
    // on. Unset while it is not resting, and from older schedulers.
    optional uint64 rests_until_ms = 18;
@@ -42,7 +42,7 @@ index 87fb692..719697d 100644
  }
  
  message SubstituterTraffic {
-@@ -323,6 +328,11 @@ message DrvState {
+@@ -324,6 +329,11 @@ message DrvState {
    string build_phase = 17;
    uint64 build_started_ms = 18;
    uint64 build_phase_started_ms = 19;
@@ -54,7 +54,7 @@ index 87fb692..719697d 100644
  }
  
  message InputSource {
-@@ -466,6 +476,9 @@ message SystemStats {
+@@ -468,6 +478,9 @@ message SystemStats {
    uint32 unplaceable = 4;
    // Keyed by what workers offer (their native system).
    uint32 running = 5;
@@ -65,7 +65,7 @@ index 87fb692..719697d 100644
    uint32 free = 7;
  }
 diff --git a/src/daemon/dispatcher-events.cc b/src/daemon/dispatcher-events.cc
-index dd7f08e..b811ae8 100644
+index 267f8d1..270676c 100644
 --- a/src/daemon/dispatcher-events.cc
 +++ b/src/daemon/dispatcher-events.cc
 @@ -42,6 +42,10 @@ namespace {
@@ -79,7 +79,7 @@ index dd7f08e..b811ae8 100644
  
  auto giveBackReason(const Done & done) -> std::string
  {
-@@ -340,6 +344,7 @@ auto Dispatcher::drvEventLocked(const sched::Entry & ent, DrvState::Cause cause,
+@@ -344,6 +348,7 @@ auto Dispatcher::drvEventLocked(const sched::Entry & ent, DrvState::Cause cause,
      auto & out = *event.mutable_drv();
      out.set_drv_path(ent.drvPath);
      out.set_cause(cause);
@@ -87,7 +87,7 @@ index dd7f08e..b811ae8 100644
      out.set_system(ent.system);
      for (const auto & feat : ent.features) {
          out.add_features(feat);
-@@ -392,6 +397,7 @@ auto Dispatcher::workerEventLocked(sched::WorkerId wid) const -> WatchEvent
+@@ -396,6 +401,7 @@ auto Dispatcher::workerEventLocked(sched::WorkerId wid) const -> WatchEvent
          out.add_features(feat);
      }
      out.set_max_jobs(static_cast<uint32_t>(wkr.maxJobs));
@@ -96,10 +96,10 @@ index dd7f08e..b811ae8 100644
      out.set_draining(wkr.draining);
      if (wkr.restsUntilMs) {
 diff --git a/tests/events-test.cc b/tests/events-test.cc
-index f6eacd0..1c265ff 100644
+index b16dad7..835f8bf 100644
 --- a/tests/events-test.cc
 +++ b/tests/events-test.cc
-@@ -1815,6 +1815,72 @@ void testRest()
+@@ -1836,6 +1836,72 @@ void testRest()
      disp.unwatch(*watcher);
  }
  
@@ -172,7 +172,7 @@ index f6eacd0..1c265ff 100644
  void testRandom()
  {
      for (unsigned seed = 1; seed <= 8; seed++) {
-@@ -2167,6 +2233,7 @@ try {
+@@ -2188,6 +2254,7 @@ try {
      testLoad();
      testPoolSamples();
      testRest();

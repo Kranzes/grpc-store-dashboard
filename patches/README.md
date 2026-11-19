@@ -20,7 +20,7 @@ lives in this repository's NixOS module (`nixosModules.default`).
 | 0010 | Builders report each running build's phase. |
 | 0011 | `Events.RecentBuilds`: the last 10,000 builds and 2,000 failures. Each record has a `seq`, and `before_seq` pages by it, so builds that finished in the same millisecond come once each. |
 | 0012 | `GetBuildLog` reads from the log store and the binary cache when a node has no log. |
-| 0013 | Builders report their host's busy CPUs and I/O wait over the last minute, and memory in use, host-wide, and the scheduler passes them on in `WorkerState`. |
+| 0013 | Builders report their host's busy CPUs and I/O wait over the last minute, and memory in use, host-wide, from `/proc` on Linux and the Mach host statistics on macOS, and the scheduler passes them on in `WorkerState`. |
 | 0014 | Each minute's `CounterSample` carries every pool's builders, slots and load, so `Reset.history` holds the last hour of them. |
 | 0015 | `WorkerState` says until when the scheduler rests a builder that keeps failing to run builds. |
 | 0016 | `WorkerState.capacity` and `DrvState.weight` give the units of the scheduler's slot accounting, which `Stats` counts slots and free in. |

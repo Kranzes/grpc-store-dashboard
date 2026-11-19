@@ -16,6 +16,11 @@ describe('load', () => {
 		expect(loadTitle({ ...l, cpuBusy: 60.4, cpuIowait: 0, cpuCores: 1400 })).toMatch(
 			/^60 of 1,400 CPUs busy over the last minute,/
 		);
+		// No I/O wait measured, as on macOS: the tooltip says nothing of it.
+		expect(loadTitle({ ...l, cpuIowait: null })).toBe(
+			'4.5 of 16 CPUs busy over the last minute, 16 GiB of 64 GiB RAM in use. Every process on the builder counts, not only its builds.'
+		);
+		expect(loadShares({ ...l, cpuIowait: null }).io).toBeNull();
 		expect(loadText(NONE)).toBeNull();
 		expect(loadShares(NONE)).toEqual({ cpu: null, io: null, mem: null });
 	});

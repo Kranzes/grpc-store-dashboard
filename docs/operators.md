@@ -473,9 +473,11 @@ report" for a builder that runs an older nix-grpc-store. With the patches, a bui
 publishes to the cache fail 3 times in a row takes no builds for a minute, and its card says
 "Publishing failing".
 
-The same goes for CPU and RAM. Patched Linux builders read them from `/proc` for the whole
-host, so anything else running there counts too, and average the CPU over the last minute. Time a
-CPU spends idle waiting on its disk shows apart, as I/O wait. macOS builders report none. A pool whose
+The same goes for CPU and RAM. Patched builders read them for the whole host, so anything else
+running there counts too, and average the CPU over the last minute. Linux builders read `/proc`,
+and time a CPU spends idle waiting on its disk shows apart, as I/O wait. macOS builders read the
+Mach host statistics: RAM in use approximates "Memory Used" in Activity Monitor, and macOS has no
+I/O wait, so the page shows none for them. A pool whose
 builders do not all report says how many do, as in "170 of 177 builders".
 
 A pool's panel charts its slots in use and busy CPUs over the last hour. A patched scheduler keeps

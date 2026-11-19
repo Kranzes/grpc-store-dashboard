@@ -423,14 +423,22 @@ message WorkerReport {
   repeated BuildProgress builds = 4;
   // The host's load. It is host-wide, so every process on the host counts,
   // not only this builder's builds. The CPU figures are averages over about
-  // the last minute of /proc/stat, in thousandths of a CPU: CPUs busy in
-  // user, system or interrupt time, and CPUs idle with I/O of theirs still
-  // outstanding (iowait). Steal, the time a hypervisor took, counts as
-  // neither. Memory in use is MemTotal minus MemAvailable from
-  // /proc/meminfo, as of the report. Set in the first report of a session,
-  // then when busy moved by at least 5% of cpu_cores, memory in use by 5% of
-  // the total, or 30 s passed since they last went out. Hosts without /proc
-  // send none.
+  // the last minute, in thousandths of a CPU: CPUs busy, and CPUs idle with
+  // I/O of theirs still outstanding (iowait). Memory in use is as of the
+  // report.
+  //
+  // Linux builders read /proc/stat and /proc/meminfo. Busy is user, system
+  // and interrupt time; steal, the time a hypervisor took, counts as
+  // neither busy nor iowait. Memory in use is MemTotal minus MemAvailable.
+  //
+  // macOS builders read the Mach host statistics. Busy is user, system and
+  // nice time, and memory in use is active, wired and compressed pages,
+  // which approximates "Memory Used" in Activity Monitor. macOS has no
+  // iowait, so they leave cpu_iowait_millicores unset.
+  //
+  // Set in the first report of a session, then when busy moved by at least
+  // 5% of cpu_cores, memory in use by 5% of the total, or 30 s passed since
+  // they last went out. Other hosts send none.
   optional uint64 cpu_busy_millicores = 5;
   optional uint32 cpu_cores = 6;
   optional uint64 mem_used_bytes = 7;

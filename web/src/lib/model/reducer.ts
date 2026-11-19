@@ -446,6 +446,8 @@ type PoolAcc = {
 	slots: number;
 	cpuBusy: number;
 	cpuIowait: number;
+	/** Builders that send iowait: macOS ones do not. */
+	ioBuilders: number;
 	cpuCores: number;
 	memUsed: number;
 	memTotal: number;
@@ -2255,6 +2257,7 @@ export class FarmReducer {
 					slots: 0,
 					cpuBusy: 0,
 					cpuIowait: 0,
+					ioBuilders: 0,
 					cpuCores: 0,
 					memUsed: 0,
 					memTotal: 0,
@@ -2290,7 +2293,10 @@ export class FarmReducer {
 			if (w.up && (w.cpuCores !== null || w.memTotal !== null)) {
 				p.loadBuilders++;
 				p.cpuBusy += w.cpuBusy ?? 0;
-				p.cpuIowait += w.cpuIowait ?? 0;
+				if (w.cpuIowait !== null) {
+					p.cpuIowait += w.cpuIowait;
+					p.ioBuilders++;
+				}
 				p.cpuCores += w.cpuCores ?? 0;
 				p.memUsed += w.memUsed ?? 0;
 				p.memTotal += w.memTotal ?? 0;
@@ -2394,7 +2400,7 @@ export class FarmReducer {
 				needed,
 				spare: Math.max(0, p.up - (needed ?? p.up)),
 				cpuBusy: p.cpuCores ? round3(p.cpuBusy) : null,
-				cpuIowait: p.cpuCores ? round3(p.cpuIowait) : null,
+				cpuIowait: p.ioBuilders ? round3(p.cpuIowait) : null,
 				cpuCores: p.cpuCores || null,
 				memUsed: p.memTotal ? p.memUsed : null,
 				memTotal: p.memTotal || null,

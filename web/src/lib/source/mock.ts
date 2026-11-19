@@ -317,10 +317,11 @@ function buildLoad(d: Drv): { cpus: number; io: number; mem: number } {
 /**
  * A host's load as its builder reports it: busy CPUs, CPUs in I/O wait and
  * all CPUs, averaged over about the last minute, and bytes in use and in all.
+ * macOS has no I/O wait: null there.
  */
 type HostReading = {
 	busy: number;
-	io: number;
+	io: number | null;
 	cores: number;
 	used: number;
 	total: number;
@@ -530,10 +531,7 @@ type Worker = {
 	/** Something to report changed since the last report. */
 	dirty: boolean;
 	lastReportMs: number;
-	/**
-	 * Reads its host's CPU and memory. Darwin builders cannot, and some
-	 * Linux ones run a release that does not.
-	 */
+	/** Reads its host's CPU and RAM. Some builders run a release that does not. */
 	reportsLoad: boolean;
 	/** The load it last reported in this session, null before its first report. */
 	load: HostReading | null;
@@ -1202,7 +1200,7 @@ export class MockFarm {
 			reportedFree: diskFree,
 			dirty: false,
 			lastReportMs: -Infinity,
-			reportsLoad: !sys.endsWith('-darwin') && unit(addr) >= 1 / 12,
+			reportsLoad: unit(addr) >= 1 / 12,
 			load: null,
 			cpuAvg: null,
 			restsUntil: 0,
@@ -1475,7 +1473,14 @@ export class MockFarm {
 			atMs: this.now
 		};
 		w.cpuAvg = avg;
-		return { busy: avg.busy, io: avg.io, cores, used: Math.min(total, mem), total, atMs: this.now };
+		return {
+			busy: avg.busy,
+			io: w.systems[0].endsWith('-darwin') ? null : avg.io,
+			cores,
+			used: Math.min(total, mem),
+			total,
+			atMs: this.now
+		};
 	}
 
 	/** Whether a builder sends `now`: the session's first, a step from the last, or LOAD_EVERY_MS since. */

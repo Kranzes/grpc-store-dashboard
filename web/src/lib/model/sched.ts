@@ -81,7 +81,8 @@ export function newPool(): PoolTally {
 export function addLoad(p: PoolTally, l: HostLoad): void {
 	if (l.cpuBusy !== null && l.cpuCores !== null) {
 		p.cpuBusy = (p.cpuBusy ?? 0) + l.cpuBusy;
-		p.cpuIowait = (p.cpuIowait ?? 0) + (l.cpuIowait ?? 0);
+		// Only where the host measures it: macOS does not.
+		if (l.cpuIowait !== null) p.cpuIowait = (p.cpuIowait ?? 0) + l.cpuIowait;
 		p.cpuCores = (p.cpuCores ?? 0) + l.cpuCores;
 	}
 	if (l.memUsed !== null && l.memTotal !== null) {

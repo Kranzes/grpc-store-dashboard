@@ -1,4 +1,4 @@
-From ff8940f9954b550cef3eda1d704cc3c848f51f95 Mon Sep 17 00:00:00 2001
+From 9c17e448f2bfe23b21f9e5877e28e3848725bcef Mon Sep 17 00:00:00 2001
 From: Ilan Joselevich <personal@ilanjoselevich.com>
 Date: Thu, 19 Nov 2026 06:50:57 +0100
 Subject: [PATCH 14/16] scheduler: sample each pool's use with the counters
@@ -20,14 +20,14 @@ older scheduler.
 
 events-test covers the samples.
 ---
- proto/events.proto              | 25 +++++++++++--
- src/daemon/dispatcher-events.cc | 62 +++++++++++++++++++++++++++++++++
+ proto/events.proto              | 26 ++++++++++++-
+ src/daemon/dispatcher-events.cc | 66 +++++++++++++++++++++++++++++++++
  src/daemon/dispatcher.hh        |  1 +
- tests/events-test.cc            | 53 ++++++++++++++++++++++++++++
- 4 files changed, 139 insertions(+), 2 deletions(-)
+ tests/events-test.cc            | 61 ++++++++++++++++++++++++++++++
+ 4 files changed, 152 insertions(+), 2 deletions(-)
 
 diff --git a/proto/events.proto b/proto/events.proto
-index 3fbc0e2..92516de 100644
+index 717ab2d..d54aac4 100644
 --- a/proto/events.proto
 +++ b/proto/events.proto
 @@ -146,8 +146,8 @@ message Reset {
@@ -41,7 +41,7 @@ index 3fbc0e2..92516de 100644
    repeated CounterSample history = 6;
    // The farm cache as builders list it among their substituters
    // (--niks3-cache-url, reduced like WorkerState.substituters). Empty when
-@@ -428,6 +428,27 @@ message Counters {
+@@ -429,6 +429,28 @@ message Counters {
  message CounterSample {
    uint64 time_ms = 1;
    Counters counters = 2;
@@ -60,7 +60,8 @@ index 3fbc0e2..92516de 100644
 +  uint32 slots = 4;
 +  uint32 free = 5;
 +  // Summed over the builders whose WorkerState has them. Unset while none
-+  // does.
++  // does; cpu_iowait_millicores sums the builders that send it, so a pool of
++  // macOS builders has none.
 +  optional uint64 cpu_busy_millicores = 6;
 +  optional uint32 cpu_cores = 7;
 +  optional uint64 mem_used_bytes = 8;
@@ -70,10 +71,10 @@ index 3fbc0e2..92516de 100644
  
  message SystemStats {
 diff --git a/src/daemon/dispatcher-events.cc b/src/daemon/dispatcher-events.cc
-index 99ee20d..c34c8d0 100644
+index e545386..e2f3ee4 100644
 --- a/src/daemon/dispatcher-events.cc
 +++ b/src/daemon/dispatcher-events.cc
-@@ -243,11 +243,73 @@ void Dispatcher::sampleLocked()
+@@ -243,11 +243,77 @@ void Dispatcher::sampleLocked()
      auto & sample = history.emplace_back();
      sample.set_time_ms(wallMs(now));
      *sample.mutable_counters() = counters;
@@ -122,7 +123,9 @@ index 99ee20d..c34c8d0 100644
 +        const auto & add = *load;
 +        auto & sum = pool.load.has_value() ? pool.load.value() : pool.load.emplace();
 +        sum.cpuBusyMillicores += add.cpuBusyMillicores;
-+        sum.cpuIowaitMillicores += add.cpuIowaitMillicores;
++        if (add.cpuIowaitMillicores) {
++            sum.cpuIowaitMillicores = sum.cpuIowaitMillicores.value_or(0) + *add.cpuIowaitMillicores;
++        }
 +        sum.cpuCores += add.cpuCores;
 +        sum.memUsedBytes += add.memUsedBytes;
 +        sum.memTotalBytes += add.memTotalBytes;
@@ -136,7 +139,9 @@ index 99ee20d..c34c8d0 100644
 +        out.set_free(static_cast<uint32_t>(pool.stats.free));
 +        if (pool.load) {
 +            out.set_cpu_busy_millicores(pool.load->cpuBusyMillicores);
-+            out.set_cpu_iowait_millicores(pool.load->cpuIowaitMillicores);
++            if (pool.load->cpuIowaitMillicores) {
++                out.set_cpu_iowait_millicores(*pool.load->cpuIowaitMillicores);
++            }
 +            out.set_cpu_cores(pool.load->cpuCores);
 +            out.set_mem_used_bytes(pool.load->memUsedBytes);
 +            out.set_mem_total_bytes(pool.load->memTotalBytes);
@@ -160,10 +165,10 @@ index 9d3bf89..5e4164d 100644
          const std::map<sched::Core::StatsKey, sched::Core::Stats> & stats);
      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) auto drvEventLocked(
 diff --git a/tests/events-test.cc b/tests/events-test.cc
-index 1c459db..0468cdc 100644
+index 202f62b..0f29ef7 100644
 --- a/tests/events-test.cc
 +++ b/tests/events-test.cc
-@@ -1718,6 +1718,58 @@ void testLoad()
+@@ -1731,6 +1731,66 @@ void testLoad()
      assert(back.up() && !back.has_cpu_busy_millicores() && !back.has_mem_total_bytes());
  }
  
@@ -184,8 +189,16 @@ index 1c459db..0468cdc 100644
 +    sendOne(disp, two.worker, helloMsg("w2", 8));
 +    auto arm = helloMsg("a1", 2);
 +    arm.mutable_hello()->clear_systems();
-+    arm.mutable_hello()->add_systems("aarch64-linux");
++    arm.mutable_hello()->add_systems("aarch64-darwin");
 +    sendOne(disp, three.worker, arm);
++    // A Mac: CPU and memory, no iowait.
++    rpc::WorkerMsg mac;
++    auto * macRep = mac.mutable_report();
++    macRep->set_cpu_busy_millicores(500);
++    macRep->set_cpu_cores(2);
++    macRep->set_mem_used_bytes(10);
++    macRep->set_mem_total_bytes(20);
++    sendOne(disp, three.worker, mac);
 +    rpc::WorkerMsg load;
 +    auto * rep = load.mutable_report();
 +    rep->set_cpu_busy_millicores(1500);
@@ -210,8 +223,8 @@ index 1c459db..0468cdc 100644
 +    const auto & pools = reset->history(reset->history_size() - 1).pools();
 +    assert(pools.size() == 2);
 +    const auto & arm64 = pools.Get(0);
-+    assert(arm64.system() == "aarch64-linux" && arm64.builders_up() == 1 && arm64.slots() == 2 && arm64.free() == 2);
-+    assert(!arm64.has_cpu_cores() && !arm64.has_mem_total_bytes());
++    assert(arm64.system() == "aarch64-darwin" && arm64.builders_up() == 1 && arm64.slots() == 2 && arm64.free() == 2);
++    assert(arm64.cpu_busy_millicores() == 500 && arm64.cpu_cores() == 2 && !arm64.has_cpu_iowait_millicores());
 +    const auto & x86pool = pools.Get(1);
 +    assert(x86pool.system() == x86 && x86pool.builders_up() == 2 && x86pool.running() == 1);
 +    assert(x86pool.slots() == 12 && x86pool.free() == 11);
@@ -222,7 +235,7 @@ index 1c459db..0468cdc 100644
  void testRandom()
  {
      for (unsigned seed = 1; seed <= 8; seed++) {
-@@ -2068,6 +2120,7 @@ try {
+@@ -2081,6 +2141,7 @@ try {
      testVersionCut();
      testReports();
      testLoad();
