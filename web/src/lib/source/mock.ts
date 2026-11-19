@@ -1494,6 +1494,7 @@ export class MockFarm {
 			systems: w.systems,
 			features: w.features,
 			maxJobs: w.maxJobs,
+			capacity: w.maxJobs,
 			up: w.up,
 			draining: w.draining,
 			drainReason:
@@ -2178,6 +2179,8 @@ export class MockFarm {
 			d.sources = { list: sources, unknown };
 		}
 		return create(DrvStateSchema, {
+			// The stock scheduler counts in builds: one unit each.
+			weight: 1,
 			drvPath: d.path,
 			phase:
 				d.phase === 'assigned'

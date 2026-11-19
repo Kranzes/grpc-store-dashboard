@@ -142,7 +142,7 @@
 			</div>
 			<div class="wide">
 				<dt
-					title="Slots in use on builders taking work, plus the queued derivations this pool can take, over the median builder's {formatCount(
+					title="Slots in use on builders taking work, plus the slots the queued derivations this pool can take need, over the median builder's {formatCount(
 						p.builderSlots
 					)} slots, rounded up"
 				>

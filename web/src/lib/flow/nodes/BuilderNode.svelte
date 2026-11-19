@@ -4,7 +4,7 @@
 	import { drainBadge, drainTitle } from '#lib/ui/drain.ts';
 	import { formatBytes, formatShort, spokenShort } from '#lib/ui/format.ts';
 	import { loadShares, loadText, loadTitle } from '#lib/ui/load.ts';
-	import { builderFeatures } from '../cells.ts';
+	import { builderFeatures, unitsText } from '../cells.ts';
 	import { getFlowContext, nodeButton } from '../context.ts';
 	import { BUILDER_PORT_OFFSET, SUBSTITUTE_PORT_OFFSET } from '../layout.ts';
 	import { lineId } from '../kinds.ts';
@@ -42,6 +42,8 @@
 		];
 		return list.filter((b): b is [string, number] => b[1] !== null);
 	});
+	// Builds and units, while the scheduler counts in other units than builds.
+	const units = $derived(w ? unitsText(w) : null);
 	// Free disk while it is why the builder drains. Offline cards show none.
 	const lowDisk = $derived(
 		state === 'draining' && w?.drainReason === 'low-disk' && w.diskFree !== null
@@ -103,8 +105,16 @@
 		<span style:transform="scaleX({fill})"></span>
 	</span>
 	<span class="row foot" title="Assigned to a builder. Includes uploading and fetching inputs.">
-		<span class="num slots">{w?.running ?? 0}/{w?.maxJobs ?? 0}</span>
-		<span class="muted">assigned</span>
+		{#if units}
+			<span
+				class="num units"
+				title="Builds assigned of its max_jobs, then the scheduler's units in use of its capacity"
+				>{units}</span
+			>
+		{:else}
+			<span class="num slots">{w?.running ?? 0}/{w?.maxJobs ?? 0}</span>
+			<span class="muted">assigned</span>
+		{/if}
 		{#if lowDisk}
 			<span class="spacer"></span>
 			<span class="num disk">{lowDisk}</span>
@@ -145,6 +155,14 @@
 	.slots {
 		font-weight: 600;
 		min-width: 3.4em;
+	}
+
+	.units {
+		min-width: 0;
+		overflow: hidden;
+		font-weight: 600;
+		text-overflow: ellipsis;
+		white-space: nowrap;
 	}
 
 	.muted {

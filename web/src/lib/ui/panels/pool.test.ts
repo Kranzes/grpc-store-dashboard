@@ -7,6 +7,8 @@ const w = (addr: string, o: Partial<WorkerView> = {}): WorkerView => ({
 	systems: ['x86_64-linux', 'i686-linux'],
 	features: [],
 	maxJobs: 8,
+	capacity: 8,
+	units: 0,
 	running: 0,
 	up: true,
 	draining: false,

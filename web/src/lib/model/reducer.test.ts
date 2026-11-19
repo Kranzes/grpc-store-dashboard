@@ -1625,6 +1625,115 @@ describe('pool history', () => {
 	});
 });
 
+describe("builders needed, in the scheduler's units", () => {
+	const queued = (n: number, init = {}) =>
+		Array.from({ length: n }, (_, i) => E.drv(drvPath(`u-q-${i}`), { clientIds: [1n], ...init }));
+	const assigned = (worker: string, n: number, init = {}) =>
+		Array.from({ length: n }, (_, i) =>
+			E.drv(drvPath(`u-${worker}-${i}`), {
+				phase: Phase.ASSIGNED,
+				workerAddr: worker,
+				clientIds: [1n],
+				...init
+			})
+		);
+	const pool = (r: FarmReducer) => r.views(T0, 15).pools.get('x86_64-linux')!;
+
+	it('reads the same with units of one build each as without them', () => {
+		const body = (units: boolean) => [
+			E.client(1, 'ci'),
+			E.worker('x1', { maxJobs: 8, ...(units ? { capacity: 8 } : {}) }),
+			E.worker('x2', { maxJobs: 8, ...(units ? { capacity: 8 } : {}) }),
+			...assigned('x1', 3, units ? { weight: 1 } : {}),
+			...queued(10, units ? { weight: 1 } : {})
+		];
+		const older = started({}, E.reset(), ...body(false)).r;
+		const stock = started({}, E.reset(), ...body(true)).r;
+		const pick = (r: FarmReducer) => {
+			const { occupied, builderSlots, needed, spare } = pool(r);
+			return { occupied, builderSlots, needed, spare };
+		};
+		expect(pick(stock)).toEqual(pick(older));
+		// (3 + 10) / 8, rounded up.
+		expect(pick(stock)).toEqual({ occupied: 3, builderSlots: 8, needed: 2, spare: 0 });
+	});
+
+	it('divides by what builders offer in units, not by max_jobs', () => {
+		const { r } = started(
+			{},
+			E.reset(),
+			E.client(1, 'ci'),
+			E.worker('x1', { maxJobs: 8, capacity: 4 }),
+			E.worker('x2', { maxJobs: 8, capacity: 4 }),
+			...assigned('x1', 2),
+			...queued(6)
+		);
+		expect(pool(r)).toMatchObject({ occupied: 2, builderSlots: 4, needed: 2 });
+		expect(r.views(T0, 15).workers.get('x1')).toMatchObject({
+			maxJobs: 8,
+			capacity: 4,
+			running: 2,
+			units: 2
+		});
+	});
+
+	it('counts heavy queued and assigned builds by their weight', () => {
+		const { r, s } = started(
+			{},
+			E.reset(),
+			E.client(1, 'ci'),
+			E.worker('x1', { maxJobs: 8, capacity: 16 }),
+			E.worker('x2', { maxJobs: 8, capacity: 16 }),
+			...assigned('x1', 2, { weight: 4 }),
+			...queued(5, { weight: 4 }),
+			// Unplaceable: no builder offers cuda, so it does not count.
+			E.drv(drvPath('u-cuda'), {
+				phase: Phase.UNPLACEABLE,
+				clientIds: [1n],
+				features: ['cuda'],
+				weight: 8
+			})
+		);
+		// Before any Stats: 2 builds of 4 units in use, and 5 of 4 queued, over 16.
+		expect(pool(r)).toMatchObject({ queuedCanTake: 5, occupied: 8, builderSlots: 16, needed: 2 });
+		expect(r.views(T0, 15).workers.get('x1')).toMatchObject({ running: 2, units: 8 });
+		// The scheduler weighs one queued build anew: the count follows.
+		r.apply(s.next(E.drv(drvPath('u-q-0'), { clientIds: [1n], weight: 20 })), T0);
+		expect(pool(r)).toMatchObject({ needed: 3 });
+		// Once placed, it takes its weight on its builder.
+		r.apply(
+			s.next(
+				E.drv(drvPath('u-q-0'), {
+					phase: Phase.ASSIGNED,
+					workerAddr: 'x2',
+					clientIds: [1n],
+					weight: 20
+				})
+			),
+			T0
+		);
+		expect(r.views(T0, 15).workers.get('x2')).toMatchObject({ running: 1, units: 20 });
+		// At most its capacity counts as in use: 8 + 16, then 4 queued of 4.
+		expect(pool(r)).toMatchObject({ occupied: 24, needed: 3 });
+	});
+
+	it('takes max_jobs and one a build where an older scheduler sends no units', () => {
+		const { r } = started(
+			{},
+			E.reset(),
+			E.client(1, 'ci'),
+			E.worker('x1', { maxJobs: 8, capacity: 16 }),
+			E.worker('x2', { maxJobs: 8 }),
+			...assigned('x2', 4),
+			...queued(3, { weight: 2 }),
+			E.drv(drvPath('u-plain'), { clientIds: [1n] })
+		);
+		expect(r.views(T0, 15).workers.get('x2')).toMatchObject({ capacity: 8, units: 4 });
+		// The median of 16 and 8 is 12: (4 + 3 * 2 + 1) / 12, rounded up.
+		expect(pool(r)).toMatchObject({ builderSlots: 12, occupied: 4, needed: 1 });
+	});
+});
+
 describe('resting builders', () => {
 	it('shows a builder the scheduler rests as draining, and leaves it out of taking work', () => {
 		const until = T0 + 30_000;

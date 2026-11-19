@@ -183,6 +183,13 @@ export type WorkerView = Readonly<{
 	systems: readonly string[];
 	features: readonly string[];
 	maxJobs: number;
+	/**
+	 * The units of the scheduler's slot accounting it offers, and the units
+	 * its assigned builds take of them. A scheduler that counts in builds
+	 * gives max_jobs and one a build, as older ones do without saying.
+	 */
+	capacity: number;
+	units: number;
 	/** Assigned slots in use. The scheduler cannot tell assigned from building. */
 	running: number;
 	up: boolean;
@@ -308,16 +315,17 @@ export type PoolView = Readonly<{
 	queuedCanTake: number;
 	/**
 	 * Slots the pool's builds take, as the scheduler counts them: slots minus
-	 * free of the pool's builders at the last Stats. Before any, the assigned
-	 * slots of builders taking work, at most each one's max_jobs.
+	 * free of the pool's builders at the last Stats, in its units. Before
+	 * any, the units of builds assigned to builders taking work, at most each
+	 * one's capacity.
 	 */
 	occupied: number;
-	/** The median max_jobs of builders taking work, or of connected ones while none does. 0 when unknown. */
+	/** The median capacity of builders taking work, or of connected ones while none does. 0 when unknown. */
 	builderSlots: number;
 	/**
-	 * How many builders of builderSlots slots the occupied slots and
-	 * queuedCanTake fill, which an autoscaler that follows the scheduler would
-	 * ask for. null when builderSlots is unknown.
+	 * How many builders of builderSlots units the occupied units and the
+	 * weights of queuedCanTake fill, which an autoscaler that follows the
+	 * scheduler would ask for. null when builderSlots is unknown.
 	 */
 	needed: number | null;
 	/** Online builders beyond `needed`. */

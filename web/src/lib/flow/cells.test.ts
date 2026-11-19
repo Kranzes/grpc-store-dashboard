@@ -1,12 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import type { WorkerView } from '#lib/model/types.ts';
-import { builderFeatures, cellLevel, cellOf, cellsOf, featureSummary } from './cells.ts';
+import { builderFeatures, cellLevel, cellOf, cellsOf, featureSummary, unitsText } from './cells.ts';
 
 const w = (addr: string, o: Partial<WorkerView> = {}): WorkerView => ({
 	addr,
 	systems: ['x86_64-linux'],
 	features: [],
 	maxJobs: 8,
+	capacity: 8,
+	units: 0,
 	running: 0,
 	up: true,
 	draining: false,
@@ -135,5 +137,14 @@ describe('cells', () => {
 		// A feature the pool does not list yet goes last.
 		expect(builderFeatures(['new', 'kvm'], pool)).toEqual(['kvm', 'new']);
 		expect(builderFeatures(['b', 'a'], undefined)).toEqual(['a', 'b']);
+	});
+});
+
+describe('unitsText', () => {
+	it('shows builds and units only where the scheduler counts other units than builds', () => {
+		expect(unitsText({ running: 6, maxJobs: 8, units: 6, capacity: 8 })).toBeNull();
+		expect(unitsText({ running: 6, maxJobs: 8, units: 12, capacity: 16 })).toBe(
+			'builds 6/8 · units 12/16'
+		);
 	});
 });

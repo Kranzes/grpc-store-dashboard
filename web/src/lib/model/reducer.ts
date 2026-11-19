@@ -202,6 +202,8 @@ type DrvRec = {
 	worker: string;
 	/** DrvState.assign_id of the current or last assignment, 0 when none. */
 	assignId: number;
+	/** DrvState.weight: the units of its builder's capacity it takes. 1 when not sent. */
+	weight: number;
 	/**
 	 * Assigned only, as the builder last reported them (DrvState fields 17
 	 * to 19). '' and 0 until then. Builder clock, which the page treats as
@@ -283,6 +285,8 @@ type WorkerRec = {
 	/** Systems and features as one key: builders with the same offer can take the same drvs. */
 	offer: string;
 	maxJobs: number;
+	/** WorkerState.capacity: the units of the scheduler's slot accounting it offers. null when not sent. */
+	capacity: number | null;
 	up: boolean;
 	draining: boolean;
 	/** Set while draining. */
@@ -327,6 +331,9 @@ type WorkerRec = {
 /** Up, not draining and with slots: what the scheduler places work on, unless it rests the builder. */
 const takesWork = (w: Pick<WorkerRec, 'up' | 'draining' | 'restsUntil' | 'maxJobs'>) =>
 	w.up && !w.draining && !w.restsUntil && w.maxJobs > 0;
+
+/** The units a builder offers in the scheduler's slot accounting: its max_jobs when not sent. */
+const capacityOf = (w: Pick<WorkerRec, 'capacity' | 'maxJobs'>) => w.capacity ?? w.maxJobs;
 
 /**
  * Why a connected builder takes no new work, as the page shows it: its own
@@ -443,11 +450,11 @@ type PoolAcc = {
 	memUsed: number;
 	memTotal: number;
 	loadBuilders: number;
-	/** Builders taking work by max_jobs, and the slots assigned on them. */
-	workingJobs: Map<number, number>;
-	workingRunning: number;
-	/** Connected builders by max_jobs, for builderSlots while none takes work. */
-	connectedJobs: Map<number, number>;
+	/** Builders taking work by capacity, and the units their builds take of it. */
+	workingCapacity: Map<number, number>;
+	workingUnits: number;
+	/** Connected builders by capacity, for builderSlots while none takes work. */
+	connectedCapacity: Map<number, number>;
 	idle: number;
 	idleSince: number;
 	idleBefore: boolean;
@@ -489,6 +496,9 @@ type SysCount = {
 	features: readonly string[];
 	queued: number;
 	unplaceable: number;
+	/** The same in units: the weights of those drvs. */
+	queuedUnits: number;
+	unplaceableUnits: number;
 };
 
 const EMPTY_IDS: readonly number[] = Object.freeze([]);
@@ -650,6 +660,7 @@ function newDrv(path: string): DrvRec {
 		errorSent: false,
 		worker: '',
 		assignId: 0,
+		weight: 1,
 		buildPhase: '',
 		buildPhaseStartedMs: 0,
 		buildStartedMs: 0,
@@ -713,6 +724,8 @@ export class FarmReducer {
 	readonly #queued = new Set<string>();
 	/** Assigned drvs per worker addr. */
 	readonly #byWorker = new Map<string, Set<DrvRec>>();
+	/** The units those take of each worker's capacity: the sum of their weights. */
+	readonly #unitsByWorker = new Map<string, number>();
 	readonly #sys = new Map<string, SysCount>();
 	#nQueued = 0;
 	/** The queue size once a second, oldest first, for queuedPerMin. */
@@ -978,6 +991,7 @@ export class FarmReducer {
 		this.#drvs.clear();
 		this.#queued.clear();
 		this.#byWorker.clear();
+		this.#unitsByWorker.clear();
 		this.#sys.clear();
 		this.#placement = new Map();
 		this.#idleDirty.clear();
@@ -1119,6 +1133,7 @@ export class FarmReducer {
 				features,
 				offer: offerKey(systems, features),
 				maxJobs: w.maxJobs,
+				capacity: w.capacity ?? null,
 				up: w.up,
 				draining: w.draining,
 				drainReason: drainReasonOf(w),
@@ -1156,6 +1171,7 @@ export class FarmReducer {
 		rec.systems = systems;
 		rec.features = features;
 		rec.maxJobs = w.maxJobs;
+		rec.capacity = w.capacity ?? null;
 		if (w.up) rec.goneAt = rec.seenGoneAt = 0;
 		else if (rec.up) {
 			rec.goneAt = now;
@@ -1376,6 +1392,7 @@ export class FarmReducer {
 			let s = this.#byWorker.get(worker);
 			if (!s) this.#byWorker.set(worker, (s = new Set()));
 			s.add(rec);
+			this.#unitsByWorker.set(worker, (this.#unitsByWorker.get(worker) ?? 0) + rec.weight);
 			this.#idleDirty.add(worker);
 			this.#nAssigned++;
 			return;
@@ -1387,12 +1404,21 @@ export class FarmReducer {
 		this.#nQueued++;
 		let sc = this.#sys.get(rec.sysKey);
 		if (!sc) {
-			sc = { system: sys, features: sorted, queued: 0, unplaceable: 0 };
+			sc = {
+				system: sys,
+				features: sorted,
+				queued: 0,
+				unplaceable: 0,
+				queuedUnits: 0,
+				unplaceableUnits: 0
+			};
 			this.#sys.set(rec.sysKey, sc);
 		}
 		sc.queued++;
+		sc.queuedUnits += rec.weight;
 		if (phase === 'unplaceable') {
 			sc.unplaceable++;
+			sc.unplaceableUnits += rec.weight;
 			this.#nUnplaceable++;
 		}
 	}
@@ -1404,6 +1430,9 @@ export class FarmReducer {
 				s.delete(rec);
 				if (s.size === 0) this.#byWorker.delete(rec.worker);
 			}
+			const units = (this.#unitsByWorker.get(rec.worker) ?? 0) - rec.weight;
+			if (units > 0 && this.#byWorker.has(rec.worker)) this.#unitsByWorker.set(rec.worker, units);
+			else this.#unitsByWorker.delete(rec.worker);
 			this.#idleDirty.add(rec.worker);
 			this.#nAssigned--;
 			return;
@@ -1413,7 +1442,11 @@ export class FarmReducer {
 		const sc = this.#sys.get(rec.sysKey);
 		if (sc) {
 			sc.queued--;
-			if (rec.phase === 'unplaceable') sc.unplaceable--;
+			sc.queuedUnits -= rec.weight;
+			if (rec.phase === 'unplaceable') {
+				sc.unplaceable--;
+				sc.unplaceableUnits -= rec.weight;
+			}
 		}
 		if (rec.phase === 'unplaceable') this.#nUnplaceable--;
 	}
@@ -1434,8 +1467,10 @@ export class FarmReducer {
 			return;
 		}
 		let oldIds = EMPTY_IDS;
+		const weight = ds.weight ?? 1;
 		if (!rec) {
 			rec = newDrv(ds.drvPath);
+			rec.weight = weight;
 			this.#drvs.set(rec.path, rec);
 			this.#indexAdd(rec, phase, worker, ds.system, ds.features);
 		} else {
@@ -1444,9 +1479,12 @@ export class FarmReducer {
 				rec.phase !== phase ||
 				rec.worker !== worker ||
 				rec.system !== ds.system ||
+				rec.weight !== weight ||
 				!sameStrings(rec.features, ds.features)
 			) {
+				// Out of the counts with the weight it went in with.
 				this.#indexRemove(rec);
+				rec.weight = weight;
 				this.#indexAdd(rec, phase, worker, ds.system, ds.features);
 			}
 		}
@@ -2159,6 +2197,8 @@ export class FarmReducer {
 				systems: w.systems,
 				features: w.features,
 				maxJobs: w.maxJobs,
+				capacity: capacityOf(w),
+				units: this.#unitsByWorker.get(addr) ?? 0,
 				running,
 				up: w.up,
 				draining: w.draining || (w.up && w.restsUntil > 0),
@@ -2219,9 +2259,9 @@ export class FarmReducer {
 					memUsed: 0,
 					memTotal: 0,
 					loadBuilders: 0,
-					workingJobs: new Map(),
-					workingRunning: 0,
-					connectedJobs: new Map(),
+					workingCapacity: new Map(),
+					workingUnits: 0,
+					connectedCapacity: new Map(),
 					idle: 0,
 					idleSince: 0,
 					idleBefore: false,
@@ -2255,12 +2295,13 @@ export class FarmReducer {
 				p.memUsed += w.memUsed ?? 0;
 				p.memTotal += w.memTotal ?? 0;
 			}
-			if (w.up && w.maxJobs > 0)
-				p.connectedJobs.set(w.maxJobs, (p.connectedJobs.get(w.maxJobs) ?? 0) + 1);
+			const capacity = capacityOf(w);
+			if (w.up && capacity > 0)
+				p.connectedCapacity.set(capacity, (p.connectedCapacity.get(capacity) ?? 0) + 1);
 			if (takesWork(w)) {
-				p.workingJobs.set(w.maxJobs, (p.workingJobs.get(w.maxJobs) ?? 0) + 1);
-				// As the scheduler counts them: at most its slots.
-				p.workingRunning += Math.min(running, w.maxJobs);
+				p.workingCapacity.set(capacity, (p.workingCapacity.get(capacity) ?? 0) + 1);
+				// As the scheduler counts them: at most its capacity.
+				p.workingUnits += Math.min(this.#unitsByWorker.get(addr) ?? 0, capacity);
 			}
 			if (w.idleSince) {
 				p.idle++;
@@ -2303,11 +2344,13 @@ export class FarmReducer {
 		for (const [system, p] of acc) {
 			// Each queue key once, however many builders of the pool could take it.
 			let queuedCanTake = 0;
+			let queuedUnits = 0;
 			for (const sc of this.#sys.values()) {
 				if (sc.queued <= sc.unplaceable) continue;
 				for (const { w } of p.offers.values()) {
 					if (offers(w.systems, w.features, sc.system, sc.features)) {
 						queuedCanTake += sc.queued - sc.unplaceable;
+						queuedUnits += sc.queuedUnits - sc.unplaceableUnits;
 						break;
 					}
 				}
@@ -2318,9 +2361,12 @@ export class FarmReducer {
 			const churn = this.#churn.get(system);
 			// The scheduler's count where it has one.
 			const pl = this.#placement.get(system);
-			const occupied = pl && pl.slots > 0 ? pl.slots - pl.free : p.workingRunning;
-			const builderSlots = medianOf(p.workingJobs.size > 0 ? p.workingJobs : p.connectedJobs);
-			const needed = builderSlots > 0 ? Math.ceil((occupied + queuedCanTake) / builderSlots) : null;
+			const occupied = pl && pl.slots > 0 ? pl.slots - pl.free : p.workingUnits;
+			const builderSlots = medianOf(
+				p.workingCapacity.size > 0 ? p.workingCapacity : p.connectedCapacity
+			);
+			// All in the scheduler's units: capacity per builder, weight per build.
+			const needed = builderSlots > 0 ? Math.ceil((occupied + queuedUnits) / builderSlots) : null;
 			// The minutes, then a point for now: the slots at the last Stats and the load the builders report.
 			const history: readonly PoolPoint[] =
 				statsAt === null || minutes.get(system)?.at(-1)?.t === statsAt

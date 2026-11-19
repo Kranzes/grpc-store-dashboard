@@ -31,6 +31,8 @@ const worker = (addr: string, system = 'x86_64-linux'): WorkerView => ({
 	systems: [system],
 	features: [],
 	maxJobs: 4,
+	capacity: 4,
+	units: 0,
 	running: 1,
 	up: true,
 	draining: false,

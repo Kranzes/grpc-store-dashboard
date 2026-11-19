@@ -12,6 +12,8 @@ const BUILDER: WorkerView = {
 	systems: ['x86_64-linux'],
 	features: [],
 	maxJobs: 8,
+	capacity: 8,
+	units: 0,
 	running: 6,
 	up: true,
 	draining: false,

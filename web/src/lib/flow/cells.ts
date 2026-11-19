@@ -99,3 +99,15 @@ export function featureSummary(features: PoolView['features'], builders: number,
 	if (sorted.length > keep) shown.push(`+${sorted.length - keep}`);
 	return shown.join(' · ');
 }
+
+/**
+ * A card's slots when the scheduler counts its capacity in other units than
+ * its max_jobs: "builds 6/8 · units 12/16". null when they are the same, as
+ * for a scheduler that counts in builds.
+ */
+export function unitsText(
+	w: Pick<WorkerView, 'running' | 'maxJobs' | 'units' | 'capacity'>
+): string | null {
+	if (w.capacity === w.maxJobs) return null;
+	return `builds ${w.running}/${w.maxJobs} · units ${w.units}/${w.capacity}`;
+}

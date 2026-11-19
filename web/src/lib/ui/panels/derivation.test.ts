@@ -151,6 +151,8 @@ describe('failure reasons', () => {
 		systems: ['x86_64-linux'],
 		features: [],
 		maxJobs: 4,
+		capacity: 4,
+		units: 0,
 		running: 0,
 		up: true,
 		draining: false,
