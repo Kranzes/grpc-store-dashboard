@@ -1,7 +1,7 @@
 From 3d53aaddb89634d2ba43f00449b8381193863807 Mon Sep 17 00:00:00 2001
 From: Ilan Joselevich <personal@ilanjoselevich.com>
 Date: Tue, 10 Nov 2026 19:27:59 +0100
-Subject: [PATCH 11/14] scheduler: keep recent builds and serve them as
+Subject: [PATCH 11/15] scheduler: keep recent builds and serve them as
  Events.RecentBuilds
 
 A watcher knows only what finished since it connected. A reload, a

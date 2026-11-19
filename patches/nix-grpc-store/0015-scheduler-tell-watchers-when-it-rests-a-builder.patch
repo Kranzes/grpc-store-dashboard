@@ -1,0 +1,158 @@
+From 858670451fac185e7bcbde3ba868afbbc4133f44 Mon Sep 17 00:00:00 2001
+From: Ilan Joselevich <personal@ilanjoselevich.com>
+Date: Thu, 19 Nov 2026 08:36:06 +0100
+Subject: [PATCH 15/15] scheduler: tell watchers when it rests a builder
+
+A builder that gives back builds for failures of its own more than twice
+since it last finished one gets no new builds for a while: 30 s, twice
+as long for each further give-back, up to 10 minutes. Watchers cannot
+see this. To them the builder is up and takes work, so a dashboard
+counts it as idle capacity, and its slots go missing from the free
+slots in Stats with no reason given.
+
+WorkerState gains rests_until_ms, set while the builder rests. The
+scheduler sends a WorkerState when a rest starts and when one ends.
+
+events-test covers both.
+---
+ proto/events.proto              |  6 +++++
+ src/daemon/dispatcher-events.cc |  3 +++
+ src/daemon/dispatcher.cc        | 15 +++++++++++
+ tests/events-test.cc            | 46 +++++++++++++++++++++++++++++++++
+ 4 files changed, 70 insertions(+)
+
+diff --git a/proto/events.proto b/proto/events.proto
+index 7289047..915d1f8 100644
+--- a/proto/events.proto
++++ b/proto/events.proto
+@@ -206,6 +206,12 @@ message WorkerState {
+   optional uint32 cpu_cores = 14;
+   optional uint64 mem_used_bytes = 15;
+   optional uint64 mem_total_bytes = 16;
++  // While the scheduler rests the builder: when the rest ends, Unix ms. A
++  // builder that gave back builds for failures of its own more than twice
++  // since it last finished one gets no new builds for 30 s, twice as long
++  // for each further give-back, up to 10 minutes. Its builds in progress go
++  // on. Unset while it is not resting, and from older schedulers.
++  optional uint64 rests_until_ms = 17;
+ }
+ 
+ message SubstituterTraffic {
+diff --git a/src/daemon/dispatcher-events.cc b/src/daemon/dispatcher-events.cc
+index 596b596..28a1562 100644
+--- a/src/daemon/dispatcher-events.cc
++++ b/src/daemon/dispatcher-events.cc
+@@ -392,6 +392,9 @@ auto Dispatcher::workerEventLocked(sched::WorkerId wid) const -> WatchEvent
+     out.set_max_jobs(static_cast<uint32_t>(wkr.maxJobs));
+     out.set_up(wkr.up);
+     out.set_draining(wkr.draining);
++    if (wkr.restsUntilMs) {
++        out.set_rests_until_ms(wallMs(*wkr.restsUntilMs));
++    }
+     if (wid >= workerInfo.size()) {
+         return event;
+     }
+diff --git a/src/daemon/dispatcher.cc b/src/daemon/dispatcher.cc
+index e0a2a22..4073dc6 100644
+--- a/src/daemon/dispatcher.cc
++++ b/src/daemon/dispatcher.cc
+@@ -119,10 +119,24 @@ void Dispatcher::tick()
+ void Dispatcher::tickLocked()
+ {
+     revokeOrphans();
++    // Watchers hear of each rest that ends.
++    std::vector<sched::WorkerId> resting;
++    if (core.resting() > 0 && !eventWatchers.empty()) {
++        for (size_t wid = 0; wid < core.workerCount(); wid++) {
++            if (core.worker(static_cast<sched::WorkerId>(wid)).restsUntilMs) {
++                resting.push_back(static_cast<sched::WorkerId>(wid));
++            }
++        }
++    }
+     if (core.wake(nowMs())) {
+         membershipChangedLocked();
+         dispatchLocked();
+         metrics.schedRested(core.resting());
++        for (auto const wid : resting) {
++            if (!core.worker(wid).restsUntilMs) {
++                workerChangedLocked(wid);
++            }
++        }
+     }
+     sampleLocked();
+     // Before Stats, so its totals match the WorkerStates before it.
+@@ -943,6 +957,7 @@ void Dispatcher::onDone(sched::WorkerId wid, const nix::remote::Done & done)
+                      {"reason", "failing"},
+                      {"seconds", std::to_string(static_cast<uint64_t>(*rest / msPerSecond))}});
+                 membershipChangedLocked();
++                workerChangedLocked(wid);
+             }
+         }
+         metrics.event("given_back_" + nix::remote::Done::Reason_Name(done.reason()));
+diff --git a/tests/events-test.cc b/tests/events-test.cc
+index afe50ab..81c8d50 100644
+--- a/tests/events-test.cc
++++ b/tests/events-test.cc
+@@ -1768,6 +1768,51 @@ void testPoolSamples()
+     assert(x86pool.mem_used_bytes() == 3000 && x86pool.mem_total_bytes() == 8000);
+ }
+ 
++// A builder the scheduler rests says until when, and says so again when the
++// rest ends.
++void testRest()
++{
++    double now = 0;
++    Metrics metrics("");
++    Dispatcher disp(
++        {.defaultSystem = std::string(x86), .lookupThreads = 0, .nowMs = [&] -> double { return now; }}, metrics);
++    Session wkr;
++    sendOne(disp, wkr.worker, helloMsg("w1", 1));
++    auto const client = disp.connectClient([](const rpc::SchedMsg &) -> bool { return true; }, [] -> void {}, "ci");
++    rpc::ClientMsgs wants;
++    wants.add_msgs()->mutable_want()->set_drv_path("a.drv");
++    disp.clientMsgs(client, wants);
++    Sink sink;
++    auto const watcher = disp.watch(sink.send(), sink.end());
++    assert(watcher);
++    sink.take();
++    auto const lastState = [&] -> std::optional<rpc::WorkerState> {
++        std::optional<rpc::WorkerState> state;
++        for (const auto & event : sink.take()) {
++            state = event.has_worker() ? std::optional(event.worker()) : state;
++        }
++        return state;
++    };
++    // Two give-backs for its own failures are tolerated; the third rests it.
++    for (int round = 1; round <= 3; round++) {
++        rpc::WorkerMsg msg;
++        auto * done = msg.mutable_done();
++        done->set_drv_path("a.drv");
++        done->set_assign_id(wkr.assignId("a.drv"));
++        done->set_outcome(rpc::Done::GIVEN_BACK);
++        done->set_reason(rpc::Done::TRANSIENT_FAILURE);
++        sendOne(disp, wkr.worker, msg);
++        auto const state = lastState();
++        assert(round < 3 ? !state || !state->has_rests_until_ms() : state && state->has_rests_until_ms());
++    }
++    assert(snapshot(disp).workers.at("w1").has_rests_until_ms());
++    now = 30e3;
++    disp.tick();
++    auto const woke = lastState();
++    assert(woke && !woke->has_rests_until_ms() && woke->up());
++    disp.unwatch(*watcher);
++}
++
+ void testRandom()
+ {
+     for (unsigned seed = 1; seed <= 8; seed++) {
+@@ -2119,6 +2164,7 @@ try {
+     testReports();
+     testLoad();
+     testPoolSamples();
++    testRest();
+     testProgress();
+     testRecentBuilds();
+     testRecentBuildsTies();
+-- 
+2.56.0
+

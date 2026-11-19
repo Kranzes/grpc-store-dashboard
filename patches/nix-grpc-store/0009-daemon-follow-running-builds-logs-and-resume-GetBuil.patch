@@ -1,7 +1,7 @@
 From 9ab2138d2aed1e911ef87938b1423eb09f7feda5 Mon Sep 17 00:00:00 2001
 From: Ilan Joselevich <personal@ilanjoselevich.com>
 Date: Tue, 10 Nov 2026 19:27:05 +0100
-Subject: [PATCH 09/14] daemon: follow running builds' logs and resume
+Subject: [PATCH 09/15] daemon: follow running builds' logs and resume
  GetBuildLog at an offset
 
 GetBuildLog answered only with the file Nix kept after a build, from its

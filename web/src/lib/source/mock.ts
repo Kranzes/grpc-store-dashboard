@@ -282,6 +282,13 @@ const MEM_PER_SLOT = 8 * GiB;
 /** What the host's own processes take with no build. */
 const BASE_BUSY = 0.3;
 const BASE_MEM = 2 * GiB;
+/**
+ * Mean time between the scheduler's rests of one builder, ms at speed 1, and
+ * how long each lasts. The scheduler rests a builder that failed to run
+ * builds in a row: 30 s, twice as long each time it goes on.
+ */
+const REST_MEAN_MS = 3 * 3_600_000;
+const REST_MS = [30_000, 60_000, 120_000] as const;
 /** Builders resend their load after this long, or when it moved by LOAD_STEP. */
 const LOAD_EVERY_MS = 30_000;
 const LOAD_STEP = 0.05;
@@ -515,6 +522,8 @@ type Worker = {
 	reportsLoad: boolean;
 	/** The load it last reported in this session, null before its first report. */
 	load: HostReading | null;
+	/** While the scheduler rests it: when the rest ends. 0 otherwise. */
+	restsUntil: number;
 	/** Its substituters: the farm cache, then the upstream ones. */
 	substituters: string[];
 	/** What it took from each, since the scheduler started serving. */
@@ -753,6 +762,8 @@ export class MockFarm {
 	 * generator, so a seed keeps its outcomes whatever these options are.
 	 */
 	readonly #rng2: Rng;
+	/** Rests only, so they leave the other draws as they were. */
+	readonly #rngRest: Rng;
 	readonly #timers = new Heap<Timer>((a, b) => a.at < b.at || (a.at === b.at && a.n < b.n));
 	#timerN = 0;
 	#seq = 0n;
@@ -801,6 +812,7 @@ export class MockFarm {
 		this.options = options;
 		this.#rng = new Rng(options.seed);
 		this.#rng2 = new Rng(options.seed ^ 0x51ed);
+		this.#rngRest = new Rng(options.seed ^ 0x7e57);
 		this.instance = this.#rng.hash().slice(0, 16);
 		const warmup = WARMUP_MS;
 		this.now = startMs - warmup;
@@ -1142,6 +1154,7 @@ export class MockFarm {
 			this.#index(w);
 			// Not during the warm-up, so the first snapshot has every builder.
 			this.#scheduleMaintenance(w, WARMUP_MS);
+			this.#scheduleRest(w, WARMUP_MS);
 			this.#scheduleInterruption(w);
 		});
 		this.#nextWorker = this.#plan.length;
@@ -1174,6 +1187,7 @@ export class MockFarm {
 			lastReportMs: -Infinity,
 			reportsLoad: !sys.endsWith('-darwin') && unit(addr) >= 1 / 12,
 			load: null,
+			restsUntil: 0,
 			substituters: [],
 			subs: new Map(),
 			reportedSubs: new Map()
@@ -1353,6 +1367,7 @@ export class MockFarm {
 		this.#placeability();
 		this.#fill(w);
 		this.#scheduleMaintenance(w);
+		this.#scheduleRest(w);
 		this.#scheduleInterruption(w);
 	}
 
@@ -1462,6 +1477,7 @@ export class MockFarm {
 							? WorkerState_DrainReason.LOCAL_DAEMON
 							: WorkerState_DrainReason.UNSPECIFIED,
 			version: 'mock',
+			...(w.up && w.restsUntil ? { restsUntilMs: BigInt(Math.round(w.restsUntil)) } : {}),
 			...(w.up && w.load
 				? loadToProto({
 						cpuBusy: w.load.busy,
@@ -1488,7 +1504,31 @@ export class MockFarm {
 	}
 
 	#takesWork(w: Worker) {
-		return w.up && !w.draining && w.maxJobs > 0;
+		return w.up && !w.draining && !w.restsUntil && w.maxJobs > 0;
+	}
+
+	/**
+	 * The builder's next rest: the scheduler sends it nothing for a while.
+	 * Its builds keep running, and what it offers stays placeable.
+	 */
+	#scheduleRest(w: Worker, after = 0) {
+		this.#after(after + this.#rngRest.exp(REST_MEAN_MS) / this.options.speed, () => {
+			if (w.retiring) return;
+			if (!this.#takesWork(w)) {
+				this.#scheduleRest(w);
+				return;
+			}
+			const ms = REST_MS[Math.floor(this.#rngRest.next() * REST_MS.length)];
+			w.restsUntil = this.now + ms / this.options.speed;
+			this.#emit({ case: 'worker', value: this.#workerMsg(w) });
+			this.#later(ms, () => {
+				if (!w.restsUntil) return;
+				w.restsUntil = 0;
+				this.#emit({ case: 'worker', value: this.#workerMsg(w) });
+				this.#fill(w);
+				this.#scheduleRest(w);
+			});
+		});
 	}
 
 	#offers(w: Worker, system: string, features: readonly string[]) {
@@ -1573,6 +1613,8 @@ export class MockFarm {
 	 */
 	#disconnect(w: Worker) {
 		w.up = false;
+		// The scheduler forgets a rest when the builder goes.
+		w.restsUntil = 0;
 		w.draining = false;
 		w.drainReason = null;
 		const ran = [...w.running];

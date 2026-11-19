@@ -37,6 +37,7 @@ const worker = (addr: string, system = 'x86_64-linux'): WorkerView => ({
 	retired: false,
 	goneAt: null,
 	drainReason: null,
+	restingUntil: null,
 	diskFree: null,
 	diskTotal: null,
 	minFree: 0,

@@ -315,6 +315,8 @@ type WorkerRec = {
 	 * how long it has been offline is then unknown.
 	 */
 	seenGoneAt: number;
+	/** While the scheduler rests it: when the rest ends, scheduler clock. 0 otherwise. */
+	restsUntil: number;
 	/** Browser clock when it last went idle: taking work, nothing assigned. 0 while not idle. */
 	idleSince: number;
 	/** It was idle when the stream's snapshot showed it, so idleSince is a bound only. */
@@ -322,8 +324,19 @@ type WorkerRec = {
 };
 
 /** Up, not draining and with slots: what the scheduler places work on, unless it rests the builder. */
-const takesWork = (w: Pick<WorkerRec, 'up' | 'draining' | 'maxJobs'>) =>
-	w.up && !w.draining && w.maxJobs > 0;
+const takesWork = (w: Pick<WorkerRec, 'up' | 'draining' | 'restsUntil' | 'maxJobs'>) =>
+	w.up && !w.draining && !w.restsUntil && w.maxJobs > 0;
+
+/**
+ * Why a connected builder takes no new work, as the page shows it: its own
+ * drain first, then the scheduler's rest. null while it takes work.
+ */
+function drainOf(
+	w: Pick<WorkerRec, 'draining' | 'drainReason' | 'restsUntil'>
+): DrainReason | null {
+	if (w.draining) return w.drainReason ?? 'unknown';
+	return w.restsUntil ? 'resting' : null;
+}
 
 /** Line histories: an hour in 30 s buckets, Float32 to halve their size. */
 const LINE_HISTORY = { windowMs: 3_600_000, buckets: 120, compact: true };
@@ -419,6 +432,7 @@ type PoolAcc = {
 	drainingStopping: number;
 	drainingLocalDaemon: number;
 	drainingPublishUnavailable: number;
+	drainingResting: number;
 	offline: number;
 	running: number;
 	slots: number;
@@ -988,6 +1002,7 @@ export class FarmReducer {
 				w.up = false;
 				w.draining = false;
 				w.drainReason = null;
+				w.restsUntil = 0;
 				w.idleSince = 0;
 			}
 			this.#workersDirty = true;
@@ -1105,6 +1120,7 @@ export class FarmReducer {
 				up: w.up,
 				draining: w.draining,
 				drainReason: drainReasonOf(w),
+				restsUntil: Number(w.restsUntilMs ?? 0n),
 				diskFree: bytesOrNull(w.diskFreeBytes),
 				diskTotal: bytesOrNull(w.diskTotalBytes),
 				minFree: Number(w.minFreeBytes),
@@ -1152,6 +1168,7 @@ export class FarmReducer {
 		rec.up = w.up;
 		rec.draining = w.draining;
 		rec.drainReason = drainReasonOf(w);
+		rec.restsUntil = Number(w.restsUntilMs ?? 0n);
 		this.#idleDirty.add(w.addr);
 		// A builder keeps its last report while it is down.
 		if (w.diskFreeBytes !== undefined) rec.diskFree = Number(w.diskFreeBytes);
@@ -1740,7 +1757,7 @@ export class FarmReducer {
 			if (!o) offered.set(w.offer, (o = { w, running: 0, slots: 0, free: 0 }));
 			const running = this.#byWorker.get(w.addr)?.size ?? 0;
 			o.running += running;
-			if (w.draining || w.maxJobs <= 0) continue;
+			if (!takesWork(w)) continue;
 			o.slots += w.maxJobs;
 			o.free += Math.max(0, w.maxJobs - running);
 		}
@@ -2142,10 +2159,11 @@ export class FarmReducer {
 				maxJobs: w.maxJobs,
 				running,
 				up: w.up,
-				draining: w.draining,
+				draining: w.draining || (w.up && w.restsUntil > 0),
 				retired: w.retired,
 				goneAt: !w.up && w.seenGoneAt ? w.seenGoneAt : null,
-				drainReason: w.up ? w.drainReason : null,
+				drainReason: w.up ? drainOf(w) : null,
+				restingUntil: w.up && w.restsUntil ? w.restsUntil + this.#offset : null,
 				diskFree: w.diskFree,
 				diskTotal: w.diskTotal,
 				minFree: w.minFree,
@@ -2188,6 +2206,7 @@ export class FarmReducer {
 					drainingStopping: 0,
 					drainingLocalDaemon: 0,
 					drainingPublishUnavailable: 0,
+					drainingResting: 0,
 					offline: 0,
 					running: 0,
 					slots: 0,
@@ -2212,13 +2231,15 @@ export class FarmReducer {
 				acc.set(pool, p);
 			}
 			p.builders++;
+			const drain = w.up ? drainOf(w) : null;
 			if (!w.up) p.offline++;
-			else if (w.draining) {
+			else if (drain !== null) {
 				p.draining++;
-				if (w.drainReason === 'low-disk') p.drainingLowDisk++;
-				else if (w.drainReason === 'stopping') p.drainingStopping++;
-				else if (w.drainReason === 'local-daemon') p.drainingLocalDaemon++;
-				else if (w.drainReason === 'publish-unavailable') p.drainingPublishUnavailable++;
+				if (drain === 'low-disk') p.drainingLowDisk++;
+				else if (drain === 'stopping') p.drainingStopping++;
+				else if (drain === 'local-daemon') p.drainingLocalDaemon++;
+				else if (drain === 'publish-unavailable') p.drainingPublishUnavailable++;
+				else if (drain === 'resting') p.drainingResting++;
 			} else p.up++;
 			if (w.up) p.slots += w.maxJobs;
 			p.running += running;
@@ -2312,6 +2333,7 @@ export class FarmReducer {
 				drainingStopping: p.drainingStopping,
 				drainingLocalDaemon: p.drainingLocalDaemon,
 				drainingPublishUnavailable: p.drainingPublishUnavailable,
+				drainingResting: p.drainingResting,
 				offline: p.offline,
 				running: p.running,
 				slots: p.slots,

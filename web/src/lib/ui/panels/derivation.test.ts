@@ -157,6 +157,7 @@ describe('failure reasons', () => {
 		retired: false,
 		goneAt: null,
 		drainReason: null,
+		restingUntil: null,
 		diskFree: null,
 		diskTotal: null,
 		minFree: 0,

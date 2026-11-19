@@ -165,12 +165,16 @@ export function hasUpstream(t: Pick<Topology, 'upstreamWorkers'>): boolean {
 /** Upstream substituters the card lists before "+N more". */
 export const UPSTREAM_CARD_ROWS = 8;
 
-/** Why a builder drains. 'unknown': it does not say. */
+/**
+ * Why a builder takes no new work. 'resting': the scheduler rests it after
+ * it failed to run builds. 'unknown': it does not say.
+ */
 export type DrainReason =
 	| 'stopping'
 	| 'low-disk'
 	| 'local-daemon'
 	| 'publish-unavailable'
+	| 'resting'
 	| 'unknown';
 
 export type WorkerView = Readonly<{
@@ -182,6 +186,7 @@ export type WorkerView = Readonly<{
 	/** Assigned slots in use. The scheduler cannot tell assigned from building. */
 	running: number;
 	up: boolean;
+	/** Takes no new work while connected: it drains, or the scheduler rests it. */
 	draining: boolean;
 	/**
 	 * Disconnected while draining, unless for low disk: taken out on purpose,
@@ -197,6 +202,8 @@ export type WorkerView = Readonly<{
 	goneAt: number | null;
 	/** null unless draining. */
 	drainReason: DrainReason | null;
+	/** While the scheduler rests it: when the rest ends, browser clock. */
+	restingUntil: number | null;
 	/** Bytes of the store's file system, as last reported. null: never reported. */
 	diskFree: number | null;
 	diskTotal: number | null;
@@ -276,11 +283,12 @@ export type PoolView = Readonly<{
 	up: number;
 	/** Connected and draining. */
 	draining: number;
-	/** Of those, the ones low on disk, stopping, with no nix-daemon, and failing to publish. */
+	/** Of those, the ones low on disk, stopping, with no nix-daemon, failing to publish and resting. */
 	drainingLowDisk: number;
 	drainingStopping: number;
 	drainingLocalDaemon: number;
 	drainingPublishUnavailable: number;
+	drainingResting: number;
 	/** Disconnected without draining first, still shown for WORKER_LINGER_MS. */
 	offline: number;
 	/**

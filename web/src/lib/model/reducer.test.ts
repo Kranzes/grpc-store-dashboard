@@ -1620,6 +1620,57 @@ describe('pool history', () => {
 	});
 });
 
+describe('resting builders', () => {
+	it('shows a builder the scheduler rests as draining, and leaves it out of taking work', () => {
+		const until = T0 + 30_000;
+		const { r, s } = started(
+			{},
+			E.reset(),
+			E.worker('a', { maxJobs: 8 }),
+			E.worker('b', { maxJobs: 4, restsUntilMs: BigInt(until) })
+		);
+		let v = r.views(T0, 15);
+		expect(v.workers.get('b')).toMatchObject({
+			up: true,
+			draining: true,
+			drainReason: 'resting',
+			restingUntil: until
+		});
+		expect(v.pools.get('x86_64-linux')).toMatchObject({
+			up: 1,
+			draining: 1,
+			drainingResting: 1,
+			idle: 1,
+			builderSlots: 8
+		});
+		expect(v.scheduler).toMatchObject({ slots: 8 });
+		// The rest ends: it takes work again, idle from then.
+		r.apply(s.next(E.worker('b', { maxJobs: 4 })), until);
+		v = r.views(until, 15);
+		expect(v.workers.get('b')).toMatchObject({
+			draining: false,
+			drainReason: null,
+			restingUntil: null
+		});
+		expect(v.pools.get('x86_64-linux')).toMatchObject({
+			up: 2,
+			drainingResting: 0,
+			idle: 2,
+			builderSlots: 6
+		});
+		// Resting is a fault, not a scale-in: a resting builder that goes away stays, as offline.
+		r.apply(s.next(E.worker('b', { maxJobs: 4, restsUntilMs: BigInt(T0 + 90_000) })), until + 1000);
+		r.apply(s.next(E.worker('b', { up: false })), until + 2000);
+		v = r.views(until + 2000, 15);
+		expect(v.workers.get('b')).toMatchObject({
+			retired: false,
+			drainReason: null,
+			restingUntil: null
+		});
+		expect(v.pools.get('x86_64-linux')).toMatchObject({ offline: 1, drainingResting: 0 });
+	});
+});
+
 describe('idle builders', () => {
 	it('counts builders taking work with nothing assigned, and since when the page saw them idle', () => {
 		const A1 = drvPath('on-a');

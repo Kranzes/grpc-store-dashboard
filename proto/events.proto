@@ -206,6 +206,12 @@ message WorkerState {
   optional uint32 cpu_cores = 14;
   optional uint64 mem_used_bytes = 15;
   optional uint64 mem_total_bytes = 16;
+  // While the scheduler rests the builder: when the rest ends, Unix ms. A
+  // builder that gave back builds for failures of its own more than twice
+  // since it last finished one gets no new builds for 30 s, twice as long
+  // for each further give-back, up to 10 minutes. Its builds in progress go
+  // on. Unset while it is not resting, and from older schedulers.
+  optional uint64 rests_until_ms = 17;
 }
 
 message SubstituterTraffic {

@@ -1,7 +1,7 @@
 From 9c0e4377b70688ce8d427b182c5572bcc34e89a0 Mon Sep 17 00:00:00 2001
 From: Ilan Joselevich <personal@ilanjoselevich.com>
 Date: Tue, 10 Nov 2026 19:22:56 +0100
-Subject: [PATCH 06/14] scheduler: count what happens, send totals once a
+Subject: [PATCH 06/15] scheduler: count what happens, send totals once a
  second, end expired streams
 
 A dashboard shows totals and rates: builds per minute, the cache hit

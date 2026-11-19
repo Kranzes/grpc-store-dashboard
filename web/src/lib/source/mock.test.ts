@@ -270,6 +270,27 @@ describe('MockFarm', () => {
 		}
 	);
 
+	it('rests a builder now and then, and assigns it nothing until the rest ends', () => {
+		const farm = new MockFarm(mockOptions({ builders: 60, seed: 4 }), T0);
+		farm.snapshot();
+		const resting = new Map<string, number>();
+		let rests = 0;
+		for (let t = T0 + 1000; t <= T0 + 30 * 60_000; t += 1000) {
+			for (const e of farm.advance(t)) {
+				if (e.event.case === 'worker') {
+					const w = e.event.value;
+					if (w.restsUntilMs !== undefined) {
+						if (!resting.has(w.addr)) rests++;
+						resting.set(w.addr, Number(w.restsUntilMs));
+					} else resting.delete(w.addr);
+				} else if (e.event.case === 'drv' && e.event.value.cause === DrvState_Cause.ASSIGNED) {
+					expect(resting.has(e.event.value.workerAddr)).toBe(false);
+				}
+			}
+		}
+		expect(rests).toBeGreaterThan(0);
+	});
+
 	it(
 		'holds back only Graviton metal from maintenance while nothing covers it',
 		{ timeout: 60_000 },
