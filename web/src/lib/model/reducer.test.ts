@@ -121,6 +121,10 @@ describe('snapshot', () => {
 		});
 		expect(v.clientGroups.get('oidc:sso:alice')).toMatchObject({ clients: 1, waiting: 2 });
 
+		// An anonymous caller's identity is "-".
+		const { r: anon } = started({}, E.reset(), E.client(3, '-'));
+		expect(anon.views(T0, 15).clientGroups.get('-')).toMatchObject({ label: 'Anonymous' });
+
 		expect(v.scheduler).toMatchObject({
 			queued: 2,
 			unplaceable: 1,

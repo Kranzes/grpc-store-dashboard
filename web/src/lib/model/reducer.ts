@@ -57,6 +57,7 @@ import {
 	compareNatural,
 	drvName,
 	edgeId,
+	groupName,
 	parseEdgeId,
 	parseNodeId,
 	poolNodeId,
@@ -2179,7 +2180,7 @@ export class FarmReducer {
 			}
 			return {
 				id,
-				label: 'other clients',
+				label: groupName(id).text,
 				clients,
 				waiting: this.#otherWaits().size,
 				wantsPerSec: round3(wants)
@@ -2188,7 +2189,7 @@ export class FarmReducer {
 		const g = this.#groups.get(id);
 		return {
 			id,
-			label: id || 'unknown client',
+			label: groupName(id).text,
 			clients: g ? Math.max(0, g.clients) : 0,
 			waiting: g ? g.waits.size : 0,
 			wantsPerSec: g ? round3(g.wants.rate(now)) : 0

@@ -4,10 +4,10 @@
 
 import {
 	CACHE_ID,
-	OTHER_CLIENTS,
 	SCHEDULER_ID,
 	UPSTREAM_ID,
 	clientGroupNodeId,
+	groupName as nameOfGroup,
 	parseNodeId,
 	poolNodeId,
 	workerNodeId,
@@ -145,8 +145,8 @@ const BUNDLE_WORD: Record<LineKind, string> = {
 const CACHE_HITS_ENDS = 'scheduler to cache';
 
 function groupName(group: string, names: LineNames): TitlePart {
-	if (group === OTHER_CLIENTS) return { text: 'other clients', mono: false };
-	return { text: names.groupLabel?.(group) ?? (group || 'unknown client'), mono: true };
+	const name = nameOfGroup(group);
+	return { text: names.groupLabel?.(group) ?? name.text, mono: name.mono };
 }
 
 /** The varying end of a line. `the`: "the x86_64-linux pool" in a sentence. */

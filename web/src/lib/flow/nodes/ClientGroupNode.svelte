@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { Handle, Position, type NodeProps } from '@xyflow/svelte';
-	import { OTHER_CLIENTS } from '#lib/model/types.ts';
+	import { OTHER_CLIENTS, groupName } from '#lib/model/types.ts';
 	import { formatCount, formatPerMinute } from '#lib/ui/format.ts';
 	import { getFlowContext, nodeButton } from '../context.ts';
 	import { lineId } from '../kinds.ts';
@@ -11,14 +11,16 @@
 	const ctx = getFlowContext();
 
 	const g = $derived(ctx.store.clientGroups.get(data.ref));
-	const label = $derived(g?.label ?? (data.ref === OTHER_CLIENTS ? 'other clients' : data.ref));
+	const name = $derived(groupName(data.ref));
+	const label = $derived(g?.label ?? name.text);
 	const other = $derived(data.ref === OTHER_CLIENTS);
+	const mono = $derived(name.mono);
 </script>
 
 <Handle type="source" position={Position.Right} id="out" class="farm-handle" />
 <button type="button" class="farm-node clients" class:other {...nodeButton(ctx, id)}>
 	<span class="row">
-		<span class="title" class:mono={!other} title={label}>{label}</span>
+		<span class="title" class:mono title={label}>{label}</span>
 		<FailBadge line={lineId('request', data.ref)} />
 	</span>
 	<span class="row nums">

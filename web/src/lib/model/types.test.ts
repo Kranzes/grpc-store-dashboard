@@ -1,11 +1,15 @@
 import { describe, expect, it } from 'vitest';
 import {
 	CACHE_ID,
+	OTHER_CLIENTS,
 	SCHEDULER_ID,
 	UPSTREAM_ID,
 	clientGroupNodeId,
 	drvName,
 	failShare,
+	groupName,
+	identityLabel,
+	identityMono,
 	parseEdgeId,
 	parseNodeId,
 	poolNodeId,
@@ -18,6 +22,22 @@ describe('drvName', () => {
 		expect(drvName(`${'a'.repeat(32)}-hello-2.12.1.drv`)).toBe('hello-2.12.1');
 		expect(drvName(`/nix/store/${'b'.repeat(32)}-x.drv`)).toBe('x');
 		expect(drvName('short-name.drv')).toBe('short-name');
+	});
+});
+
+describe('identityLabel', () => {
+	it('calls an anonymous caller Anonymous, in the sans face', () => {
+		expect(identityLabel('-')).toBe('Anonymous');
+		expect(identityMono('-')).toBe(false);
+		expect(identityLabel('oidc:sso:alice')).toBe('oidc:sso:alice');
+		expect(identityMono('oidc:sso:alice')).toBe(true);
+	});
+
+	it('names the groups that are not one identity in words', () => {
+		expect(groupName(OTHER_CLIENTS)).toEqual({ text: 'other clients', mono: false });
+		expect(groupName('')).toEqual({ text: 'unknown client', mono: false });
+		expect(groupName('-')).toEqual({ text: 'Anonymous', mono: false });
+		expect(groupName('ci-runner-1')).toEqual({ text: 'ci-runner-1', mono: true });
 	});
 });
 

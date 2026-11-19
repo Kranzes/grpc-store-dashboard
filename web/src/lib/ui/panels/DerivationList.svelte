@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
 	import { basePath } from '#lib/farm/farm.ts';
-	import type { DrvView } from '#lib/model/types.ts';
+	import { identityLabel, type DrvView } from '#lib/model/types.ts';
 	import Icon from '../Icon.svelte';
 	import { drvLogParams, hereUrl, logsHref } from '../nav.ts';
 	import { clock } from '../clock.svelte.ts';
@@ -70,7 +70,11 @@
 		}
 		if (context === 'queue' && d.reason) parts.push(d.reason);
 		if (context !== 'clients' && d.identities.length > 0) {
-			parts.push(d.identities.length === 1 ? d.identities[0] : `${d.identities.length} identities`);
+			parts.push(
+				d.identities.length === 1
+					? identityLabel(d.identities[0])
+					: `${d.identities.length} identities`
+			);
 		}
 		const n = note?.(d);
 		if (n) parts.unshift(n);

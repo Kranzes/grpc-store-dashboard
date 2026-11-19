@@ -15,7 +15,12 @@
 
 <script lang="ts">
 	import { assignedText, durationMs } from '#lib/model/builds.ts';
-	import { OTHER_CLIENTS, type BuildRow, type BuildsView } from '#lib/model/types.ts';
+	import {
+		OTHER_CLIENTS,
+		identityLabel,
+		type BuildRow,
+		type BuildsView
+	} from '#lib/model/types.ts';
 	import { clock } from '../clock.svelte.ts';
 	import { formatClockMinutes, formatExact, windowShort } from '../format.ts';
 	import { Hold } from '../hold.svelte.ts';
@@ -129,7 +134,7 @@
 		}
 		if (r.state === 'assigned') return `${assignedText(r)} · ${r.worker}`;
 		const parts = [r.system, r.worker];
-		if (r.requestedBy.length) parts.push(r.requestedBy[0]);
+		if (r.requestedBy.length) parts.push(identityLabel(r.requestedBy[0]));
 		return parts.filter(Boolean).join(' · ');
 	}
 
@@ -231,7 +236,7 @@
 				onchange={(e) => set({ client: (e.currentTarget as HTMLSelectElement).value || null })}
 			>
 				<option value="">Anyone</option>
-				{#each view.facets.clients as c (c)}<option value={c}>{c}</option>{/each}
+				{#each view.facets.clients as c (c)}<option value={c}>{identityLabel(c)}</option>{/each}
 				{#if groups.length}<option value={OTHER_CLIENTS}>Other clients</option>{/if}
 			</select>
 			<select

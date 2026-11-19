@@ -99,6 +99,26 @@ export const edgeId = (kind: FlowKind, endpoint: string) => `${kind}:${endpoint}
 /** Client group id for identities beyond the shown ones. */
 export const OTHER_CLIENTS = '__other';
 
+/** ClientState.identity of an anonymous caller. */
+export const ANONYMOUS = '-';
+
+/** An identity as the page shows it: "Anonymous" for an anonymous caller. */
+export function identityLabel(identity: string): string {
+	return identity === ANONYMOUS ? 'Anonymous' : identity;
+}
+
+/** Identities use the mono face. "Anonymous" is a word, not a name. */
+export function identityMono(identity: string): boolean {
+	return identity !== ANONYMOUS;
+}
+
+/** A client group's name on the map and in the panels, and whether it is an identity in the mono face. */
+export function groupName(group: string): { text: string; mono: boolean } {
+	if (group === OTHER_CLIENTS) return { text: 'other clients', mono: false };
+	if (group === '') return { text: 'unknown client', mono: false };
+	return { text: identityLabel(group), mono: identityMono(group) };
+}
+
 /** How long a disconnected builder stays in the topology. */
 export const WORKER_LINGER_MS = 10 * 60_000;
 

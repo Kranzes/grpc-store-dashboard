@@ -72,6 +72,7 @@ describe('lineTitle', () => {
 		expect(text('request', ['want:g3'])).toBe('Requests from ci-runner-3');
 		expect(text('request', [`want:${OTHER_CLIENTS}`])).toBe('Requests from other clients');
 		expect(text('request', ['want:'])).toBe('Requests from unknown client');
+		expect(text('request', ['want:-'])).toBe('Requests from Anonymous');
 		expect(text('hit', ['cached:scheduler'])).toBe('Cache hits, scheduler to cache');
 
 		const builders = (kind: string, n: number) =>
@@ -117,6 +118,13 @@ describe('lineTitle', () => {
 		]);
 		expect(lineTitle('request', [`want:${OTHER_CLIENTS}`], names).parts).toEqual([
 			{ text: 'Requests from other clients', mono: false }
+		]);
+		// "Anonymous" is a word, not an identity.
+		expect(lineTitle('request', ['want:-'], names).parts).toEqual([
+			{ text: 'Requests from Anonymous', mono: false }
+		]);
+		expect(lineTitle('request', ['want:'], names).parts).toEqual([
+			{ text: 'Requests from unknown client', mono: false }
 		]);
 	});
 });

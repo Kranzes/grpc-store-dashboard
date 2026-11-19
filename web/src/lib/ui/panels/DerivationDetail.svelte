@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { workerNodeId, type FarmStore } from '#lib/model/types.ts';
+	import { identityLabel, identityMono, workerNodeId, type FarmStore } from '#lib/model/types.ts';
 	import { clock } from '../clock.svelte.ts';
 	import { Copier } from '../copy.svelte.ts';
 	import {
@@ -236,7 +236,9 @@
 			<p class="p-caption">{noClientCaption(tracked)}</p>
 		{:else}
 			<ul class="p-chips">
-				{#each d.identities as id (id)}<li>{id}</li>{/each}
+				{#each d.identities as id (id)}<li class:word={!identityMono(id)}>
+						{identityLabel(id)}
+					</li>{/each}
 			</ul>
 			<p class="p-caption num">{streamsCaption(d.clientIds.length, tracked)}</p>
 		{/if}
@@ -325,6 +327,11 @@
 {/snippet}
 
 <style>
+	/* "Anonymous" is a word, not an identity. */
+	.p-chips li.word {
+		font-family: var(--font-sans);
+	}
+
 	.phase {
 		display: flex;
 		align-items: center;

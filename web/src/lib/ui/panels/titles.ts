@@ -7,7 +7,7 @@ import {
 	type LineNames,
 	type LineTitle
 } from '#lib/flow/lines.ts';
-import { OTHER_CLIENTS, drvName, parseNodeId, type NodeRef } from '#lib/model/types.ts';
+import { OTHER_CLIENTS, drvName, groupName, parseNodeId, type NodeRef } from '#lib/model/types.ts';
 import type { PanelView } from '../stack.ts';
 
 /** What the panel needs to name builders and client groups. */
@@ -29,7 +29,9 @@ export function nodeTitle(id: string, names: PanelNames): string {
 		case 'pool':
 			return t.system;
 		case 'clients':
-			return t.group === OTHER_CLIENTS ? 'Other clients' : (names.groupLabel(t.group) ?? t.group);
+			return t.group === OTHER_CLIENTS
+				? 'Other clients'
+				: (names.groupLabel(t.group) ?? groupName(t.group).text);
 	}
 }
 
@@ -39,7 +41,7 @@ export function nodeMono(id: string): boolean {
 	return (
 		t?.kind === 'builder' ||
 		t?.kind === 'pool' ||
-		(t?.kind === 'clients' && t.group !== OTHER_CLIENTS)
+		(t?.kind === 'clients' && groupName(t.group).mono)
 	);
 }
 

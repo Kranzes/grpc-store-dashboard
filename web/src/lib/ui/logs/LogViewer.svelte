@@ -6,7 +6,7 @@
 	import type { Group } from '#lib/logs/groups.ts';
 	import type { GroupView } from '#lib/logs/protocol.ts';
 	import { outcomePhase } from '#lib/model/reducer.ts';
-	import type { BuildRow, BuildStatus } from '#lib/model/types.ts';
+	import { identityLabel, type BuildRow, type BuildStatus } from '#lib/model/types.ts';
 	import type { LogBackend } from '#lib/source/types.ts';
 	import { clock } from '../clock.svelte.ts';
 	import { Copier } from '../copy.svelte.ts';
@@ -453,7 +453,7 @@
 		const plain = (t: string) => parts.push({ text: t, words: t });
 		if (b.system) plain(b.system);
 		if (b.worker) plain(`on ${b.worker}`);
-		if (b.requestedBy.length) plain(`requested by ${b.requestedBy.join(', ')}`);
+		if (b.requestedBy.length) plain(`requested by ${b.requestedBy.map(identityLabel).join(', ')}`);
 		if (b.assignedMs !== null) plain(`assigned ${formatClock(b.assignedMs)}`);
 		if (b.startedMs !== null) plain(`started ${formatClock(b.startedMs)}`);
 		// When it ended: "failed 10:42:16 AM", "finished 10:42:16 AM".
