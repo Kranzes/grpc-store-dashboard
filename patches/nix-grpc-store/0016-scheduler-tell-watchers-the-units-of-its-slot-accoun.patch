@@ -1,0 +1,185 @@
+From da37c5abf4ef04fed0ac552b3f2b07afbbef0b24 Mon Sep 17 00:00:00 2001
+From: Ilan Joselevich <personal@ilanjoselevich.com>
+Date: Thu, 19 Nov 2026 09:58:08 +0100
+Subject: [PATCH 16/16] scheduler: tell watchers the units of its slot
+ accounting
+
+Stats.systems gives slots and free in the scheduler's own units, but
+nothing says what one unit is. A watcher that works out how many
+builders a queue needs takes a builder for max_jobs units and a build
+for one. That holds for this scheduler, and fails for one that gives a
+builder fewer units than max_jobs or charges a build several, as by the
+cores it reserves.
+
+WorkerState gains capacity, the units a builder offers while it takes
+work, and DrvState gains weight, the units a derivation takes once
+placed. Stats.systems says it counts slots and free in the same units.
+This scheduler counts in builds, so it sends max_jobs and 1, set
+explicitly, so that watchers can tell equal weights from a scheduler
+that sends neither. They go out with every WorkerState and DrvState.
+
+events-test checks that a system's slots in Stats are the capacity of
+its builders that take work.
+---
+ proto/events.proto              | 13 +++++++
+ src/daemon/dispatcher-events.cc |  6 +++
+ tests/events-test.cc            | 67 +++++++++++++++++++++++++++++++++
+ 3 files changed, 86 insertions(+)
+
+diff --git a/proto/events.proto b/proto/events.proto
+index 87fb692..719697d 100644
+--- a/proto/events.proto
++++ b/proto/events.proto
+@@ -213,6 +213,11 @@ message WorkerState {
+   // for each further give-back, up to 10 minutes. Its builds in progress go
+   // on. Unset while it is not resting, and from older schedulers.
+   optional uint64 rests_until_ms = 18;
++  // The units of the scheduler's slot accounting this builder offers while
++  // it takes work, the units Stats.systems slots and free count. This
++  // scheduler counts in builds, so it is max_jobs. Unset from older
++  // schedulers, which count the same way.
++  optional uint32 capacity = 19;
+ }
+ 
+ message SubstituterTraffic {
+@@ -323,6 +328,11 @@ message DrvState {
+   string build_phase = 17;
+   uint64 build_started_ms = 18;
+   uint64 build_phase_started_ms = 19;
++  // The units of its builder's capacity this derivation takes once placed,
++  // as Stats.systems slots and free count them. This scheduler counts in
++  // builds, so it is 1. Unset from older schedulers, which count the same
++  // way.
++  optional uint32 weight = 20;
+ }
+ 
+ message InputSource {
+@@ -466,6 +476,9 @@ message SystemStats {
+   uint32 unplaceable = 4;
+   // Keyed by what workers offer (their native system).
+   uint32 running = 5;
++  // In the units of the scheduler's slot accounting: the capacity of the
++  // workers that take work (WorkerState.capacity), and what the weights of
++  // their builds leave of it (DrvState.weight).
+   uint32 slots = 6;
+   uint32 free = 7;
+ }
+diff --git a/src/daemon/dispatcher-events.cc b/src/daemon/dispatcher-events.cc
+index dd7f08e..b811ae8 100644
+--- a/src/daemon/dispatcher-events.cc
++++ b/src/daemon/dispatcher-events.cc
+@@ -42,6 +42,10 @@ namespace {
+ 
+ // One sample a minute, and one older than an hour so "last 60 minutes" is whole.
+ constexpr size_t historyLen = 61;
++// Core counts slots in builds, as Core::stats() shows: a worker offers
++// max_jobs of them and a build takes one. Watchers get these units with each
++// WorkerState and DrvState, so they can count as Stats does.
++constexpr uint32_t buildWeight = 1;
+ 
+ auto giveBackReason(const Done & done) -> std::string
+ {
+@@ -340,6 +344,7 @@ auto Dispatcher::drvEventLocked(const sched::Entry & ent, DrvState::Cause cause,
+     auto & out = *event.mutable_drv();
+     out.set_drv_path(ent.drvPath);
+     out.set_cause(cause);
++    out.set_weight(buildWeight);
+     out.set_system(ent.system);
+     for (const auto & feat : ent.features) {
+         out.add_features(feat);
+@@ -392,6 +397,7 @@ auto Dispatcher::workerEventLocked(sched::WorkerId wid) const -> WatchEvent
+         out.add_features(feat);
+     }
+     out.set_max_jobs(static_cast<uint32_t>(wkr.maxJobs));
++    out.set_capacity(static_cast<uint32_t>(std::max(0, wkr.maxJobs)));
+     out.set_up(wkr.up);
+     out.set_draining(wkr.draining);
+     if (wkr.restsUntilMs) {
+diff --git a/tests/events-test.cc b/tests/events-test.cc
+index f6eacd0..1c265ff 100644
+--- a/tests/events-test.cc
++++ b/tests/events-test.cc
+@@ -1815,6 +1815,72 @@ void testRest()
+     disp.unwatch(*watcher);
+ }
+ 
++// Stats counts slots in the units WorkerState.capacity and DrvState.weight
++// give: a system's slots are the capacity of its builders that take work.
++void testUnits()
++{
++    double now = 0;
++    Metrics metrics("");
++    Dispatcher disp(
++        {.defaultSystem = std::string(x86), .lookupThreads = 0, .nowMs = [&] -> double { return now; }}, metrics);
++    Session one;
++    Session two;
++    Session drained;
++    Session arm;
++    sendOne(disp, one.worker, helloMsg("w1", 2));
++    sendOne(disp, two.worker, helloMsg("w2", 4));
++    sendOne(disp, drained.worker, helloMsg("w3", 8));
++    rpc::WorkerMsg drain;
++    drain.mutable_load()->set_draining(true);
++    sendOne(disp, drained.worker, drain);
++    auto aarch = helloMsg("a1", 3);
++    aarch.mutable_hello()->clear_systems();
++    aarch.mutable_hello()->add_systems("aarch64-linux");
++    sendOne(disp, arm.worker, aarch);
++    auto const client = disp.connectClient([](const rpc::SchedMsg &) -> bool { return true; }, [] -> void {}, "ci");
++    rpc::ClientMsgs wants;
++    wants.add_msgs()->mutable_want()->set_drv_path("a.drv");
++    wants.add_msgs()->mutable_want()->set_drv_path("b.drv");
++    wants.mutable_msgs()->rbegin()->mutable_want()->set_system("riscv64-linux");
++    disp.clientMsgs(client, wants);
++
++    Sink sink;
++    auto const watcher = disp.watch(sink.send(), sink.end());
++    assert(watcher);
++    now += 1000;
++    disp.tick();
++    std::map<std::string, rpc::WorkerState> workers;
++    std::map<std::string, rpc::DrvState> drvs;
++    std::optional<rpc::Stats> stats;
++    for (const auto & event : sink.take()) {
++        if (event.has_worker()) {
++            workers[event.worker().addr()] = event.worker();
++        } else if (event.has_drv()) {
++            drvs[event.drv().drv_path()] = event.drv();
++        } else if (event.has_stats()) {
++            stats = event.stats();
++        }
++    }
++    disp.unwatch(*watcher);
++    assert(stats && workers.size() == 4 && drvs.size() == 2);
++    for (const auto & [path, drv] : drvs) {
++        assert(drv.has_weight() && drv.weight() == 1);
++    }
++    std::map<std::string, uint64_t> capacity;
++    for (const auto & [addr, wkr] : workers) {
++        assert(wkr.has_capacity() && wkr.capacity() == wkr.max_jobs());
++        if (wkr.up() && !wkr.draining()) {
++            capacity[wkr.systems(0)] += wkr.capacity();
++        }
++    }
++    std::map<std::string, uint64_t> slots;
++    for (const auto & sys : stats->systems()) {
++        slots[sys.system()] += sys.slots();
++    }
++    assert(capacity.at(std::string(x86)) == 6 && slots.at(std::string(x86)) == 6);
++    assert(capacity.at("aarch64-linux") == 3 && slots.at("aarch64-linux") == 3);
++}
++
+ void testRandom()
+ {
+     for (unsigned seed = 1; seed <= 8; seed++) {
+@@ -2167,6 +2233,7 @@ try {
+     testLoad();
+     testPoolSamples();
+     testRest();
++    testUnits();
+     testProgress();
+     testRecentBuilds();
+     testRecentBuildsTies();
+-- 
+2.56.0
+

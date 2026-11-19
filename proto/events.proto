@@ -213,6 +213,11 @@ message WorkerState {
   // for each further give-back, up to 10 minutes. Its builds in progress go
   // on. Unset while it is not resting, and from older schedulers.
   optional uint64 rests_until_ms = 18;
+  // The units of the scheduler's slot accounting this builder offers while
+  // it takes work, the units Stats.systems slots and free count. This
+  // scheduler counts in builds, so it is max_jobs. Unset from older
+  // schedulers, which count the same way.
+  optional uint32 capacity = 19;
 }
 
 message SubstituterTraffic {
@@ -323,6 +328,11 @@ message DrvState {
   string build_phase = 17;
   uint64 build_started_ms = 18;
   uint64 build_phase_started_ms = 19;
+  // The units of its builder's capacity this derivation takes once placed,
+  // as Stats.systems slots and free count them. This scheduler counts in
+  // builds, so it is 1. Unset from older schedulers, which count the same
+  // way.
+  optional uint32 weight = 20;
 }
 
 message InputSource {
@@ -466,6 +476,9 @@ message SystemStats {
   uint32 unplaceable = 4;
   // Keyed by what workers offer (their native system).
   uint32 running = 5;
+  // In the units of the scheduler's slot accounting: the capacity of the
+  // workers that take work (WorkerState.capacity), and what the weights of
+  // their builds leave of it (DrvState.weight).
   uint32 slots = 6;
   uint32 free = 7;
 }

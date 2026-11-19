@@ -1,7 +1,7 @@
 From 5b8c85b43a5662f22e4192fef162b7adc20bf2b8 Mon Sep 17 00:00:00 2001
 From: Ilan Joselevich <personal@ilanjoselevich.com>
 Date: Tue, 10 Nov 2026 19:18:42 +0100
-Subject: [PATCH 07/15] daemon: add a watch command that prints the scheduler's
+Subject: [PATCH 07/16] daemon: add a watch command that prints the scheduler's
  events
 
 The event stream should have a client in this repository, to try it on
