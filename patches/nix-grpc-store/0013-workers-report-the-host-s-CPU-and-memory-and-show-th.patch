@@ -1,0 +1,813 @@
+From 21bc01d394012ad0e4e9f899a95bf5a466cfb097 Mon Sep 17 00:00:00 2001
+From: Ilan Joselevich <personal@ilanjoselevich.com>
+Date: Thu, 19 Nov 2026 06:34:31 +0100
+Subject: [PATCH 13/13] workers: report the host's CPU and memory, and show
+ them to watchers
+
+Slot use says how full a builder's slots are, not how busy its machine
+is. A pool whose slots look 60 to 90% full while its CPUs sit at 30%
+looks healthy, and nothing on the stream says otherwise.
+
+Builders read /proc/stat and /proc/meminfo once a second. Busy CPUs are
+the share of jiffies since the last read that were neither idle nor
+iowait, times the online CPUs, in thousandths of a CPU. Memory in use is
+MemTotal minus MemAvailable. Both are host-wide, so any other process on
+the host counts too. WorkerReport carries them in a session's first
+report, then when busy moved by at least 5% of the CPUs, memory in use
+by 5% of the total, or 30 s passed since they last went out. Like the
+rest of the report, they go only to a scheduler that asked with
+ReportsWanted. Hosts without /proc, such as macOS, send none.
+
+The scheduler keeps a builder's last values, with busy capped at its
+CPUs and memory in use at its total. WorkerState gains
+cpu_busy_millicores, cpu_cores, mem_used_bytes and mem_total_bytes. They
+go out with the report-driven WorkerStates, at most once a second per
+builder. Hello clears them until the session's first report, so a
+builder that sends none shows none.
+
+substituter-tally-test covers the parsing, the sampler, the real /proc
+files and when reports carry the load. events-test covers what watchers
+get.
+---
+ proto/events.proto              |  10 ++
+ proto/nix_remote.proto          |  12 +++
+ src/daemon/builder.cc           |   6 ++
+ src/daemon/builder.hh           |   3 +
+ src/daemon/coordinator.cc       |   3 +
+ src/daemon/coordinator.hh       |   2 +
+ src/daemon/dispatcher-events.cc |  22 ++++-
+ src/daemon/dispatcher.cc        |   1 +
+ src/daemon/dispatcher.hh        |   4 +
+ src/daemon/host-load.hh         | 166 ++++++++++++++++++++++++++++++++
+ src/daemon/scheduler-link.hh    |  63 +++++++++++-
+ tests/events-test.cc            |  48 +++++++++
+ tests/substituter-tally-test.cc | 136 +++++++++++++++++++++++++-
+ 13 files changed, 469 insertions(+), 7 deletions(-)
+ create mode 100644 src/daemon/host-load.hh
+
+diff --git a/proto/events.proto b/proto/events.proto
+index 32c2df2..3645190 100644
+--- a/proto/events.proto
++++ b/proto/events.proto
+@@ -196,6 +196,16 @@ message WorkerState {
+   // from the change between two events. Kept while the builder is down and
+   // across its reconnects.
+   repeated SubstituterTraffic substituters = 12;
++  // The builder's host as its last WorkerReport said: CPUs busy over about
++  // a second, in thousandths of a CPU, and its online CPUs; memory in use
++  // and in all. Host-wide, so every process on the host counts, not only
++  // the builder's builds. Unset: the builder does not report them, as
++  // older builders and hosts without /proc do. Hello clears them until the
++  // session's first report.
++  optional uint64 cpu_busy_millicores = 13;
++  optional uint32 cpu_cores = 14;
++  optional uint64 mem_used_bytes = 15;
++  optional uint64 mem_total_bytes = 16;
+ }
+ 
+ message SubstituterTraffic {
+diff --git a/proto/nix_remote.proto b/proto/nix_remote.proto
+index d6544c8..8db4c5d 100644
+--- a/proto/nix_remote.proto
++++ b/proto/nix_remote.proto
+@@ -421,6 +421,18 @@ message WorkerReport {
+   // every running build in the first report of a session. A build that ends
+   // needs no entry: its Done tells the scheduler.
+   repeated BuildProgress builds = 4;
++  // The host's load. It is host-wide, so every process on the host counts,
++  // not only this builder's builds. Busy CPUs are the share of /proc/stat
++  // jiffies since the builder's previous sample, about a second earlier,
++  // that were neither idle nor iowait, times the online CPUs, in
++  // thousandths of a CPU. Memory in use is MemTotal minus MemAvailable from
++  // /proc/meminfo. Set in the first report of a session, then when busy
++  // moved by at least 5% of cpu_cores, memory in use by 5% of the total, or
++  // 30 s passed since they last went out. Hosts without /proc send none.
++  optional uint64 cpu_busy_millicores = 5;
++  optional uint32 cpu_cores = 6;
++  optional uint64 mem_used_bytes = 7;
++  optional uint64 mem_total_bytes = 8;
+ }
+ 
+ // What a builder knows about one running build that the scheduler does not.
+diff --git a/src/daemon/builder.cc b/src/daemon/builder.cc
+index bde20a0..5b7f800 100644
+--- a/src/daemon/builder.cc
++++ b/src/daemon/builder.cc
+@@ -14,6 +14,7 @@
+ #include <utility>
+ #include <vector>
+ 
++#include "host-load.hh"
+ #include "logfmt.hh"
+ #include "metrics.hh"
+ #include "nix_remote.pb.h"
+@@ -400,6 +401,11 @@ void Builder::setDisk(uint64_t free, uint64_t total)
+     link.setDisk(free, total);
+ }
+ 
++void Builder::setLoad(const HostLoad & load)
++{
++    link.setLoad(load);
++}
++
+ void Builder::tick()
+ {
+     const auto now = config.now();
+diff --git a/src/daemon/builder.hh b/src/daemon/builder.hh
+index 6d44644..d4ec215 100644
+--- a/src/daemon/builder.hh
++++ b/src/daemon/builder.hh
+@@ -23,6 +23,7 @@
+ #include <nix/util/sync.hh>
+ 
+ #include "build-report.hh"
++#include "host-load.hh"
+ #include "log-spill.hh"
+ #include "metrics.hh"
+ #include "nix_remote.pb.h"
+@@ -221,6 +222,8 @@ public:
+     void tick();
+     // The store's file system, from the serve loop.
+     void setDisk(uint64_t free, uint64_t total);
++    // The host's CPU and memory, from the serve loop.
++    void setLoad(const HostLoad & load);
+     // SchedCmd.reports_wanted on the current session.
+     void reportsWanted();
+ 
+diff --git a/src/daemon/coordinator.cc b/src/daemon/coordinator.cc
+index 6d51c45..dc12ec5 100644
+--- a/src/daemon/coordinator.cc
++++ b/src/daemon/coordinator.cc
+@@ -356,6 +356,9 @@ void Coordinator::tick()
+     if (stat) {
+         builder->setDisk(free, static_cast<uint64_t>(vfs.f_blocks) * vfs.f_frsize);
+     }
++    if (auto const load = hostLoad.sample()) {
++        builder->setLoad(*load);
++    }
+     builder->tick();
+     if (options.minFree == 0 || !stat) {
+         return;
+diff --git a/src/daemon/coordinator.hh b/src/daemon/coordinator.hh
+index 101f5b1..cd13084 100644
+--- a/src/daemon/coordinator.hh
++++ b/src/daemon/coordinator.hh
+@@ -23,6 +23,7 @@
+ #include "eds.hh"
+ #include "elector.hh"
+ #include "events.hh"
++#include "host-load.hh"
+ #include "idle.hh"
+ #include "metrics.hh"
+ #include "nix_remote.grpc.pb.h"
+@@ -100,6 +101,7 @@ private:
+     std::optional<Elector> elector;
+     grpc::HealthCheckServiceInterface * health = nullptr;
+     std::atomic<bool> lastHealthy{true};
++    HostLoadSampler hostLoad; // the serve loop's only
+     void setSchedulerActive(bool active);
+     void runRemoteSession(Builder & bld, const std::stop_token & stop);
+     void askLocalDaemon(Builder & bld);
+diff --git a/src/daemon/dispatcher-events.cc b/src/daemon/dispatcher-events.cc
+index 25aab8a..c919ca5 100644
+--- a/src/daemon/dispatcher-events.cc
++++ b/src/daemon/dispatcher-events.cc
+@@ -25,6 +25,7 @@
+ 
+ #include "build-report.hh"
+ #include "events.pb.h"
++#include "host-load.hh"
+ #include "nix_remote.pb.h"
+ #include "scheduler.hh"
+ #include "substituter-url.hh"
+@@ -343,6 +344,12 @@ auto Dispatcher::workerEventLocked(sched::WorkerId wid) const -> WatchEvent
+     if (info.diskTotal) {
+         out.set_disk_total_bytes(*info.diskTotal);
+     }
++    if (info.load) {
++        out.set_cpu_busy_millicores(info.load->cpuBusyMillicores);
++        out.set_cpu_cores(info.load->cpuCores);
++        out.set_mem_used_bytes(info.load->memUsedBytes);
++        out.set_mem_total_bytes(info.load->memTotalBytes);
++    }
+     out.set_min_free_bytes(info.minFree);
+     // Configured ones in the builder's order, idle ones too, then the rest
+     // it reported, sorted by URL.
+@@ -628,6 +635,19 @@ void Dispatcher::onReport(sched::WorkerId wid, const nix::remote::WorkerReport &
+     if (report.has_disk_total_bytes()) {
+         info.diskTotal = report.disk_total_bytes();
+     }
++    // All four or none, as builders send them. Watchers get busy within the
++    // cores and used within the total.
++    bool const load = report.has_cpu_busy_millicores() && report.has_cpu_cores() && report.has_mem_used_bytes()
++        && report.has_mem_total_bytes();
++    if (load) {
++        constexpr uint64_t milli = 1000;
++        info.load = HostLoad{
++            .cpuBusyMillicores = std::min(report.cpu_busy_millicores(), uint64_t{report.cpu_cores()} * milli),
++            .cpuCores = report.cpu_cores(),
++            .memUsedBytes = std::min(report.mem_used_bytes(), report.mem_total_bytes()),
++            .memTotalBytes = report.mem_total_bytes(),
++        };
++    }
+     // Only the worker's own assignments. A phase name is short; a longer
+     // one is cut, then made valid UTF-8.
+     for (const auto & run : report.builds()) {
+@@ -636,7 +656,7 @@ void Dispatcher::onReport(sched::WorkerId wid, const nix::remote::WorkerReport &
+             progressed.insert(run.drv_path());
+         }
+     }
+-    if (report.substituters_size() == 0 && !report.has_disk_free_bytes() && !report.has_disk_total_bytes()) {
++    if (report.substituters_size() == 0 && !report.has_disk_free_bytes() && !report.has_disk_total_bytes() && !load) {
+         return; // builds only: the WorkerState did not change
+     }
+     if (!std::exchange(info.dirty, true)) {
+diff --git a/src/daemon/dispatcher.cc b/src/daemon/dispatcher.cc
+index eb008c5..e0a2a22 100644
+--- a/src/daemon/dispatcher.cc
++++ b/src/daemon/dispatcher.cc
+@@ -870,6 +870,7 @@ void Dispatcher::onHello(Worker & worker, const nix::remote::Hello & hel)
+     // Watchers show it: no control or bidi control characters.
+     info.version = cleanUtf8(cutAtChar(hel.version(), maxVersionLen));
+     info.minFree = hel.min_free_bytes();
++    info.load.reset();
+     info.substituters.clear();
+     for (const auto & url : hel.substituters()) {
+         auto reduced = reduceSubstituterUrl(url);
+diff --git a/src/daemon/dispatcher.hh b/src/daemon/dispatcher.hh
+index 9cd0086..9d3bf89 100644
+--- a/src/daemon/dispatcher.hh
++++ b/src/daemon/dispatcher.hh
+@@ -32,6 +32,7 @@
+ #include <prometheus/gauge.h>
+ 
+ #include "events.pb.h"
++#include "host-load.hh"
+ #include "logfmt.hh"
+ #include "metrics.hh"
+ #include "nix_remote.pb.h"
+@@ -224,6 +225,9 @@ private:
+         std::map<std::string, nix::remote::SubstituterTraffic> totals;
+         std::optional<uint64_t> diskFree;
+         std::optional<uint64_t> diskTotal;
++        // The host's load as the session's reports said. A new session
++        // starts without one: it may come from a builder that sends none.
++        std::optional<HostLoad> load;
+         bool dirty = false; // a report changed it since its last WorkerState
+     };
+     std::vector<WorkerInfo> workerInfo ABSL_GUARDED_BY(mutex);
+diff --git a/src/daemon/host-load.hh b/src/daemon/host-load.hh
+new file mode 100644
+index 0000000..f206304
+--- /dev/null
++++ b/src/daemon/host-load.hh
+@@ -0,0 +1,166 @@
++#pragma once
++// The host's CPU and memory as a builder reports them, read from /proc/stat
++// and /proc/meminfo. The figures are host-wide: every process on the host
++// counts, the builder's builds and anything else that runs there. A host
++// without those files, such as macOS, reports none.
++
++#include <algorithm>
++#include <cctype>
++#include <cmath>
++#include <cstdint>
++#include <optional>
++#include <sstream>
++#include <string>
++#include <string_view>
++#include <utility>
++
++#include <nix/util/error.hh>
++#include <nix/util/file-system.hh>
++
++namespace nixgrpc {
++
++// What a WorkerReport carries about the host.
++struct HostLoad
++{
++    uint64_t cpuBusyMillicores = 0; // CPUs busy since the last sample, in thousandths
++    uint32_t cpuCores = 0;          // online CPUs
++    uint64_t memUsedBytes = 0;      // MemTotal minus MemAvailable
++    uint64_t memTotalBytes = 0;
++};
++
++// Jiffies of all online CPUs together, from /proc/stat.
++struct CpuTimes
++{
++    uint64_t total = 0;
++    uint64_t idle = 0;  // idle and iowait
++    uint32_t cores = 0; // its cpuN lines: the online CPUs
++};
++
++// The "cpu" line adds up every online CPU: user nice system idle iowait irq
++// softirq steal, then guest and guest_nice, which user and nice already
++// include. nullopt when the line is missing or short.
++[[nodiscard]] inline auto parseProcStat(std::string_view text) -> std::optional<CpuTimes>
++{
++    constexpr int fields = 8;
++    constexpr int idleField = 3;
++    constexpr int iowaitField = 4;
++    std::optional<CpuTimes> out;
++    uint32_t cores = 0;
++    std::istringstream lines{std::string(text)};
++    for (std::string line; std::getline(lines, line);) {
++        if (!line.starts_with("cpu")) {
++            continue;
++        }
++        if (line.size() > 3 && std::isdigit(static_cast<unsigned char>(line.at(3))) != 0) {
++            cores++;
++            continue;
++        }
++        std::istringstream words(line.substr(3));
++        CpuTimes times;
++        int read = 0;
++        for (uint64_t val = 0; read < fields && words >> val; read++) {
++            times.total += val;
++            if (read == idleField || read == iowaitField) {
++                times.idle += val;
++            }
++        }
++        if (read == fields) {
++            out = times;
++        }
++    }
++    if (out) {
++        out->cores = cores;
++    }
++    return out;
++}
++
++// MemTotal and MemAvailable in bytes. nullopt without both.
++[[nodiscard]] inline auto parseMeminfo(std::string_view text) -> std::optional<std::pair<uint64_t, uint64_t>>
++{
++    constexpr uint64_t kib = 1024;
++    std::optional<uint64_t> total;
++    std::optional<uint64_t> available;
++    std::istringstream lines{std::string(text)};
++    for (std::string line; std::getline(lines, line);) {
++        std::istringstream words(line);
++        std::string key;
++        uint64_t val = 0;
++        if (!(words >> key >> val)) {
++            continue;
++        }
++        if (key == "MemTotal:") {
++            total = val * kib;
++        } else if (key == "MemAvailable:") {
++            available = val * kib;
++        }
++    }
++    if (!total || !available) {
++        return std::nullopt;
++    }
++    return std::pair{*total, std::min(*available, *total)};
++}
++
++// CPUs busy between two samples, in thousandths: the share of jiffies
++// neither idle nor iowait, times the online CPUs. nullopt when no time
++// passed or the counters went back.
++[[nodiscard]] inline auto busyMillicores(const CpuTimes & before, const CpuTimes & now) -> std::optional<uint64_t>
++{
++    if (now.total <= before.total) {
++        return std::nullopt;
++    }
++    auto const total = static_cast<double>(now.total - before.total);
++    // iowait can go back a little, so busy is clamped to the time that passed.
++    auto const busyBefore = static_cast<double>(before.total - std::min(before.idle, before.total));
++    auto const busyNow = static_cast<double>(now.total - std::min(now.idle, now.total));
++    auto const share = std::clamp((busyNow - busyBefore) / total, 0.0, 1.0);
++    constexpr double milli = 1000;
++    return static_cast<uint64_t>(std::llround(share * now.cores * milli));
++}
++
++// Samples the host once per call, from the serve loop.
++class HostLoadSampler
++{
++public:
++    explicit HostLoadSampler(std::string procDir = "/proc")
++        : procDir(std::move(procDir))
++    {
++    }
++
++    // The load since the last call. nullopt on the first call, and while a
++    // file cannot be read or parsed.
++    auto sample() -> std::optional<HostLoad>
++    {
++        auto const cpu = parseProcStat(read("stat"));
++        auto const mem = parseMeminfo(read("meminfo"));
++        auto const before = std::exchange(last, cpu);
++        if (!cpu || !mem || !before) {
++            return std::nullopt;
++        }
++        auto const busy = busyMillicores(*before, *cpu);
++        if (!busy) {
++            return std::nullopt;
++        }
++        return HostLoad{
++            .cpuBusyMillicores = *busy,
++            .cpuCores = cpu->cores,
++            .memUsedBytes = mem->first - mem->second,
++            .memTotalBytes = mem->first,
++        };
++    }
++
++private:
++    std::string procDir;
++    std::optional<CpuTimes> last;
++
++    // Empty where it cannot be read, which no parse accepts.
++    [[nodiscard]] auto read(std::string_view name) const -> std::string
++    {
++        try {
++            return nix::readFile(procDir + "/" + std::string(name));
++        } catch (nix::Error &) {
++            return {};
++        }
++    }
++};
++
++} // namespace nixgrpc
+diff --git a/src/daemon/scheduler-link.hh b/src/daemon/scheduler-link.hh
+index c5bb5e1..a43a438 100644
+--- a/src/daemon/scheduler-link.hh
++++ b/src/daemon/scheduler-link.hh
+@@ -10,7 +10,9 @@
+ //
+ // They also carry the running builds whose phase or start changed since the
+ // last report that went out, and every running build in the first report of
+-// a session, which a new scheduler needs.
++// a session, which a new scheduler needs. And the host's CPU and memory, in
++// a session's first report and when they moved or have not gone out for a
++// while.
+ 
+ #include <algorithm>
+ #include <chrono>
+@@ -26,6 +28,7 @@
+ 
+ #include <nix/util/sync.hh>
+ 
++#include "host-load.hh"
+ #include "nix_remote.pb.h"
+ #include "substituter-tally.hh"
+ 
+@@ -49,6 +52,10 @@ public:
+     static constexpr std::chrono::seconds minInterval{2};
+     static constexpr uint64_t minDiskStep = uint64_t{256} << 20U;
+     static constexpr uint64_t diskStepPercent = 5;
++    // The load goes out again when busy CPUs moved by this share of the
++    // cores, memory in use by this share of the total, or after loadEvery.
++    static constexpr uint64_t loadStepPercent = 5;
++    static constexpr std::chrono::seconds loadEvery{30};
+ 
+     // `tally` may be null: then reports carry disk only.
+     SchedulerLink(const SubstituterTally * tally, uint64_t minFree)
+@@ -87,10 +94,17 @@ public:
+         disk = Disk{.free = free, .total = total};
+     }
+ 
++    // The host's CPU and memory, once a second.
++    void setLoad(const HostLoad & now)
++    {
++        const std::scoped_lock lock(reportMutex);
++        load = now;
++    }
++
+     // From the serve loop: sends a report when one is due. The first goes
+     // out on the first tick after ReportsWanted, then one at most every
+-    // minInterval when traffic grew, free disk moved by a step or a build in
+-    // `running` changed.
++    // minInterval when traffic grew, free disk moved by a step, the load is
++    // due or a build in `running` changed.
+     void tick(Clock::time_point now = Clock::now(), const std::vector<RunningBuild> & running = {})
+     {
+         const std::scoped_lock lock(reportMutex);
+@@ -122,7 +136,8 @@ public:
+                 changed.push_back(&run);
+             }
+         }
+-        if (!first && !traffic && !step && changed.empty()) {
++        auto const withLoad = loadToSend(first, now);
++        if (!first && !traffic && !step && !withLoad && changed.empty()) {
+             return;
+         }
+         for (const auto * run : changed) {
+@@ -133,6 +148,12 @@ public:
+             report.set_disk_free_bytes(disk->free);
+             report.set_disk_total_bytes(disk->total);
+         }
++        if (withLoad) {
++            report.set_cpu_busy_millicores(withLoad->cpuBusyMillicores);
++            report.set_cpu_cores(withLoad->cpuCores);
++            report.set_mem_used_bytes(withLoad->memUsedBytes);
++            report.set_mem_total_bytes(withLoad->memTotalBytes);
++        }
+         if (!sendFn(msg)) {
+             return; // the counts go into the next report
+         }
+@@ -140,6 +161,10 @@ public:
+         if (withDisk) {
+             diskSent = disk->free;
+         }
++        if (withLoad) {
++            loadSent = withLoad;
++            loadSentAt = now;
++        }
+         for (const auto * run : changed) {
+             progressSent[run->progress.drv_path()] = {run->progress.assign_id(), run->version};
+         }
+@@ -176,6 +201,9 @@ private:
+     SubstituterTotals sent; // what the last successful report covered
+     std::optional<Disk> disk;
+     std::optional<uint64_t> diskSent;
++    std::optional<HostLoad> load;
++    std::optional<HostLoad> loadSent;
++    Clock::time_point loadSentAt;
+     // Each running build's assignment and version, as last sent in a report.
+     std::map<std::string, std::pair<uint64_t, uint64_t>> progressSent;
+     Clock::time_point lastReport;
+@@ -190,6 +218,33 @@ private:
+         return minFree > 0 && (last < minFree) != (now < minFree);
+     }
+ 
++    // The load, when a report should carry it: in a session's first, then
++    // when it moved by a step or went out loadEvery ago.
++    [[nodiscard]] auto loadToSend(bool first, Clock::time_point now) const -> std::optional<HostLoad>
++    {
++        if (!load) {
++            return std::nullopt;
++        }
++        if (first || !loadSent || now - loadSentAt >= loadEvery || loadStep(*loadSent, *load)) {
++            return load;
++        }
++        return std::nullopt;
++    }
++
++    [[nodiscard]] static auto loadStep(const HostLoad & last, const HostLoad & now) -> bool
++    {
++        constexpr uint64_t percent = 100;
++        constexpr uint64_t milli = 1000;
++        auto const moved = [](uint64_t before, uint64_t after) -> uint64_t {
++            return before > after ? before - after : after - before;
++        };
++        auto const cpuStep = std::max<uint64_t>(1, uint64_t{now.cpuCores} * milli * loadStepPercent / percent);
++        auto const memStep = std::max<uint64_t>(1, now.memTotalBytes / percent * loadStepPercent);
++        return last.cpuCores != now.cpuCores || last.memTotalBytes != now.memTotalBytes
++            || moved(last.cpuBusyMillicores, now.cpuBusyMillicores) >= cpuStep
++            || moved(last.memUsedBytes, now.memUsedBytes) >= memStep;
++    }
++
+     // What `totals` adds to `sent`, only substituters with traffic, folding
+     // any past maxSubstituters into otherSubstituterUrl. The tally only appends, so an index
+     // names the same URL in both.
+diff --git a/tests/events-test.cc b/tests/events-test.cc
+index f2c56bd..9bea1ed 100644
+--- a/tests/events-test.cc
++++ b/tests/events-test.cc
+@@ -1670,6 +1670,53 @@ void testReports()
+     disp.unwatch(*watcher);
+ }
+ 
++// A builder's CPU and memory go to watchers with the next stats pass, busy
++// within its cores and in use within the total. A new session has none
++// until it reports, since it may come from a builder that sends none.
++void testLoad()
++{
++    Metrics metrics("");
++    Dispatcher disp({.defaultSystem = std::string(x86), .lookupThreads = 0}, metrics);
++    Session one;
++    sendOne(disp, one.worker, helloMsg("w1", 2));
++    auto const loadMsg = [](uint64_t busy, uint64_t used) -> rpc::WorkerMsg {
++        rpc::WorkerMsg msg;
++        auto * rep = msg.mutable_report();
++        rep->set_cpu_busy_millicores(busy);
++        rep->set_cpu_cores(4);
++        rep->set_mem_used_bytes(used);
++        rep->set_mem_total_bytes(2000);
++        return msg;
++    };
++    assert(!snapshot(disp).workers.at("w1").has_cpu_cores());
++    sendOne(disp, one.worker, loadMsg(9000, 3000));
++    auto const snap = snapshot(disp);
++    const auto & w1 = snap.workers.at("w1");
++    assert(w1.cpu_busy_millicores() == 4000 && w1.cpu_cores() == 4);
++    assert(w1.mem_used_bytes() == 2000 && w1.mem_total_bytes() == 2000);
++
++    Sink sink;
++    auto watcher = disp.watch(sink.send(), sink.end());
++    assert(watcher);
++    sendOne(disp, one.worker, loadMsg(1500, 500));
++    std::optional<rpc::WorkerState> later;
++    bool const heard = waitFor([&] -> bool {
++        for (const auto & event : sink.take()) {
++            later = event.has_worker() ? std::optional(event.worker()) : later;
++        }
++        return later && later->cpu_busy_millicores() == 1500; // after the snapshot's
++    });
++    assert(heard && later->mem_used_bytes() == 500);
++    disp.unwatch(*watcher);
++
++    // The builder reconnects: no load until its first report.
++    Session two;
++    sendOne(disp, two.worker, helloMsg("w1", 2));
++    auto const again = snapshot(disp);
++    const auto & back = again.workers.at("w1");
++    assert(back.up() && !back.has_cpu_busy_millicores() && !back.has_mem_total_bytes());
++}
++
+ void testRandom()
+ {
+     for (unsigned seed = 1; seed <= 8; seed++) {
+@@ -2019,6 +2066,7 @@ try {
+     testDrainReasons();
+     testVersionCut();
+     testReports();
++    testLoad();
+     testProgress();
+     testRecentBuilds();
+     testRecentBuildsTies();
+diff --git a/tests/substituter-tally-test.cc b/tests/substituter-tally-test.cc
+index bc362bb..ed1c0dc 100644
+--- a/tests/substituter-tally-test.cc
++++ b/tests/substituter-tally-test.cc
+@@ -1,5 +1,6 @@
+-// What a builder counts per substituter, and the WorkerReports that carry it:
+-// URL reduction, the activity tally, and when reports go out.
++// What a builder counts per substituter and reads of its host, and the
++// WorkerReports that carry them: URL reduction, the activity tally, the
++// host's CPU and memory, and when reports go out.
+ 
+ #include <algorithm>
+ #include <array>
+@@ -8,16 +9,21 @@
+ #include <cstddef>
+ #include <cstdint>
+ #include <exception>
++#include <filesystem>
+ #include <format>
++#include <fstream>
+ #include <iostream>
+ #include <string>
+ #include <string_view>
+ #include <thread>
+ #include <vector>
+ 
++#include <stdlib.h> // NOLINT(modernize-deprecated-headers): mkdtemp is POSIX.
++
+ #include <nix/util/error.hh>
+ #include <nix/util/logging.hh>
+ 
++#include "host-load.hh"
+ #include "metrics.hh"
+ #include "nix_remote.pb.h"
+ #include "scheduler-link.hh"
+@@ -25,6 +31,8 @@
+ #include "substituter-url.hh"
+ 
+ using nix::remote::WorkerMsg;
++using nixgrpc::HostLoad;
++using nixgrpc::HostLoadSampler;
+ using nixgrpc::LoggerFields;
+ using nixgrpc::reduceSubstituterUrl;
+ using nixgrpc::SchedulerLink;
+@@ -263,6 +271,128 @@ void testReports()
+     assert(kept.substituters_size() == 1 && kept.substituters(0).nar_bytes() == 25 && kept.substituters(0).paths() == 1);
+ }
+ 
++// /proc/stat of a host with two online CPUs; `busy` and `idle` jiffies on
++// each, iowait counted as idle.
++auto procStat(uint64_t busy, uint64_t idle) -> std::string
++{
++    // user nice system idle iowait irq softirq steal guest guest_nice
++    return std::format(
++        "cpu  {} 0 {} {} {} 0 0 0 7 7\ncpu0 1 0 0 1 0 0 0 0 0 0\ncpu1 1 0 0 1 0 0 0 0 0 0\nintr 5 0\nctxt 9\n",
++        busy - (busy / 4),
++        busy / 4,
++        idle - (idle / 10),
++        idle / 10);
++}
++
++void testHostLoad()
++{
++    using nixgrpc::busyMillicores;
++    using nixgrpc::parseMeminfo;
++    using nixgrpc::parseProcStat;
++    // guest and guest_nice are in user already, so they do not count.
++    auto const stat = parseProcStat(procStat(400, 600));
++    assert(stat && stat->total == 1000 && stat->idle == 600 && stat->cores == 2);
++    assert(!parseProcStat("cpu  1 2 3\n") && !parseProcStat(""));
++    // 300 of the next 500 jiffies busy: 60% of 2 CPUs.
++    auto const next = parseProcStat(procStat(700, 800));
++    assert(next && busyMillicores(*stat, *next) == 1200);
++    // No time passed, or counters that went back: nothing to say.
++    assert(!busyMillicores(*stat, *stat));
++    // iowait can drop a little, which looks like more busy time than passed. Busy stops at every CPU.
++    auto later = *stat;
++    later.total += 10;
++    later.idle -= 50;
++    assert(busyMillicores(*stat, later) == 2000);
++
++    auto const mem = parseMeminfo("MemTotal:       16384 kB\nMemFree:  100 kB\nMemAvailable:    4096 kB\n");
++    assert(mem && mem->first == uint64_t{16384} * 1024 && mem->second == uint64_t{4096} * 1024);
++    assert(!parseMeminfo("MemTotal: 16384 kB\n"));
++
++    std::string dir = (std::filesystem::temp_directory_path() / "host-load-XXXXXX").string();
++    assert(::mkdtemp(dir.data()) != nullptr);
++    auto const write = [&](uint64_t busy, uint64_t idle) -> void {
++        std::ofstream(dir + "/stat") << procStat(busy, idle);
++        std::ofstream(dir + "/meminfo") << "MemTotal: 1000 kB\nMemAvailable: 250 kB\n";
++    };
++    HostLoadSampler sampler(dir);
++    write(400, 600);
++    assert(!sampler.sample()); // one sample: no change to measure yet
++    write(500, 1500);
++    auto const load = sampler.sample();
++    assert(load && load->cpuBusyMillicores == 200 && load->cpuCores == 2);
++    constexpr uint64_t kib = 1024;
++    assert(load->memUsedBytes == 750 * kib && load->memTotalBytes == 1000 * kib);
++    // A host without /proc reports nothing.
++    std::filesystem::remove_all(dir);
++    assert(!sampler.sample() && !sampler.sample());
++
++#ifdef __linux__
++    // The real files report size 0 and are read to the end.
++    HostLoadSampler host;
++    (void)host.sample();
++    std::this_thread::sleep_for(std::chrono::milliseconds(100));
++    auto const real = host.sample();
++    assert(real && real->cpuCores > 0 && real->memTotalBytes > 0 && real->memUsedBytes <= real->memTotalBytes);
++#endif
++}
++
++// The load goes out in a session's first report, then when busy CPUs moved
++// by 5% of the cores, memory in use by 5% of the total, or after 30 s.
++void testLoadReports()
++{
++    using std::chrono::seconds;
++    constexpr uint64_t gib = uint64_t{1} << 30U;
++    SchedulerLink link(nullptr, 0);
++    auto now = SchedulerLink::Clock::now();
++    Recorder one;
++    link.setSend(one.send());
++    HostLoad load{.cpuBusyMillicores = 4000, .cpuCores = 16, .memUsedBytes = 10 * gib, .memTotalBytes = 64 * gib};
++    link.setLoad(load);
++    link.tick(now);
++    assert(one.msgs.empty()); // only to a scheduler that asks
++    link.reportsWanted();
++    link.tick(now += seconds(1));
++    assert(one.msgs.size() == 1);
++    const auto & first = one.msgs.at(0).report();
++    assert(first.cpu_busy_millicores() == 4000 && first.cpu_cores() == 16);
++    assert(first.mem_used_bytes() == 10 * gib && first.mem_total_bytes() == 64 * gib);
++    // Moves under 800 millicores, 5% of 16 CPUs, and under 3.2 GiB send no report.
++    load.cpuBusyMillicores = 4790;
++    load.memUsedBytes = 13 * gib;
++    link.setLoad(load);
++    link.tick(now += seconds(3));
++    assert(one.msgs.size() == 1);
++    load.cpuBusyMillicores = 3200;
++    link.setLoad(load);
++    link.tick(now += seconds(3));
++    assert(one.msgs.size() == 2 && one.msgs.at(1).report().cpu_busy_millicores() == 3200);
++    assert(one.msgs.at(1).report().mem_used_bytes() == 13 * gib && !one.msgs.at(1).report().has_disk_free_bytes());
++    load.memUsedBytes = 17 * gib;
++    link.setLoad(load);
++    link.tick(now += seconds(3));
++    assert(one.msgs.size() == 3 && one.msgs.at(2).report().mem_used_bytes() == 17 * gib);
++    // Unchanged, it goes out again after 30 s.
++    link.tick(now += seconds(20));
++    assert(one.msgs.size() == 3);
++    link.tick(now += seconds(10));
++    assert(one.msgs.size() == 4 && one.msgs.at(3).report().cpu_cores() == 16);
++    // A new session's first report carries it.
++    Recorder two;
++    link.setSend(two.send());
++    link.reportsWanted();
++    link.tick(now += seconds(1));
++    assert(two.msgs.size() == 1 && two.msgs.at(0).report().has_cpu_busy_millicores());
++    // A builder that has no load to report sends none.
++    SchedulerLink bare(nullptr, 0);
++    Recorder three;
++    bare.setSend(three.send());
++    bare.reportsWanted();
++    bare.tick(now);
++    assert(three.msgs.size() == 1 && !three.msgs.at(0).report().has_cpu_cores());
++    bare.tick(now += seconds(31));
++    assert(three.msgs.size() == 1);
++}
++
+ // Until a builder sets them, the disk gauges have no sample: a node without
+ // the builder role would otherwise show a full disk.
+ void testDiskGauges()
+@@ -294,6 +424,8 @@ auto main() -> int
+         testActivities();
+         testLimits();
+         testReports();
++        testHostLoad();
++        testLoadReports();
+         testDiskGauges();
+     } catch (std::exception & err) {
+         std::cerr << "error: " << err.what() << "\n";
+-- 
+2.56.0
+

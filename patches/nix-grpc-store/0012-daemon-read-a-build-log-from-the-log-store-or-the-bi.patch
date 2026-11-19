@@ -1,7 +1,7 @@
 From 22cd932acabeee633204dcbf27e3dcb8ee9e83fe Mon Sep 17 00:00:00 2001
 From: Ilan Joselevich <personal@ilanjoselevich.com>
 Date: Tue, 10 Nov 2026 19:31:36 +0100
-Subject: [PATCH 12/12] daemon: read a build log from the log store or the
+Subject: [PATCH 12/14] daemon: read a build log from the log store or the
  binary cache
 
 A builder that left the farm takes Nix's kept logs with it, and a node

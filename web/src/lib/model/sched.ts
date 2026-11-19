@@ -157,3 +157,46 @@ export function offers(
 ): boolean {
 	return systems.includes(system) && needs.every((f) => features.includes(f));
 }
+
+/** A builder's or a pool's host: busy CPUs and CPUs, bytes in use and in all. null where not reported. */
+export type HostLoad = Readonly<{
+	cpuBusy: number | null;
+	cpuCores: number | null;
+	memUsed: number | null;
+	memTotal: number | null;
+}>;
+
+/** The load fields of a WorkerState, as the proto names them. */
+type LoadFields = {
+	cpuBusyMillicores?: bigint;
+	cpuCores?: number;
+	memUsedBytes?: bigint;
+	memTotalBytes?: bigint;
+};
+
+/** The load of a WorkerState: each pair of fields, or null. CPUs, not millicores. */
+export function loadFromProto(x: LoadFields): HostLoad {
+	const cpu = x.cpuBusyMillicores !== undefined && x.cpuCores !== undefined;
+	const mem = x.memUsedBytes !== undefined && x.memTotalBytes !== undefined;
+	return {
+		cpuBusy: cpu ? Number(x.cpuBusyMillicores) / 1000 : null,
+		cpuCores: cpu ? x.cpuCores! : null,
+		memUsed: mem ? Number(x.memUsedBytes) : null,
+		memTotal: mem ? Number(x.memTotalBytes) : null
+	};
+}
+
+/** The same fields for a load, as the demo farm sends them. */
+export function loadToProto(l: HostLoad): LoadFields {
+	return {
+		...(l.cpuBusy !== null && l.cpuCores !== null
+			? { cpuBusyMillicores: BigInt(Math.round(l.cpuBusy * 1000)), cpuCores: l.cpuCores }
+			: {}),
+		...(l.memUsed !== null && l.memTotal !== null
+			? {
+					memUsedBytes: BigInt(Math.round(l.memUsed)),
+					memTotalBytes: BigInt(Math.round(l.memTotal))
+				}
+			: {})
+	};
+}

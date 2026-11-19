@@ -204,6 +204,11 @@ export function hostOf(url: string): string {
 	}
 }
 
+/** CPUs, such as the busy ones: "4.5", "12", "1,400". */
+export function formatCpus(n: number): string {
+	return n < 10 ? trim(n, 1) : formatCount(Math.round(n));
+}
+
 export function formatPercent(ratio: number | null): string {
 	if (ratio === null || !Number.isFinite(ratio)) return '–';
 	return `${Math.round(ratio * 100)}%`;

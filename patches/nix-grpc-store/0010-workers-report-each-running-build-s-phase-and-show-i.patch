@@ -1,7 +1,7 @@
 From e18587bb2bb93089cbc4ae16ef93191827ca5eb8 Mon Sep 17 00:00:00 2001
 From: Ilan Joselevich <personal@ilanjoselevich.com>
 Date: Tue, 10 Nov 2026 19:27:48 +0100
-Subject: [PATCH 10/12] workers: report each running build's phase, and show it
+Subject: [PATCH 10/14] workers: report each running build's phase, and show it
  to watchers
 
 The scheduler sees assignments, not build starts. A derivation stays

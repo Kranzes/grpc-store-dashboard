@@ -34,6 +34,7 @@ import {
 	ZERO_COUNTERS,
 	ZERO_SUBSTITUTER,
 	countersFromProto,
+	loadFromProto,
 	offers,
 	priority as schedPriority,
 	reduceSubstituterUrl,
@@ -282,6 +283,11 @@ type WorkerRec = {
 	diskTotal: number | null;
 	minFree: number;
 	version: string;
+	/** As its last WorkerState says; null: not reported. CPUs, not millicores. */
+	cpuBusy: number | null;
+	cpuCores: number | null;
+	memUsed: number | null;
+	memTotal: number | null;
 	/** Every URL of its last WorkerState, in its order. */
 	listed: readonly string[];
 	/** Of those, the upstream ones: not the farm cache, not "other". */
@@ -408,6 +414,11 @@ type PoolAcc = {
 	offline: number;
 	running: number;
 	slots: number;
+	cpuBusy: number;
+	cpuCores: number;
+	memUsed: number;
+	memTotal: number;
+	loadBuilders: number;
 	/** Builders taking work by max_jobs, and the slots assigned on them. */
 	workingJobs: Map<number, number>;
 	workingRunning: number;
@@ -1062,6 +1073,7 @@ export class FarmReducer {
 				diskTotal: bytesOrNull(w.diskTotalBytes),
 				minFree: Number(w.minFreeBytes),
 				version: w.version,
+				...loadFromProto(w),
 				listed,
 				upstream,
 				// The first counts only set the base.
@@ -1110,6 +1122,8 @@ export class FarmReducer {
 		if (w.diskTotalBytes !== undefined) rec.diskTotal = Number(w.diskTotalBytes);
 		rec.minFree = Number(w.minFreeBytes);
 		rec.version = w.version;
+		// Unlike disk, a reading of now: a new session clears it.
+		Object.assign(rec, loadFromProto(w));
 		if (!sameStrings(rec.listed, listed)) {
 			rec.listed = listed;
 			const upstream = this.#upstreamOf(listed);
@@ -2047,6 +2061,10 @@ export class FarmReducer {
 				diskTotal: w.diskTotal,
 				minFree: w.minFree,
 				version: w.version,
+				cpuBusy: w.up ? w.cpuBusy : null,
+				cpuCores: w.up ? w.cpuCores : null,
+				memUsed: w.up ? w.memUsed : null,
+				memTotal: w.up ? w.memTotal : null,
 				substituters: w.upstream,
 				builtPerMin: tr ? Math.round(tr.built.total(now) * 10) / 10 : 0,
 				failedPerMin: tr ? Math.round(tr.failed.total(now) * 10) / 10 : 0,
@@ -2084,6 +2102,11 @@ export class FarmReducer {
 					offline: 0,
 					running: 0,
 					slots: 0,
+					cpuBusy: 0,
+					cpuCores: 0,
+					memUsed: 0,
+					memTotal: 0,
+					loadBuilders: 0,
 					workingJobs: new Map(),
 					workingRunning: 0,
 					connectedJobs: new Map(),
@@ -2110,6 +2133,13 @@ export class FarmReducer {
 			} else p.up++;
 			if (w.up) p.slots += w.maxJobs;
 			p.running += running;
+			if (w.up && (w.cpuCores !== null || w.memTotal !== null)) {
+				p.loadBuilders++;
+				p.cpuBusy += w.cpuBusy ?? 0;
+				p.cpuCores += w.cpuCores ?? 0;
+				p.memUsed += w.memUsed ?? 0;
+				p.memTotal += w.memTotal ?? 0;
+			}
 			if (w.up && w.maxJobs > 0)
 				p.connectedJobs.set(w.maxJobs, (p.connectedJobs.get(w.maxJobs) ?? 0) + 1);
 			if (takesWork(w)) {
@@ -2177,6 +2207,11 @@ export class FarmReducer {
 				builderSlots,
 				needed,
 				spare: Math.max(0, p.up - (needed ?? p.up)),
+				cpuBusy: p.cpuCores ? round3(p.cpuBusy) : null,
+				cpuCores: p.cpuCores || null,
+				memUsed: p.memTotal ? p.memUsed : null,
+				memTotal: p.memTotal || null,
+				loadBuilders: p.loadBuilders,
 				idle: p.idle,
 				idleSince: p.idleSince || null,
 				idleBefore: p.idleBefore,

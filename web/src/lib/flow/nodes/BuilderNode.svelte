@@ -3,6 +3,7 @@
 	import { builderState, hasUpstream, loadOf, poolOf } from '#lib/model/types.ts';
 	import { drainBadge, drainTitle } from '#lib/ui/drain.ts';
 	import { formatBytes, formatShort, spokenShort } from '#lib/ui/format.ts';
+	import { loadShares, loadText, loadTitle } from '#lib/ui/load.ts';
 	import { builderFeatures } from '../cells.ts';
 	import { getFlowContext, nodeButton } from '../context.ts';
 	import { BUILDER_PORT_OFFSET, SUBSTITUTE_PORT_OFFSET } from '../layout.ts';
@@ -31,6 +32,16 @@
 	const features = $derived(
 		ownFeatures ? builderFeatures(ownFeatures, poolFeatures).join(', ') : ''
 	);
+	// The host's CPU and memory, while it reports them. A builder that is down has none.
+	const bars = $derived.by(() => {
+		if (!w) return [];
+		const { cpu, mem } = loadShares(w);
+		const list: [string, number | null][] = [
+			['CPU', cpu],
+			['mem', mem]
+		];
+		return list.filter((b): b is [string, number] => b[1] !== null);
+	});
 	// Free disk while it is why the builder drains. Offline cards show none.
 	const lowDisk = $derived(
 		state === 'draining' && w?.drainReason === 'low-disk' && w.diskFree !== null
@@ -97,6 +108,17 @@
 		{#if lowDisk}
 			<span class="spacer"></span>
 			<span class="num disk">{lowDisk}</span>
+		{:else if w && bars.length}
+			<span class="spacer"></span>
+			<span class="load" title={loadTitle(w)}>
+				<span class="visually-hidden">{loadText(w)}</span>
+				{#each bars as [label, share] (label)}
+					<span class="muted" aria-hidden="true">{label}</span>
+					<span class="meter mini" aria-hidden="true"
+						><span style:transform="scaleX({share})"></span></span
+					>
+				{/each}
+			</span>
 		{/if}
 	</span>
 </button>
@@ -132,6 +154,20 @@
 	/* Thinner than the scheduler's and the pools' bars: on a saturated farm every card is full. */
 	.meter {
 		height: 3px;
+	}
+
+	.load {
+		display: flex;
+		flex: none;
+		align-items: center;
+		gap: 3px;
+	}
+
+	/* The host's CPU and memory: as thin as the slots bar, in muted ink, draining or not. */
+	.builder .meter.mini {
+		--fill: var(--fg-muted);
+		width: 18px;
+		margin-right: 3px;
 	}
 
 	/* 4.76:1 on --bg-node in Latte. */

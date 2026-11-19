@@ -18,10 +18,12 @@
 		formatBytes,
 		formatClockMinutes,
 		formatCount,
+		formatPercent,
 		formatShort,
 		spokenShort
 	} from '../format.ts';
 	import { Hold } from '../hold.svelte.ts';
+	import { loadShares, loadTitle, poolLoadCoverage } from '../load.ts';
 	import Segmented from '../Segmented.svelte';
 	import Spoken from '../Spoken.svelte';
 	import { Throttled } from '../throttle.svelte.ts';
@@ -47,6 +49,17 @@
 	const p = $derived(store.pools.get(system));
 	const fill = $derived(p && p.slots > 0 ? Math.min(1, p.running / p.slots) : 0);
 	const collapsed = $derived(pools.collapsed(system));
+	// CPU and Memory, each while some builder reports it.
+	const meters = $derived.by(() => {
+		if (!p) return [];
+		const { cpu, mem } = loadShares(p);
+		const list: [string, number | null][] = [
+			['CPU', cpu],
+			['Memory', mem]
+		];
+		return list.filter((m): m is [string, number] => m[1] !== null);
+	});
+	const coverage = $derived(p ? poolLoadCoverage(p) : null);
 	/** How long the builder idle longest has been idle. Only an open panel with idle builders reads the clock. */
 	const idleFor = $derived(p?.idleSince != null ? Math.max(0, clock.now - p.idleSince) : null);
 
@@ -142,6 +155,16 @@
 					{/if}
 				</dd>
 			</div>
+			<!-- Under Assigned slots, so the two fills compare at a glance. -->
+			{#each meters as [label, share] (label)}
+				<div>
+					<dt title={loadTitle(p)}>{label}</dt>
+					<dd>{formatPercent(share)}</dd>
+					<dd class="p-meter load" aria-hidden="true">
+						<span style:transform="scaleX({share})"></span>
+					</dd>
+				</div>
+			{/each}
 			<div class="wide">
 				<dt title="Online builders with nothing assigned">Idle</dt>
 				<dd
@@ -161,6 +184,12 @@
 				</dd>
 			</div>
 		</dl>
+		{#if coverage}
+			<p class="p-caption num">
+				CPU and memory of {formatCount(coverage.reporting)} of {formatCount(coverage.connected)} builders:
+				the others do not report them.
+			</p>
+		{/if}
 		<p class="p-caption">
 			If an autoscaler follows the scheduler, it asks for the needed builders. A gap that lasts is
 			capacity it holds, such as a scale-in delay or a minimum, not load.

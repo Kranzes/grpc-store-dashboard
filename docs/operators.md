@@ -473,6 +473,10 @@ report" for a builder that runs an older nix-grpc-store. With the patches, a bui
 publishes to the cache fail 3 times in a row takes no builds for a minute, and its card says
 "Publishing failing".
 
+The same goes for CPU and memory. Patched Linux builders read them from `/proc` for the whole
+host, so anything else running there counts too. macOS builders report none. A pool whose
+builders do not all report says how many do, as in "170 of 177 builders".
+
 ## 9. Build logs
 
 The Logs tab reads each build's log from the builder that ran it, with `GetBuildLog` through the

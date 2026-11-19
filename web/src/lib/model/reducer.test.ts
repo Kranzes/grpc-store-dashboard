@@ -1445,6 +1445,78 @@ describe('builders needed', () => {
 	});
 });
 
+describe('host load', () => {
+	const GiB = 1024 ** 3;
+	const load = (busyMilli: number, cores: number, usedGiB: number, totalGiB: number) => ({
+		cpuBusyMillicores: BigInt(busyMilli),
+		cpuCores: cores,
+		memUsedBytes: BigInt(usedGiB * GiB),
+		memTotalBytes: BigInt(totalGiB * GiB)
+	});
+
+	it("takes each builder's CPU and memory, and null while it does not report them", () => {
+		const { r, s } = started(
+			{},
+			E.reset(),
+			E.worker('a', load(4500, 16, 20, 64)),
+			// An older builder, or a host without /proc.
+			E.worker('b')
+		);
+		let v = r.views(T0, 15);
+		expect(v.workers.get('a')).toMatchObject({
+			cpuBusy: 4.5,
+			cpuCores: 16,
+			memUsed: 20 * GiB,
+			memTotal: 64 * GiB
+		});
+		expect(v.workers.get('b')).toMatchObject({
+			cpuBusy: null,
+			cpuCores: null,
+			memUsed: null,
+			memTotal: null
+		});
+		// Down: no reading of now. Back with a new session, none until it reports.
+		r.apply(s.next(E.worker('a', { up: false, ...load(4500, 16, 20, 64) })), T0 + 1000);
+		expect(r.views(T0 + 1000, 15).workers.get('a')!.cpuBusy).toBeNull();
+		r.apply(s.next(E.worker('a')), T0 + 2000);
+		v = r.views(T0 + 2000, 15);
+		expect(v.workers.get('a')).toMatchObject({ up: true, cpuBusy: null, memTotal: null });
+	});
+
+	it('sums the pool over connected builders that report, draining ones included', () => {
+		const { r } = started(
+			{},
+			E.reset(),
+			E.worker('a', load(4000, 16, 20, 64)),
+			E.worker('b', { draining: true, ...load(2000, 8, 4, 32) }),
+			E.worker('c'),
+			E.worker('d', { up: false, ...load(8000, 8, 30, 32) })
+		);
+		expect(r.views(T0, 15).pools.get('x86_64-linux')).toMatchObject({
+			up: 2,
+			draining: 1,
+			offline: 1,
+			cpuBusy: 6,
+			cpuCores: 24,
+			memUsed: 24 * GiB,
+			memTotal: 96 * GiB,
+			// Of up + draining: 3.
+			loadBuilders: 2
+		});
+	});
+
+	it('sums nothing while no builder reports', () => {
+		const { r } = farm();
+		expect(r.views(T0, 15).pools.get('x86_64-linux')).toMatchObject({
+			cpuBusy: null,
+			cpuCores: null,
+			memUsed: null,
+			memTotal: null,
+			loadBuilders: 0
+		});
+	});
+});
+
 describe('idle builders', () => {
 	it('counts builders taking work with nothing assigned, and since when the page saw them idle', () => {
 		const A1 = drvPath('on-a');

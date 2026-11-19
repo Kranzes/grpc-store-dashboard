@@ -3,6 +3,7 @@
 	import { hasUpstream, parseNodeId, workerNodeId } from '#lib/model/types.ts';
 	import { poolDrains } from '#lib/ui/drain.ts';
 	import { formatCount } from '#lib/ui/format.ts';
+	import { loadText, loadTitle, poolLoadCoverage } from '#lib/ui/load.ts';
 	import { cellsOf, featureSummary, type Cell } from '../cells.ts';
 	import { failingBuilders, failingTitle, farmFailShare } from '../outliers.ts';
 	import { getFlowContext, nodeButton, repeatClick } from '../context.ts';
@@ -22,6 +23,15 @@
 
 	const p = $derived(ctx.store.pools.get(data.ref));
 	const fill = $derived(p && p.slots > 0 ? Math.min(1, p.running / p.slots) : 0);
+	// Beside the slots: how busy the builders' hosts are, over those that report it.
+	const load = $derived(p ? loadText(p) : null);
+	const coverage = $derived(p ? poolLoadCoverage(p) : null);
+	// "183/197": the node has no room for "183 of 197 builders", which its tooltip says.
+	const loadTip = $derived(
+		p && load
+			? `${loadTitle(p)}${coverage ? ` Over ${formatCount(coverage.reporting)} of ${formatCount(coverage.connected)} builders, the ones that report it.` : ''}`
+			: undefined
+	);
 	// The dot sums up the pool: green while some builder takes work.
 	const state = $derived(!p || p.up > 0 ? 'up' : p.draining > 0 ? 'draining' : 'offline');
 	const features = $derived(p ? featureSummary(p.features, p.builders) : '');
@@ -117,8 +127,17 @@
 				</span>
 			{/if}
 		</span>
-		<span class="meter" aria-hidden="true">
-			<span style:transform="scaleX({fill})"></span>
+		<span class="row fill">
+			<span class="meter" aria-hidden="true">
+				<span style:transform="scaleX({fill})"></span>
+			</span>
+			{#if load}
+				<span class="num load" title={loadTip}
+					>{load}{#if coverage}<span class="muted"
+							>{` (${formatCount(coverage.reporting)}/${formatCount(coverage.connected)})`}</span
+						>{/if}</span
+				>
+			{/if}
 		</span>
 		<span
 			class="row foot"
@@ -189,6 +208,25 @@
 
 	.slots {
 		font-weight: 600;
+	}
+
+	/* The slots bar keeps the room the load text leaves. */
+	.fill {
+		gap: 8px;
+	}
+
+	.fill .meter {
+		flex: 1 1 auto;
+		min-width: 96px;
+	}
+
+	.load {
+		flex: 0 1 auto;
+		min-width: 0;
+		overflow: hidden;
+		font-size: var(--text-2xs);
+		text-overflow: ellipsis;
+		white-space: nowrap;
 	}
 
 	.muted {

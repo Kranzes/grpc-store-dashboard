@@ -22,6 +22,10 @@ const BUILDER: WorkerView = {
 	diskTotal: 200 * 1024 ** 3,
 	minFree: 10 * 1024 ** 3,
 	version: '1.0',
+	cpuBusy: null,
+	cpuCores: null,
+	memUsed: null,
+	memTotal: null,
 	substituters: [],
 	builtPerMin: 12,
 	failedPerMin: 3,
@@ -45,6 +49,11 @@ const POOL: PoolView = {
 	builderSlots: 8,
 	needed: 1,
 	spare: 1,
+	cpuBusy: null,
+	cpuCores: null,
+	memUsed: null,
+	memTotal: null,
+	loadBuilders: 0,
 	idle: 0,
 	idleSince: null,
 	idleBefore: false,
@@ -141,6 +150,23 @@ describe('PoolPanel', () => {
 		expect(facts(body)[5]).toEqual(['Idle', '2, longest over 5m5 minutes']);
 		body = renderPool({ ...POOL, needed: null });
 		expect(facts(body)[4]).toEqual(['Needed now', 'Unknown']);
+	});
+
+	it('puts CPU and memory under the slots, and says how many builders report them', () => {
+		const GiB = 1024 ** 3;
+		const load = { cpuBusy: 4, cpuCores: 16, memUsed: 8 * GiB, memTotal: 32 * GiB };
+		let body = renderPool({ ...POOL, ...load, loadBuilders: 1 });
+		expect(facts(body).slice(5, 7)).toEqual([
+			['CPU', '25%'],
+			['Memory', '25%']
+		]);
+		expect(meterIn(body, 'CPU')).toBeCloseTo(0.25);
+		expect(body).toContain('CPU and memory of 1 of 2 builders: the others do not report them.');
+		body = renderPool({ ...POOL, ...load, loadBuilders: 2 });
+		expect(body).not.toContain('do not report them');
+		// No builder reports: neither shows.
+		body = renderPool(POOL);
+		expect(facts(body).map(([label]) => label)).not.toContain('CPU');
 	});
 
 	it('puts the slots meter under Assigned slots, filled to the share in use', () => {

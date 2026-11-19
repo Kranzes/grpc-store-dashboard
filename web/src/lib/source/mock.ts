@@ -40,6 +40,7 @@ import {
 	COUNTER_KEYS,
 	ZERO_COUNTERS,
 	countersToProto,
+	loadToProto,
 	offers,
 	priority,
 	substitutersToProto,
@@ -266,6 +267,39 @@ const LOW_DISK_MS = 300_000;
 /** A builder reports free disk at most this often, and only after a step. */
 const REPORT_MS = 2_000;
 
+/**
+ * A builder's host: 2 CPUs and 8 GiB per slot. A build keeps a CPU and a
+ * half busy at most, and most use well under one, so full slots leave CPUs
+ * idle, as on a farm provisioned by slots.
+ */
+const CPUS_PER_SLOT = 2;
+const MEM_PER_SLOT = 8 * GiB;
+/** What the host's own processes take with no build. */
+const BASE_BUSY = 0.3;
+const BASE_MEM = 2 * GiB;
+/** Builders resend their load after this long, or when it moved by LOAD_STEP. */
+const LOAD_EVERY_MS = 30_000;
+const LOAD_STEP = 0.05;
+
+/** A number from 0 to 1 fixed by `parts`, so the load model draws nothing from the farm's RNGs. */
+const unit = (...parts: string[]) => hash32(...parts) / 2 ** 32;
+
+const BUILD_LOAD = new WeakMap<Drv, { cpus: number; mem: number }>();
+
+/** CPUs and memory a build takes, fixed by its path and worked out once. */
+function buildLoad(d: Drv): { cpus: number; mem: number } {
+	let b = BUILD_LOAD.get(d);
+	if (!b) {
+		const u = unit(d.path);
+		b = { cpus: 0.15 + 1.35 * u * u, mem: (0.5 + 3 * unit(d.path, 'mem')) * GiB };
+		BUILD_LOAD.set(d, b);
+	}
+	return b;
+}
+
+/** A host's load at a time: busy CPUs and all CPUs, bytes in use and in all. */
+type HostReading = { busy: number; cores: number; used: number; total: number; atMs: number };
+
 /** The farm's own cache, as builders list it among their substituters. */
 const FARM_CACHE = 'https://cache.farm.example';
 
@@ -469,6 +503,13 @@ type Worker = {
 	/** Something to report changed since the last report. */
 	dirty: boolean;
 	lastReportMs: number;
+	/**
+	 * Reads its host's CPU and memory. Darwin builders cannot, and some
+	 * Linux ones run a release that does not.
+	 */
+	reportsLoad: boolean;
+	/** The load it last reported in this session, null before its first report. */
+	load: HostReading | null;
 	/** Its substituters: the farm cache, then the upstream ones. */
 	substituters: string[];
 	/** What it took from each, since the scheduler started serving. */
@@ -1125,6 +1166,8 @@ export class MockFarm {
 			reportedFree: diskFree,
 			dirty: false,
 			lastReportMs: -Infinity,
+			reportsLoad: !sys.endsWith('-darwin') && unit(addr) >= 1 / 12,
+			load: null,
 			substituters: [],
 			subs: new Map(),
 			reportedSubs: new Map()
@@ -1366,6 +1409,36 @@ export class MockFarm {
 		}
 	}
 
+	/** The host's CPUs busy and memory in use now, from its builds. */
+	#loadNow(w: Worker): HostReading {
+		let cpus = BASE_BUSY;
+		let mem = BASE_MEM;
+		for (const d of w.running) {
+			const b = buildLoad(d);
+			cpus += b.cpus;
+			mem += b.mem;
+		}
+		const cores = w.maxJobs * CPUS_PER_SLOT;
+		const total = w.maxJobs * MEM_PER_SLOT;
+		return {
+			busy: Math.min(cores, cpus),
+			cores,
+			used: Math.min(total, mem),
+			total,
+			atMs: this.now
+		};
+	}
+
+	/** Whether a builder sends `now`: the session's first, a step from the last, or LOAD_EVERY_MS since. */
+	static #loadDue(last: HostReading | null, now: HostReading): boolean {
+		return (
+			!last ||
+			now.atMs - last.atMs >= LOAD_EVERY_MS ||
+			Math.abs(now.busy - last.busy) >= LOAD_STEP * now.cores ||
+			Math.abs(now.used - last.used) >= LOAD_STEP * now.total
+		);
+	}
+
 	#workerMsg(w: Worker) {
 		return create(WorkerStateSchema, {
 			addr: w.addr,
@@ -1383,6 +1456,14 @@ export class MockFarm {
 							? WorkerState_DrainReason.LOCAL_DAEMON
 							: WorkerState_DrainReason.UNSPECIFIED,
 			version: 'mock',
+			...(w.up && w.load
+				? loadToProto({
+						cpuBusy: w.load.busy,
+						cpuCores: w.load.cores,
+						memUsed: w.load.used,
+						memTotal: w.load.total
+					})
+				: {}),
 			diskFreeBytes: BigInt(Math.round(w.reportedFree)),
 			diskTotalBytes: BigInt(Math.round(w.diskTotal)),
 			minFreeBytes: BigInt(MIN_FREE),
@@ -1503,6 +1584,9 @@ export class MockFarm {
 			w.up = true;
 			w.draining = false;
 			w.drainReason = null;
+			// A new session: Hello clears the load until its first report.
+			w.load = null;
+			w.lastReportMs = -Infinity;
 			this.#emit({ case: 'worker', value: this.#workerMsg(w) });
 			this.#placeability();
 			this.#fill(w);
@@ -2369,7 +2453,11 @@ export class MockFarm {
 		// The scheduler sends what builders reported, at most once a second per
 		// builder, before the Stats. Builders report at most every REPORT_MS.
 		for (const w of this.#workers) {
-			if (!w.dirty || !w.up || this.now - w.lastReportMs < REPORT_MS) continue;
+			if (!w.up || this.now - w.lastReportMs < REPORT_MS) continue;
+			const load = w.reportsLoad ? this.#loadNow(w) : null;
+			const due = load !== null && MockFarm.#loadDue(w.load, load);
+			if (!w.dirty && !due) continue;
+			if (due) w.load = load;
 			w.dirty = false;
 			w.lastReportMs = this.now;
 			w.reportedFree = w.diskFree;

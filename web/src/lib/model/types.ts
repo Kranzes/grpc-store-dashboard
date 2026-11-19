@@ -205,6 +205,15 @@ export type WorkerView = Readonly<{
 	/** nix-grpc-store version, '' when the builder does not report it. */
 	version: string;
 	/**
+	 * Its host's CPUs busy, over about a second, and online CPUs; memory in
+	 * use and in all, bytes. Host-wide, so other processes on the host count
+	 * too. null when the builder does not report them.
+	 */
+	cpuBusy: number | null;
+	cpuCores: number | null;
+	memUsed: number | null;
+	memTotal: number | null;
+	/**
 	 * Upstream substituters it has configured, in its order, reduced to
 	 * scheme://host/path. The farm cache is left out when the scheduler names it.
 	 */
@@ -229,6 +238,11 @@ export function builderState(w: WorkerView | undefined): BuilderState {
 /** Share of a builder's slots in use, 0 to 1. */
 export function loadOf(w: WorkerView | undefined): number {
 	return w && w.maxJobs > 0 ? Math.min(1, w.running / w.maxJobs) : 0;
+}
+
+/** Share of `total` that `used` is, 0 to 1, or null without a total. */
+export function shareOf(used: number | null, total: number | null): number | null {
+	return used !== null && total ? Math.min(1, Math.max(0, used / total)) : null;
 }
 
 /** Samples of the queue size, one a second, behind SchedulerView.queuedPerMin: a minute's worth. */
@@ -293,6 +307,17 @@ export type PoolView = Readonly<{
 	idleSince: number | null;
 	/** That builder was already idle when this stream started, so idleSince is only a bound. */
 	idleBefore: boolean;
+	/**
+	 * CPU and memory summed over connected builders that report them,
+	 * draining ones included: busy CPUs and CPUs, bytes in use and in all.
+	 * null while none does.
+	 */
+	cpuBusy: number | null;
+	cpuCores: number | null;
+	memUsed: number | null;
+	memTotal: number | null;
+	/** Connected builders that report them, of up + draining. */
+	loadBuilders: number;
 	/** Features and how many builders offer each, most common first. */
 	features: readonly Readonly<{ name: string; builders: number }>[];
 	/** Builders that connected or came back, and that disconnected, within POOL_CHURN_MINUTES. */
