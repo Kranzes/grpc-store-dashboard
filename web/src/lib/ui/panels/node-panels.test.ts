@@ -41,6 +41,13 @@ const POOL: PoolView = {
 	running: 4,
 	slots: 16,
 	queuedCanTake: 0,
+	occupied: 4,
+	builderSlots: 8,
+	needed: 1,
+	spare: 1,
+	idle: 0,
+	idleSince: null,
+	idleBefore: false,
 	features: [],
 	joined: 0,
 	left: 0,
@@ -117,6 +124,23 @@ describe('PoolPanel', () => {
 		expect(body).toContain(
 			'Draining: 1 low on disk, 1 stopping, 1 with no nix-daemon, 1 with publishing failing, 1 without a reason.'
 		);
+	});
+
+	it('says how many builders the work needs, and how many idle', () => {
+		const now = Date.now();
+		let body = renderPool({ ...POOL, idle: 1, idleSince: now - 23 * 60_000 });
+		expect(facts(body).slice(4, 6)).toEqual([
+			['Needed now', '1 of 2 online (1 spare)'],
+			['Idle', '1, longest 23m23 minutes']
+		]);
+		expect(body).toContain(
+			'If an autoscaler follows the scheduler, it asks for the needed builders.'
+		);
+		// Idle since before the page connected: only a bound.
+		body = renderPool({ ...POOL, idle: 2, idleSince: now - 5 * 60_000, idleBefore: true });
+		expect(facts(body)[5]).toEqual(['Idle', '2, longest over 5m5 minutes']);
+		body = renderPool({ ...POOL, needed: null });
+		expect(facts(body)[4]).toEqual(['Needed now', 'Unknown']);
 	});
 
 	it('puts the slots meter under Assigned slots, filled to the share in use', () => {

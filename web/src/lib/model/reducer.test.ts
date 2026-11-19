@@ -1338,6 +1338,184 @@ describe('pools', () => {
 	});
 });
 
+describe('builders needed', () => {
+	const assigned = (worker: string, n: number) =>
+		Array.from({ length: n }, (_, i) =>
+			E.drv(drvPath(`${worker}-${i}`), {
+				phase: Phase.ASSIGNED,
+				workerAddr: worker,
+				clientIds: [1n]
+			})
+		);
+	const queued = (n: number, init = {}) =>
+		Array.from({ length: n }, (_, i) => E.drv(drvPath(`q-${i}`), { clientIds: [1n], ...init }));
+
+	function mixed() {
+		return started(
+			{},
+			E.reset(),
+			E.client(1, 'ci'),
+			E.worker('x1', { maxJobs: 8 }),
+			E.worker('x2', { maxJobs: 8 }),
+			E.worker('x3', { maxJobs: 4 }),
+			// Draining: neither its size nor its builds count.
+			E.worker('x4', { maxJobs: 16, draining: true }),
+			...assigned('x1', 3),
+			...assigned('x4', 2),
+			...queued(10),
+			...Array.from({ length: 2 }, (_, i) =>
+				E.drv(drvPath(`cuda-${i}`), {
+					phase: Phase.UNPLACEABLE,
+					clientIds: [1n],
+					features: ['cuda']
+				})
+			)
+		);
+	}
+
+	it('fills median-sized builders with the slots in use and the queue the pool can take', () => {
+		const { r } = mixed();
+		const p = r.views(T0, 15).pools.get('x86_64-linux')!;
+		// Before any Stats: the assigned slots of builders taking work.
+		expect(p).toMatchObject({
+			up: 3,
+			running: 5,
+			queuedCanTake: 10,
+			occupied: 3,
+			builderSlots: 8,
+			// (3 + 10) / 8, rounded up.
+			needed: 2,
+			spare: 1
+		});
+	});
+
+	it("counts the slots in use from the scheduler's Stats once there is one", () => {
+		const { r, s } = mixed();
+		const x86 = (free: number) => ({ system: 'x86_64-linux', slots: 20, free, running: 5 });
+		r.apply(s.next(E.stats({}, [x86(17)])), T0 + 1000);
+		expect(r.views(T0 + 1000, 15).pools.get('x86_64-linux')).toMatchObject({
+			occupied: 3,
+			needed: 2
+		});
+		r.apply(s.next(E.stats({}, [x86(9)])), T0 + 2000);
+		expect(r.views(T0 + 2000, 15).pools.get('x86_64-linux')).toMatchObject({
+			occupied: 11,
+			// (11 + 10) / 8, rounded up: every builder is needed.
+			needed: 3,
+			spare: 0
+		});
+	});
+
+	it('takes the mean of the two middle sizes, and connected builders while none takes work', () => {
+		const { r, s } = started(
+			{},
+			E.reset(),
+			E.client(1, 'ci'),
+			E.worker('x1', { maxJobs: 4 }),
+			E.worker('x2', { maxJobs: 8 }),
+			...queued(13)
+		);
+		expect(r.views(T0, 15).pools.get('x86_64-linux')).toMatchObject({
+			builderSlots: 6,
+			needed: 3,
+			spare: 0
+		});
+		r.apply(
+			s.next(
+				E.worker('x1', { maxJobs: 4, draining: true }),
+				E.worker('x2', { maxJobs: 8, draining: true })
+			),
+			T0 + 1000
+		);
+		expect(r.views(T0 + 1000, 15).pools.get('x86_64-linux')).toMatchObject({
+			up: 0,
+			builderSlots: 6,
+			occupied: 0,
+			needed: 3,
+			spare: 0
+		});
+		// No connected builder: no size to go by.
+		const { r: gone } = started({}, E.reset(), E.worker('x1', { up: false }));
+		expect(gone.views(T0, 15).pools.get('x86_64-linux')).toMatchObject({
+			offline: 1,
+			builderSlots: 0,
+			needed: null,
+			spare: 0
+		});
+	});
+});
+
+describe('idle builders', () => {
+	it('counts builders taking work with nothing assigned, and since when the page saw them idle', () => {
+		const A1 = drvPath('on-a');
+		const B1 = drvPath('on-b');
+		const { r, s } = started(
+			{},
+			E.reset(),
+			E.client(1, 'ci'),
+			E.worker('a'),
+			E.worker('b'),
+			// Draining or without slots: not idle.
+			E.worker('d', { draining: true }),
+			E.worker('z', { maxJobs: 0 }),
+			E.drv(B1, { phase: Phase.ASSIGNED, workerAddr: 'b', clientIds: [1n] })
+		);
+		// a was idle in the snapshot: since when is unknown.
+		expect(r.views(T0, 15).pools.get('x86_64-linux')).toMatchObject({
+			idle: 1,
+			idleSince: T0,
+			idleBefore: true
+		});
+		r.apply(s.next(E.gone(B1, Outcome.BUILT, { workerAddr: 'b' })), T0 + 1000);
+		expect(r.views(T0 + 1000, 15).pools.get('x86_64-linux')).toMatchObject({
+			idle: 2,
+			idleSince: T0,
+			idleBefore: true
+		});
+		r.apply(
+			s.next(E.drv(A1, { phase: Phase.ASSIGNED, workerAddr: 'a', clientIds: [1n] })),
+			T0 + 2000
+		);
+		expect(r.views(T0 + 2000, 15).pools.get('x86_64-linux')).toMatchObject({
+			idle: 1,
+			idleSince: T0 + 1000,
+			idleBefore: false
+		});
+		// A drain ends it, and so does going away.
+		r.apply(s.next(E.worker('b', { draining: true })), T0 + 3000);
+		expect(r.views(T0 + 3000, 15).pools.get('x86_64-linux')).toMatchObject({
+			idle: 0,
+			idleSince: null,
+			idleBefore: false
+		});
+		// Back, and idle from now.
+		r.apply(s.next(E.worker('b')), T0 + 4000);
+		expect(r.views(T0 + 4000, 15).pools.get('x86_64-linux')).toMatchObject({
+			idle: 1,
+			idleSince: T0 + 4000,
+			idleBefore: false
+		});
+		// A new stream: what happened in the gap is unknown, so the time is a bound again.
+		r.beginStream();
+		const s2 = new Stream(500n, T0 + 9000);
+		r.apply(
+			s2.snapshot(
+				E.reset(),
+				E.client(1, 'ci'),
+				E.worker('a'),
+				E.worker('b'),
+				E.drv(A1, { phase: Phase.ASSIGNED, workerAddr: 'a', clientIds: [1n] })
+			),
+			T0 + 9000
+		);
+		expect(r.views(T0 + 9000, 15).pools.get('x86_64-linux')).toMatchObject({
+			idle: 1,
+			idleSince: T0 + 9000,
+			idleBefore: true
+		});
+	});
+});
+
 describe('line failures', () => {
 	const MIN = 60_000;
 	const assign = (path: string, addr: string, ids: number[] = []) =>

@@ -301,7 +301,15 @@ type WorkerRec = {
 	 * how long it has been offline is then unknown.
 	 */
 	seenGoneAt: number;
+	/** Browser clock when it last went idle: taking work, nothing assigned. 0 while not idle. */
+	idleSince: number;
+	/** It was idle when the stream's snapshot showed it, so idleSince is a bound only. */
+	idleBefore: boolean;
 };
+
+/** Up, not draining and with slots: what the scheduler places work on, unless it rests the builder. */
+const takesWork = (w: Pick<WorkerRec, 'up' | 'draining' | 'maxJobs'>) =>
+	w.up && !w.draining && w.maxJobs > 0;
 
 /** Line histories: an hour in 30 s buckets, Float32 to halve their size. */
 const LINE_HISTORY = { windowMs: 3_600_000, buckets: 120, compact: true };
@@ -400,6 +408,14 @@ type PoolAcc = {
 	offline: number;
 	running: number;
 	slots: number;
+	/** Builders taking work by max_jobs, and the slots assigned on them. */
+	workingJobs: Map<number, number>;
+	workingRunning: number;
+	/** Connected builders by max_jobs, for builderSlots while none takes work. */
+	connectedJobs: Map<number, number>;
+	idle: number;
+	idleSince: number;
+	idleBefore: boolean;
 	/** Builders per distinct offer of systems and features, for features and the queue count. */
 	offers: Map<string, { w: WorkerRec; n: number }>;
 	assign: number;
@@ -486,6 +502,23 @@ function unique(xs: readonly string[]): readonly string[] {
 /** Three significant digits: keeps tiny rate changes from replacing views. */
 function round3(x: number): number {
 	return x > 0 ? Number(x.toPrecision(3)) : 0;
+}
+
+/** The median of values, given as a map from each value to how many have it. 0 for none. */
+function medianOf(counts: ReadonlyMap<number, number>): number {
+	let n = 0;
+	for (const c of counts.values()) n += c;
+	if (n === 0) return 0;
+	const keys = [...counts.keys()].sort((a, b) => a - b);
+	// The values at the two middle ranks, the same one when n is odd.
+	const at = (rank: number) => {
+		for (const k of keys) {
+			rank -= counts.get(k)!;
+			if (rank < 0) return k;
+		}
+		return keys[keys.length - 1];
+	};
+	return (at(Math.floor((n - 1) / 2)) + at(Math.floor(n / 2))) / 2;
 }
 
 function phaseOf(p: DrvState_Phase): DrvPhase {
@@ -705,6 +738,10 @@ export class FarmReducer {
 		unreported: number;
 	} = { byUrl: new Map(), builders: 0, unreported: 0 };
 	#systems: SystemQueueView[] = [];
+	/** Per pool at the last Stats: the scheduler's slots and free over the pool's system. */
+	#placement = new Map<string, { slots: number; free: number }>();
+	/** Builders whose assignments, state or slots changed: their idleSince is due. */
+	readonly #idleDirty = new Set<string>();
 	#meters!: {
 		assign: RateMeter;
 		hits: RateMeter;
@@ -816,6 +853,8 @@ export class FarmReducer {
 				switch (e.case) {
 					case 'snapshotDone':
 						if (!live) {
+							// Idle in the snapshot: since when is unknown.
+							this.#flushIdle(false, now);
 							this.#phase = 'live';
 							this.#complete = true;
 							snapshotDone = true;
@@ -849,6 +888,7 @@ export class FarmReducer {
 				}
 			}
 		} finally {
+			this.#flushIdle(this.#phase === 'live', now);
 			if (maxTime > 0) this.#sampleOffset(now - maxTime, now);
 			if (this.#phase === 'live') {
 				this.#live.add(1, now);
@@ -879,6 +919,8 @@ export class FarmReducer {
 		this.#queued.clear();
 		this.#byWorker.clear();
 		this.#sys.clear();
+		this.#placement = new Map();
+		this.#idleDirty.clear();
 		this.#nQueued = this.#nUnplaceable = this.#nAssigned = 0;
 		this.#clients.clear();
 		this.#follows.clear();
@@ -902,6 +944,7 @@ export class FarmReducer {
 				w.up = false;
 				w.draining = false;
 				w.drainReason = null;
+				w.idleSince = 0;
 			}
 			this.#workersDirty = true;
 			for (const g of this.#groups.values()) {
@@ -1025,9 +1068,12 @@ export class FarmReducer {
 				subs: substitutersFromProto(w.substituters),
 				retired: false,
 				goneAt: w.up ? 0 : now,
-				seenGoneAt: 0
+				seenGoneAt: 0,
+				idleSince: 0,
+				idleBefore: false
 			};
 			this.#workers.set(w.addr, rec);
+			this.#idleDirty.add(w.addr);
 			this.#workersDirty = true;
 			this.#subsDirty = true;
 			if (live && w.up) this.#churnOf(rec).joined.add(1, now);
@@ -1058,6 +1104,7 @@ export class FarmReducer {
 		rec.up = w.up;
 		rec.draining = w.draining;
 		rec.drainReason = drainReasonOf(w);
+		this.#idleDirty.add(w.addr);
 		// A builder keeps its last report while it is down.
 		if (w.diskFreeBytes !== undefined) rec.diskFree = Number(w.diskFreeBytes);
 		if (w.diskTotalBytes !== undefined) rec.diskTotal = Number(w.diskTotalBytes);
@@ -1260,6 +1307,7 @@ export class FarmReducer {
 			let s = this.#byWorker.get(worker);
 			if (!s) this.#byWorker.set(worker, (s = new Set()));
 			s.add(rec);
+			this.#idleDirty.add(worker);
 			this.#nAssigned++;
 			return;
 		}
@@ -1287,6 +1335,7 @@ export class FarmReducer {
 				s.delete(rec);
 				if (s.size === 0) this.#byWorker.delete(rec.worker);
 			}
+			this.#idleDirty.add(rec.worker);
 			this.#nAssigned--;
 			return;
 		}
@@ -1521,6 +1570,35 @@ export class FarmReducer {
 			if (this.#samples.length > HISTORY_KEEP) this.#samples.shift();
 		}
 		this.#systems = this.#queueRows(s.systems);
+		this.#placement = this.#placementOf(s.systems);
+	}
+
+	/** The scheduler's slots and free per pool, from Stats rows keyed by what builders offer. */
+	#placementOf(stats: readonly SystemStats[]) {
+		const out = new Map<string, { slots: number; free: number }>();
+		for (const x of stats) {
+			if (!x.slots) continue;
+			const pool = poolOf(x.system);
+			let p = out.get(pool);
+			if (!p) out.set(pool, (p = { slots: 0, free: 0 }));
+			p.slots += x.slots;
+			p.free += x.free;
+		}
+		return out;
+	}
+
+	/** Brings idleSince up to date for builders whose state changed. `known`: the page saw it go idle. */
+	#flushIdle(known: boolean, now: number) {
+		for (const addr of this.#idleDirty) {
+			const w = this.#workers.get(addr);
+			if (!w) continue;
+			if (!takesWork(w) || this.#byWorker.has(addr)) w.idleSince = 0;
+			else if (!w.idleSince) {
+				w.idleSince = now;
+				w.idleBefore = !known;
+			}
+		}
+		this.#idleDirty.clear();
 	}
 
 	/**
@@ -1944,7 +2022,7 @@ export class FarmReducer {
 			const running = this.#byWorker.get(addr)?.size ?? 0;
 			if (w.up) {
 				workersUp++;
-				if (!w.draining && w.maxJobs > 0) {
+				if (takesWork(w)) {
 					slots += w.maxJobs;
 					free += Math.max(0, w.maxJobs - running);
 				}
@@ -2006,6 +2084,12 @@ export class FarmReducer {
 					offline: 0,
 					running: 0,
 					slots: 0,
+					workingJobs: new Map(),
+					workingRunning: 0,
+					connectedJobs: new Map(),
+					idle: 0,
+					idleSince: 0,
+					idleBefore: false,
 					offers: new Map(),
 					assign: 0,
 					publish: 0,
@@ -2026,6 +2110,20 @@ export class FarmReducer {
 			} else p.up++;
 			if (w.up) p.slots += w.maxJobs;
 			p.running += running;
+			if (w.up && w.maxJobs > 0)
+				p.connectedJobs.set(w.maxJobs, (p.connectedJobs.get(w.maxJobs) ?? 0) + 1);
+			if (takesWork(w)) {
+				p.workingJobs.set(w.maxJobs, (p.workingJobs.get(w.maxJobs) ?? 0) + 1);
+				// As the scheduler counts them: at most its slots.
+				p.workingRunning += Math.min(running, w.maxJobs);
+			}
+			if (w.idleSince) {
+				p.idle++;
+				if (!p.idleSince || w.idleSince < p.idleSince) {
+					p.idleSince = w.idleSince;
+					p.idleBefore = w.idleBefore;
+				}
+			}
 			const o = p.offers.get(w.offer);
 			if (o) o.n++;
 			else p.offers.set(w.offer, { w, n: 1 });
@@ -2057,6 +2155,11 @@ export class FarmReducer {
 			for (const { w, n } of p.offers.values())
 				for (const f of w.features) features.set(f, (features.get(f) ?? 0) + n);
 			const churn = this.#churn.get(system);
+			// The scheduler's count where it has one.
+			const pl = this.#placement.get(system);
+			const occupied = pl && pl.slots > 0 ? pl.slots - pl.free : p.workingRunning;
+			const builderSlots = medianOf(p.workingJobs.size > 0 ? p.workingJobs : p.connectedJobs);
+			const needed = builderSlots > 0 ? Math.ceil((occupied + queuedCanTake) / builderSlots) : null;
 			pools.set(system, {
 				system,
 				builders: p.builders,
@@ -2070,6 +2173,13 @@ export class FarmReducer {
 				running: p.running,
 				slots: p.slots,
 				queuedCanTake,
+				occupied,
+				builderSlots,
+				needed,
+				spare: Math.max(0, p.up - (needed ?? p.up)),
+				idle: p.idle,
+				idleSince: p.idleSince || null,
+				idleBefore: p.idleBefore,
 				features: [...features]
 					.sort((a, b) => b[1] - a[1] || compareNatural(a[0], b[0]))
 					.map(([name, builders]) => ({ name, builders })),

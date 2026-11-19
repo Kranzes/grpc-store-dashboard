@@ -13,9 +13,17 @@
 	} from '#lib/model/types.ts';
 	import type { LineKind } from '#lib/flow/kinds.ts';
 	import { drainRow, knownDrains, poolDrains } from '../drain.ts';
-	import { formatBytes, formatCount } from '../format.ts';
+	import { clock } from '../clock.svelte.ts';
+	import {
+		formatBytes,
+		formatClockMinutes,
+		formatCount,
+		formatShort,
+		spokenShort
+	} from '../format.ts';
 	import { Hold } from '../hold.svelte.ts';
 	import Segmented from '../Segmented.svelte';
+	import Spoken from '../Spoken.svelte';
 	import { Throttled } from '../throttle.svelte.ts';
 	import VirtualList from '../VirtualList.svelte';
 	import WindowCaption from '../WindowCaption.svelte';
@@ -39,6 +47,8 @@
 	const p = $derived(store.pools.get(system));
 	const fill = $derived(p && p.slots > 0 ? Math.min(1, p.running / p.slots) : 0);
 	const collapsed = $derived(pools.collapsed(system));
+	/** How long the builder idle longest has been idle. Only an open panel with idle builders reads the clock. */
+	const idleFor = $derived(p?.idleSince != null ? Math.max(0, clock.now - p.idleSince) : null);
 
 	// Search, sort, filter and scroll as the user left them for this pool, so
 	// coming back from a builder finds the list unchanged. The panel is keyed
@@ -115,7 +125,46 @@
 				</dt>
 				<dd>{formatCount(p.queuedCanTake)}</dd>
 			</div>
+			<div class="wide">
+				<dt
+					title="Slots in use on builders taking work, plus the queued derivations this pool can take, over the median builder's {formatCount(
+						p.builderSlots
+					)} slots, rounded up"
+				>
+					Needed now
+				</dt>
+				<dd class="small">
+					{#if p.needed === null}
+						Unknown
+					{:else}
+						{@const of = ` of ${formatCount(p.up)} online (${formatCount(p.spare)} spare)`}
+						{formatCount(p.needed)}<span class="p-of">{of}</span>
+					{/if}
+				</dd>
+			</div>
+			<div class="wide">
+				<dt title="Online builders with nothing assigned">Idle</dt>
+				<dd
+					class="small"
+					title={p.idleSince === null
+						? undefined
+						: p.idleBefore
+							? `The longest idle one was already idle when this page connected, at ${formatClockMinutes(p.idleSince)}.`
+							: `The longest idle one went idle at ${formatClockMinutes(p.idleSince)}.`}
+				>
+					{formatCount(p.idle)}{#if idleFor !== null}<span class="p-of"
+							>, longest {p.idleBefore ? 'over ' : ''}<Spoken
+								text={formatShort(idleFor)}
+								words={spokenShort(idleFor)}
+							/></span
+						>{/if}
+				</dd>
+			</div>
 		</dl>
+		<p class="p-caption">
+			If an autoscaler follows the scheduler, it asks for the needed builders. A gap that lasts is
+			capacity it holds, such as a scale-in delay or a minimum, not load.
+		</p>
 		<div class="p-when-group">
 			<WindowCaption minutes={POOL_CHURN_MINUTES} since={p.churnSince} />
 			<dl class="p-facts facts">
@@ -238,6 +287,14 @@
 
 	.facts dd {
 		font-size: var(--text-md);
+	}
+
+	.facts dd.small {
+		font-size: var(--text-sm);
+	}
+
+	.facts .wide {
+		grid-column: span 2;
 	}
 
 	.toggle {

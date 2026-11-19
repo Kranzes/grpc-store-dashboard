@@ -271,6 +271,28 @@ export type PoolView = Readonly<{
 	 * every feature it needs. Unplaceable ones do not count.
 	 */
 	queuedCanTake: number;
+	/**
+	 * Slots the pool's builds take, as the scheduler counts them: slots minus
+	 * free of the pool's builders at the last Stats. Before any, the assigned
+	 * slots of builders taking work, at most each one's max_jobs.
+	 */
+	occupied: number;
+	/** The median max_jobs of builders taking work, or of connected ones while none does. 0 when unknown. */
+	builderSlots: number;
+	/**
+	 * How many builders of builderSlots slots the occupied slots and
+	 * queuedCanTake fill, which an autoscaler that follows the scheduler would
+	 * ask for. null when builderSlots is unknown.
+	 */
+	needed: number | null;
+	/** Online builders beyond `needed`. */
+	spare: number;
+	/** Online builders taking work with nothing assigned. */
+	idle: number;
+	/** When the one idle longest went idle, browser clock. null without idle builders. */
+	idleSince: number | null;
+	/** That builder was already idle when this stream started, so idleSince is only a bound. */
+	idleBefore: boolean;
 	/** Features and how many builders offer each, most common first. */
 	features: readonly Readonly<{ name: string; builders: number }>[];
 	/** Builders that connected or came back, and that disconnected, within POOL_CHURN_MINUTES. */
