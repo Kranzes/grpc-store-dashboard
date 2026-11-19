@@ -196,22 +196,23 @@ message WorkerState {
   // from the change between two events. Kept while the builder is down and
   // across its reconnects.
   repeated SubstituterTraffic substituters = 12;
-  // The builder's host as its last WorkerReport said: CPUs busy over about
-  // a second, in thousandths of a CPU, and its online CPUs; memory in use
-  // and in all. Host-wide, so every process on the host counts, not only
-  // the builder's builds. Unset: the builder does not report them, as
-  // older builders and hosts without /proc do. Hello clears them until the
-  // session's first report.
+  // The builder's host as its last WorkerReport said: CPUs busy and CPUs in
+  // iowait, each averaged over about the last minute, in thousandths of a
+  // CPU, and its online CPUs; memory in use and in all. Host-wide, so every
+  // process on the host counts, not only the builder's builds. Unset: the
+  // builder does not report them, as older builders and hosts without /proc
+  // do. Hello clears them until the session's first report.
   optional uint64 cpu_busy_millicores = 13;
   optional uint32 cpu_cores = 14;
   optional uint64 mem_used_bytes = 15;
   optional uint64 mem_total_bytes = 16;
+  optional uint64 cpu_iowait_millicores = 17;
   // While the scheduler rests the builder: when the rest ends, Unix ms. A
   // builder that gave back builds for failures of its own more than twice
   // since it last finished one gets no new builds for 30 s, twice as long
   // for each further give-back, up to 10 minutes. Its builds in progress go
   // on. Unset while it is not resting, and from older schedulers.
-  optional uint64 rests_until_ms = 17;
+  optional uint64 rests_until_ms = 18;
 }
 
 message SubstituterTraffic {
@@ -453,6 +454,7 @@ message PoolSample {
   optional uint32 cpu_cores = 7;
   optional uint64 mem_used_bytes = 8;
   optional uint64 mem_total_bytes = 9;
+  optional uint64 cpu_iowait_millicores = 10;
 }
 
 message SystemStats {

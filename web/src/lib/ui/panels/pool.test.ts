@@ -19,6 +19,7 @@ const w = (addr: string, o: Partial<WorkerView> = {}): WorkerView => ({
 	minFree: 0,
 	version: '',
 	cpuBusy: null,
+	cpuIowait: null,
 	cpuCores: null,
 	memUsed: null,
 	memTotal: null,

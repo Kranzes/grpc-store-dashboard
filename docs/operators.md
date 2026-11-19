@@ -474,7 +474,8 @@ publishes to the cache fail 3 times in a row takes no builds for a minute, and i
 "Publishing failing".
 
 The same goes for CPU and memory. Patched Linux builders read them from `/proc` for the whole
-host, so anything else running there counts too. macOS builders report none. A pool whose
+host, so anything else running there counts too, and average the CPU over the last minute. Time a
+CPU spends idle waiting on its disk shows apart, as I/O wait. macOS builders report none. A pool whose
 builders do not all report says how many do, as in "170 of 177 builders".
 
 A pool's panel charts its slots in use and busy CPUs over the last hour. A patched scheduler keeps

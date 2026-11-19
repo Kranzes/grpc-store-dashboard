@@ -1,4 +1,4 @@
-From a8bb9e26e4e4e4cc4a93a5f9e0feca0bf17abf00 Mon Sep 17 00:00:00 2001
+From ff8940f9954b550cef3eda1d704cc3c848f51f95 Mon Sep 17 00:00:00 2001
 From: Ilan Joselevich <personal@ilanjoselevich.com>
 Date: Thu, 19 Nov 2026 06:50:57 +0100
 Subject: [PATCH 14/15] scheduler: sample each pool's use with the counters
@@ -11,8 +11,8 @@ its slots, starts empty on every new page.
 Each CounterSample now carries a PoolSample per native system of the
 connected builders: how many are up, drvs assigned to them, and the
 max_jobs and free slots of those that take work, as Stats counts them.
-It also carries the sums of busy CPUs and memory of the builders whose
-WorkerState has them, unset while none does. The scheduler fills them
+It also carries the sums of busy CPUs, CPUs in iowait and memory of the
+builders whose WorkerState has them, unset while none does. The scheduler fills them
 in the once-a-minute sample from the same counts as Stats, so
 Reset.history's 61 samples give a new watcher the last hour. The sample
 taken when serving starts has none, and so does every sample from an
@@ -20,14 +20,14 @@ older scheduler.
 
 events-test covers the samples.
 ---
- proto/events.proto              | 24 +++++++++++--
- src/daemon/dispatcher-events.cc | 60 +++++++++++++++++++++++++++++++++
+ proto/events.proto              | 25 +++++++++++--
+ src/daemon/dispatcher-events.cc | 62 +++++++++++++++++++++++++++++++++
  src/daemon/dispatcher.hh        |  1 +
- tests/events-test.cc            | 52 ++++++++++++++++++++++++++++
- 4 files changed, 135 insertions(+), 2 deletions(-)
+ tests/events-test.cc            | 53 ++++++++++++++++++++++++++++
+ 4 files changed, 139 insertions(+), 2 deletions(-)
 
 diff --git a/proto/events.proto b/proto/events.proto
-index 3645190..7289047 100644
+index 3fbc0e2..92516de 100644
 --- a/proto/events.proto
 +++ b/proto/events.proto
 @@ -146,8 +146,8 @@ message Reset {
@@ -41,7 +41,7 @@ index 3645190..7289047 100644
    repeated CounterSample history = 6;
    // The farm cache as builders list it among their substituters
    // (--niks3-cache-url, reduced like WorkerState.substituters). Empty when
-@@ -427,6 +427,26 @@ message Counters {
+@@ -428,6 +428,27 @@ message Counters {
  message CounterSample {
    uint64 time_ms = 1;
    Counters counters = 2;
@@ -65,14 +65,15 @@ index 3645190..7289047 100644
 +  optional uint32 cpu_cores = 7;
 +  optional uint64 mem_used_bytes = 8;
 +  optional uint64 mem_total_bytes = 9;
++  optional uint64 cpu_iowait_millicores = 10;
  }
  
  message SystemStats {
 diff --git a/src/daemon/dispatcher-events.cc b/src/daemon/dispatcher-events.cc
-index c919ca5..596b596 100644
+index 99ee20d..c34c8d0 100644
 --- a/src/daemon/dispatcher-events.cc
 +++ b/src/daemon/dispatcher-events.cc
-@@ -243,11 +243,71 @@ void Dispatcher::sampleLocked()
+@@ -243,11 +243,73 @@ void Dispatcher::sampleLocked()
      auto & sample = history.emplace_back();
      sample.set_time_ms(wallMs(now));
      *sample.mutable_counters() = counters;
@@ -121,6 +122,7 @@ index c919ca5..596b596 100644
 +        const auto & add = *load;
 +        auto & sum = pool.load.has_value() ? pool.load.value() : pool.load.emplace();
 +        sum.cpuBusyMillicores += add.cpuBusyMillicores;
++        sum.cpuIowaitMillicores += add.cpuIowaitMillicores;
 +        sum.cpuCores += add.cpuCores;
 +        sum.memUsedBytes += add.memUsedBytes;
 +        sum.memTotalBytes += add.memTotalBytes;
@@ -134,6 +136,7 @@ index c919ca5..596b596 100644
 +        out.set_free(static_cast<uint32_t>(pool.stats.free));
 +        if (pool.load) {
 +            out.set_cpu_busy_millicores(pool.load->cpuBusyMillicores);
++            out.set_cpu_iowait_millicores(pool.load->cpuIowaitMillicores);
 +            out.set_cpu_cores(pool.load->cpuCores);
 +            out.set_mem_used_bytes(pool.load->memUsedBytes);
 +            out.set_mem_total_bytes(pool.load->memTotalBytes);
@@ -157,10 +160,10 @@ index 9d3bf89..5e4164d 100644
          const std::map<sched::Core::StatsKey, sched::Core::Stats> & stats);
      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) auto drvEventLocked(
 diff --git a/tests/events-test.cc b/tests/events-test.cc
-index 9bea1ed..afe50ab 100644
+index 1c459db..0468cdc 100644
 --- a/tests/events-test.cc
 +++ b/tests/events-test.cc
-@@ -1717,6 +1717,57 @@ void testLoad()
+@@ -1718,6 +1718,58 @@ void testLoad()
      assert(back.up() && !back.has_cpu_busy_millicores() && !back.has_mem_total_bytes());
  }
  
@@ -186,6 +189,7 @@ index 9bea1ed..afe50ab 100644
 +    rpc::WorkerMsg load;
 +    auto * rep = load.mutable_report();
 +    rep->set_cpu_busy_millicores(1500);
++    rep->set_cpu_iowait_millicores(250);
 +    rep->set_cpu_cores(8);
 +    rep->set_mem_used_bytes(3000);
 +    rep->set_mem_total_bytes(8000);
@@ -211,14 +215,14 @@ index 9bea1ed..afe50ab 100644
 +    const auto & x86pool = pools.Get(1);
 +    assert(x86pool.system() == x86 && x86pool.builders_up() == 2 && x86pool.running() == 1);
 +    assert(x86pool.slots() == 12 && x86pool.free() == 11);
-+    assert(x86pool.cpu_busy_millicores() == 1500 && x86pool.cpu_cores() == 8);
++    assert(x86pool.cpu_busy_millicores() == 1500 && x86pool.cpu_iowait_millicores() == 250 && x86pool.cpu_cores() == 8);
 +    assert(x86pool.mem_used_bytes() == 3000 && x86pool.mem_total_bytes() == 8000);
 +}
 +
  void testRandom()
  {
      for (unsigned seed = 1; seed <= 8; seed++) {
-@@ -2067,6 +2118,7 @@ try {
+@@ -2068,6 +2120,7 @@ try {
      testVersionCut();
      testReports();
      testLoad();

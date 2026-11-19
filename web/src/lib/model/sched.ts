@@ -70,6 +70,7 @@ export function newPool(): PoolTally {
 		slots: 0,
 		free: 0,
 		cpuBusy: null,
+		cpuIowait: null,
 		cpuCores: null,
 		memUsed: null,
 		memTotal: null
@@ -80,6 +81,7 @@ export function newPool(): PoolTally {
 export function addLoad(p: PoolTally, l: HostLoad): void {
 	if (l.cpuBusy !== null && l.cpuCores !== null) {
 		p.cpuBusy = (p.cpuBusy ?? 0) + l.cpuBusy;
+		p.cpuIowait = (p.cpuIowait ?? 0) + (l.cpuIowait ?? 0);
 		p.cpuCores = (p.cpuCores ?? 0) + l.cpuCores;
 	}
 	if (l.memUsed !== null && l.memTotal !== null) {
@@ -243,7 +245,9 @@ export function offers(
 
 /** A builder's or a pool's host: busy CPUs and CPUs, bytes in use and in all. null where not reported. */
 export type HostLoad = Readonly<{
+	/** CPUs busy, and CPUs idle with I/O of theirs outstanding: each the average over about a minute. */
 	cpuBusy: number | null;
+	cpuIowait: number | null;
 	cpuCores: number | null;
 	memUsed: number | null;
 	memTotal: number | null;
@@ -252,6 +256,7 @@ export type HostLoad = Readonly<{
 /** The load fields of a WorkerState, as the proto names them. */
 type LoadFields = {
 	cpuBusyMillicores?: bigint;
+	cpuIowaitMillicores?: bigint;
 	cpuCores?: number;
 	memUsedBytes?: bigint;
 	memTotalBytes?: bigint;
@@ -263,6 +268,8 @@ export function loadFromProto(x: LoadFields): HostLoad {
 	const mem = x.memUsedBytes !== undefined && x.memTotalBytes !== undefined;
 	return {
 		cpuBusy: cpu ? Number(x.cpuBusyMillicores) / 1000 : null,
+		cpuIowait:
+			cpu && x.cpuIowaitMillicores !== undefined ? Number(x.cpuIowaitMillicores) / 1000 : null,
 		cpuCores: cpu ? x.cpuCores! : null,
 		memUsed: mem ? Number(x.memUsedBytes) : null,
 		memTotal: mem ? Number(x.memTotalBytes) : null
@@ -274,6 +281,9 @@ export function loadToProto(l: HostLoad): LoadFields {
 	return {
 		...(l.cpuBusy !== null && l.cpuCores !== null
 			? { cpuBusyMillicores: BigInt(Math.round(l.cpuBusy * 1000)), cpuCores: l.cpuCores }
+			: {}),
+		...(l.cpuBusy !== null && l.cpuIowait !== null
+			? { cpuIowaitMillicores: BigInt(Math.round(l.cpuIowait * 1000)) }
 			: {}),
 		...(l.memUsed !== null && l.memTotal !== null
 			? {

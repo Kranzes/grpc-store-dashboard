@@ -43,6 +43,7 @@ const worker = (addr: string, system = 'x86_64-linux'): WorkerView => ({
 	minFree: 0,
 	version: '',
 	cpuBusy: null,
+	cpuIowait: null,
 	cpuCores: null,
 	memUsed: null,
 	memTotal: null,

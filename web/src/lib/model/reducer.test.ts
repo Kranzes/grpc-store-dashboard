@@ -1450,6 +1450,7 @@ describe('host load', () => {
 	const GiB = 1024 ** 3;
 	const load = (busyMilli: number, cores: number, usedGiB: number, totalGiB: number) => ({
 		cpuBusyMillicores: BigInt(busyMilli),
+		cpuIowaitMillicores: BigInt(busyMilli / 4),
 		cpuCores: cores,
 		memUsedBytes: BigInt(usedGiB * GiB),
 		memTotalBytes: BigInt(totalGiB * GiB)
@@ -1466,12 +1467,14 @@ describe('host load', () => {
 		let v = r.views(T0, 15);
 		expect(v.workers.get('a')).toMatchObject({
 			cpuBusy: 4.5,
+			cpuIowait: 1.125,
 			cpuCores: 16,
 			memUsed: 20 * GiB,
 			memTotal: 64 * GiB
 		});
 		expect(v.workers.get('b')).toMatchObject({
 			cpuBusy: null,
+			cpuIowait: null,
 			cpuCores: null,
 			memUsed: null,
 			memTotal: null
@@ -1498,6 +1501,7 @@ describe('host load', () => {
 			draining: 1,
 			offline: 1,
 			cpuBusy: 6,
+			cpuIowait: 1.5,
 			cpuCores: 24,
 			memUsed: 24 * GiB,
 			memTotal: 96 * GiB,
@@ -1510,6 +1514,7 @@ describe('host load', () => {
 		const { r } = farm();
 		expect(r.views(T0, 15).pools.get('x86_64-linux')).toMatchObject({
 			cpuBusy: null,
+			cpuIowait: null,
 			cpuCores: null,
 			memUsed: null,
 			memTotal: null,

@@ -293,6 +293,7 @@ type WorkerRec = {
 	version: string;
 	/** As its last WorkerState says; null: not reported. CPUs, not millicores. */
 	cpuBusy: number | null;
+	cpuIowait: number | null;
 	cpuCores: number | null;
 	memUsed: number | null;
 	memTotal: number | null;
@@ -437,6 +438,7 @@ type PoolAcc = {
 	running: number;
 	slots: number;
 	cpuBusy: number;
+	cpuIowait: number;
 	cpuCores: number;
 	memUsed: number;
 	memTotal: number;
@@ -2169,6 +2171,7 @@ export class FarmReducer {
 				minFree: w.minFree,
 				version: w.version,
 				cpuBusy: w.up ? w.cpuBusy : null,
+				cpuIowait: w.up ? w.cpuIowait : null,
 				cpuCores: w.up ? w.cpuCores : null,
 				memUsed: w.up ? w.memUsed : null,
 				memTotal: w.up ? w.memTotal : null,
@@ -2211,6 +2214,7 @@ export class FarmReducer {
 					running: 0,
 					slots: 0,
 					cpuBusy: 0,
+					cpuIowait: 0,
 					cpuCores: 0,
 					memUsed: 0,
 					memTotal: 0,
@@ -2246,6 +2250,7 @@ export class FarmReducer {
 			if (w.up && (w.cpuCores !== null || w.memTotal !== null)) {
 				p.loadBuilders++;
 				p.cpuBusy += w.cpuBusy ?? 0;
+				p.cpuIowait += w.cpuIowait ?? 0;
 				p.cpuCores += w.cpuCores ?? 0;
 				p.memUsed += w.memUsed ?? 0;
 				p.memTotal += w.memTotal ?? 0;
@@ -2343,6 +2348,7 @@ export class FarmReducer {
 				needed,
 				spare: Math.max(0, p.up - (needed ?? p.up)),
 				cpuBusy: p.cpuCores ? round3(p.cpuBusy) : null,
+				cpuIowait: p.cpuCores ? round3(p.cpuIowait) : null,
 				cpuCores: p.cpuCores || null,
 				memUsed: p.memTotal ? p.memUsed : null,
 				memTotal: p.memTotal || null,

@@ -212,11 +212,13 @@ export type WorkerView = Readonly<{
 	/** nix-grpc-store version, '' when the builder does not report it. */
 	version: string;
 	/**
-	 * Its host's CPUs busy, over about a second, and online CPUs; memory in
-	 * use and in all, bytes. Host-wide, so other processes on the host count
-	 * too. null when the builder does not report them.
+	 * Its host's CPUs busy and CPUs idle with I/O of theirs outstanding, each
+	 * averaged over about the last minute, and online CPUs; memory in use and
+	 * in all, bytes. Host-wide, so other processes on the host count too.
+	 * null when the builder does not report them.
 	 */
 	cpuBusy: number | null;
+	cpuIowait: number | null;
 	cpuCores: number | null;
 	memUsed: number | null;
 	memTotal: number | null;
@@ -328,10 +330,11 @@ export type PoolView = Readonly<{
 	idleBefore: boolean;
 	/**
 	 * CPU and memory summed over connected builders that report them,
-	 * draining ones included: busy CPUs and CPUs, bytes in use and in all.
-	 * null while none does.
+	 * draining ones included: busy CPUs, CPUs in iowait and all CPUs, bytes in
+	 * use and in all. null while none does.
 	 */
 	cpuBusy: number | null;
+	cpuIowait: number | null;
 	cpuCores: number | null;
 	memUsed: number | null;
 	memTotal: number | null;

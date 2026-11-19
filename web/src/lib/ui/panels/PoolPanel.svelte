@@ -50,6 +50,7 @@
 	const p = $derived(store.pools.get(system));
 	const fill = $derived(p && p.slots > 0 ? Math.min(1, p.running / p.slots) : 0);
 	const collapsed = $derived(pools.collapsed(system));
+	const ioWait = $derived(p ? loadShares(p).io : null);
 	// CPU and Memory, each while some builder reports it.
 	const meters = $derived.by(() => {
 		if (!p) return [];
@@ -184,6 +185,16 @@
 						>{/if}
 				</dd>
 			</div>
+			{#if ioWait !== null}
+				<div>
+					<dt
+						title="CPUs idle with I/O of theirs still outstanding, as a share of all CPUs, over the last minute. Builds that wait on disk show here, not as spare CPU."
+					>
+						I/O wait
+					</dt>
+					<dd>{formatPercent(ioWait)}</dd>
+				</div>
+			{/if}
 		</dl>
 		{#if coverage}
 			<p class="p-caption num">

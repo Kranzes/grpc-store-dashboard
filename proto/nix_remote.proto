@@ -422,17 +422,20 @@ message WorkerReport {
   // needs no entry: its Done tells the scheduler.
   repeated BuildProgress builds = 4;
   // The host's load. It is host-wide, so every process on the host counts,
-  // not only this builder's builds. Busy CPUs are the share of /proc/stat
-  // jiffies since the builder's previous sample, about a second earlier,
-  // that were neither idle nor iowait, times the online CPUs, in
-  // thousandths of a CPU. Memory in use is MemTotal minus MemAvailable from
-  // /proc/meminfo. Set in the first report of a session, then when busy
-  // moved by at least 5% of cpu_cores, memory in use by 5% of the total, or
-  // 30 s passed since they last went out. Hosts without /proc send none.
+  // not only this builder's builds. The CPU figures are averages over about
+  // the last minute of /proc/stat, in thousandths of a CPU: CPUs busy in
+  // user, system or interrupt time, and CPUs idle with I/O of theirs still
+  // outstanding (iowait). Steal, the time a hypervisor took, counts as
+  // neither. Memory in use is MemTotal minus MemAvailable from
+  // /proc/meminfo, as of the report. Set in the first report of a session,
+  // then when busy moved by at least 5% of cpu_cores, memory in use by 5% of
+  // the total, or 30 s passed since they last went out. Hosts without /proc
+  // send none.
   optional uint64 cpu_busy_millicores = 5;
   optional uint32 cpu_cores = 6;
   optional uint64 mem_used_bytes = 7;
   optional uint64 mem_total_bytes = 8;
+  optional uint64 cpu_iowait_millicores = 9;
 }
 
 // What a builder knows about one running build that the scheduler does not.

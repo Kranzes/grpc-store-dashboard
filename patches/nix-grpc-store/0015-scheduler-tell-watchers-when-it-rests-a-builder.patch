@@ -1,4 +1,4 @@
-From 858670451fac185e7bcbde3ba868afbbc4133f44 Mon Sep 17 00:00:00 2001
+From 44b42cdf43a8be1c07024f84d5913a1b4b341d61 Mon Sep 17 00:00:00 2001
 From: Ilan Joselevich <personal@ilanjoselevich.com>
 Date: Thu, 19 Nov 2026 08:36:06 +0100
 Subject: [PATCH 15/15] scheduler: tell watchers when it rests a builder
@@ -22,27 +22,27 @@ events-test covers both.
  4 files changed, 70 insertions(+)
 
 diff --git a/proto/events.proto b/proto/events.proto
-index 7289047..915d1f8 100644
+index 92516de..87fb692 100644
 --- a/proto/events.proto
 +++ b/proto/events.proto
-@@ -206,6 +206,12 @@ message WorkerState {
-   optional uint32 cpu_cores = 14;
+@@ -207,6 +207,12 @@ message WorkerState {
    optional uint64 mem_used_bytes = 15;
    optional uint64 mem_total_bytes = 16;
+   optional uint64 cpu_iowait_millicores = 17;
 +  // While the scheduler rests the builder: when the rest ends, Unix ms. A
 +  // builder that gave back builds for failures of its own more than twice
 +  // since it last finished one gets no new builds for 30 s, twice as long
 +  // for each further give-back, up to 10 minutes. Its builds in progress go
 +  // on. Unset while it is not resting, and from older schedulers.
-+  optional uint64 rests_until_ms = 17;
++  optional uint64 rests_until_ms = 18;
  }
  
  message SubstituterTraffic {
 diff --git a/src/daemon/dispatcher-events.cc b/src/daemon/dispatcher-events.cc
-index 596b596..28a1562 100644
+index c34c8d0..dd7f08e 100644
 --- a/src/daemon/dispatcher-events.cc
 +++ b/src/daemon/dispatcher-events.cc
-@@ -392,6 +392,9 @@ auto Dispatcher::workerEventLocked(sched::WorkerId wid) const -> WatchEvent
+@@ -394,6 +394,9 @@ auto Dispatcher::workerEventLocked(sched::WorkerId wid) const -> WatchEvent
      out.set_max_jobs(static_cast<uint32_t>(wkr.maxJobs));
      out.set_up(wkr.up);
      out.set_draining(wkr.draining);
@@ -90,10 +90,10 @@ index e0a2a22..4073dc6 100644
          }
          metrics.event("given_back_" + nix::remote::Done::Reason_Name(done.reason()));
 diff --git a/tests/events-test.cc b/tests/events-test.cc
-index afe50ab..81c8d50 100644
+index 0468cdc..f6eacd0 100644
 --- a/tests/events-test.cc
 +++ b/tests/events-test.cc
-@@ -1768,6 +1768,51 @@ void testPoolSamples()
+@@ -1770,6 +1770,51 @@ void testPoolSamples()
      assert(x86pool.mem_used_bytes() == 3000 && x86pool.mem_total_bytes() == 8000);
  }
  
@@ -145,7 +145,7 @@ index afe50ab..81c8d50 100644
  void testRandom()
  {
      for (unsigned seed = 1; seed <= 8; seed++) {
-@@ -2119,6 +2164,7 @@ try {
+@@ -2121,6 +2166,7 @@ try {
      testReports();
      testLoad();
      testPoolSamples();

@@ -296,21 +296,36 @@ const LOAD_STEP = 0.05;
 /** A number from 0 to 1 fixed by `parts`, so the load model draws nothing from the farm's RNGs. */
 const unit = (...parts: string[]) => hash32(...parts) / 2 ** 32;
 
-const BUILD_LOAD = new WeakMap<Drv, { cpus: number; mem: number }>();
+const BUILD_LOAD = new WeakMap<Drv, { cpus: number; io: number; mem: number }>();
 
-/** CPUs and memory a build takes, fixed by its path and worked out once. */
-function buildLoad(d: Drv): { cpus: number; mem: number } {
+/** CPUs busy, CPUs waiting on its I/O and memory a build takes, fixed by its path and worked out once. */
+function buildLoad(d: Drv): { cpus: number; io: number; mem: number } {
 	let b = BUILD_LOAD.get(d);
 	if (!b) {
 		const u = unit(d.path);
-		b = { cpus: 0.15 + 1.35 * u * u, mem: (0.5 + 3 * unit(d.path, 'mem')) * GiB };
+		const io = unit(d.path, 'io');
+		b = {
+			cpus: 0.15 + 1.35 * u * u,
+			io: 0.3 * io * io,
+			mem: (0.5 + 3 * unit(d.path, 'mem')) * GiB
+		};
 		BUILD_LOAD.set(d, b);
 	}
 	return b;
 }
 
-/** A host's load at a time: busy CPUs and all CPUs, bytes in use and in all. */
-type HostReading = { busy: number; cores: number; used: number; total: number; atMs: number };
+/**
+ * A host's load as its builder reports it: busy CPUs, CPUs in I/O wait and
+ * all CPUs, averaged over about the last minute, and bytes in use and in all.
+ */
+type HostReading = {
+	busy: number;
+	io: number;
+	cores: number;
+	used: number;
+	total: number;
+	atMs: number;
+};
 
 /** The farm's own cache, as builders list it among their substituters. */
 const FARM_CACHE = 'https://cache.farm.example';
@@ -522,6 +537,8 @@ type Worker = {
 	reportsLoad: boolean;
 	/** The load it last reported in this session, null before its first report. */
 	load: HostReading | null;
+	/** Its CPU averaged so far, which the builder reports. null before the first reading. */
+	cpuAvg: { busy: number; io: number; atMs: number } | null;
 	/** While the scheduler rests it: when the rest ends. 0 otherwise. */
 	restsUntil: number;
 	/** Its substituters: the farm cache, then the upstream ones. */
@@ -1187,6 +1204,7 @@ export class MockFarm {
 			lastReportMs: -Infinity,
 			reportsLoad: !sys.endsWith('-darwin') && unit(addr) >= 1 / 12,
 			load: null,
+			cpuAvg: null,
 			restsUntil: 0,
 			substituters: [],
 			subs: new Map(),
@@ -1430,24 +1448,34 @@ export class MockFarm {
 		}
 	}
 
-	/** The host's CPUs busy and memory in use now, from its builds. */
+	/**
+	 * The host's load as its builder would report it now: CPU from its builds,
+	 * averaged over about a minute of the farm's time, and memory in use now.
+	 */
 	#loadNow(w: Worker): HostReading {
 		let cpus = BASE_BUSY;
+		let io = 0;
 		let mem = BASE_MEM;
 		for (const d of w.running) {
 			const b = buildLoad(d);
 			cpus += b.cpus;
+			io += b.io;
 			mem += b.mem;
 		}
 		const cores = w.maxJobs * CPUS_PER_SLOT;
 		const total = w.maxJobs * MEM_PER_SLOT;
-		return {
-			busy: Math.min(cores, cpus),
-			cores,
-			used: Math.min(total, mem),
-			total,
+		const busy = Math.min(cores, cpus);
+		io = Math.min(cores - busy, io);
+		// An average that forgets over a minute: close enough to the builder's window.
+		const last = w.cpuAvg;
+		const k = last ? 1 - Math.exp(-((this.now - last.atMs) * this.options.speed) / 60_000) : 1;
+		const avg = {
+			busy: last ? last.busy + (busy - last.busy) * k : busy,
+			io: last ? last.io + (io - last.io) * k : io,
 			atMs: this.now
 		};
+		w.cpuAvg = avg;
+		return { busy: avg.busy, io: avg.io, cores, used: Math.min(total, mem), total, atMs: this.now };
 	}
 
 	/** Whether a builder sends `now`: the session's first, a step from the last, or LOAD_EVERY_MS since. */
@@ -1481,6 +1509,7 @@ export class MockFarm {
 			...(w.up && w.load
 				? loadToProto({
 						cpuBusy: w.load.busy,
+						cpuIowait: w.load.io,
 						cpuCores: w.load.cores,
 						memUsed: w.load.used,
 						memTotal: w.load.total
@@ -2595,7 +2624,13 @@ export class MockFarm {
 			}
 			if (w.load) {
 				const { busy, cores, used, total } = w.load;
-				addLoad(p, { cpuBusy: busy, cpuCores: cores, memUsed: used, memTotal: total });
+				addLoad(p, {
+					cpuBusy: busy,
+					cpuIowait: w.load.io,
+					cpuCores: cores,
+					memUsed: used,
+					memTotal: total
+				});
 			}
 		}
 		return out;
@@ -2618,6 +2653,7 @@ export class MockFarm {
 				running: Math.max(0, Math.round(p.running * k)),
 				free: p.slots - used,
 				cpuBusy: scale(p.cpuBusy, p.up * BASE_BUSY),
+				cpuIowait: scale(p.cpuIowait, 0),
 				memUsed: scale(p.memUsed, p.up * BASE_MEM)
 			});
 		}

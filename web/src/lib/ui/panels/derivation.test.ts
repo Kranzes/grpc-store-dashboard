@@ -163,6 +163,7 @@ describe('failure reasons', () => {
 		minFree: 0,
 		version,
 		cpuBusy: null,
+		cpuIowait: null,
 		cpuCores: null,
 		memUsed: null,
 		memTotal: null,
