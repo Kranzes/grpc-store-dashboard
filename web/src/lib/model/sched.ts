@@ -4,8 +4,10 @@
 import { create } from '@bufbuild/protobuf';
 import {
 	CountersSchema,
+	PoolSampleSchema,
 	SubstituterTrafficSchema,
 	type Counters,
+	type PoolSample,
 	type SubstituterTraffic
 } from '#lib/gen/events_pb.ts';
 import { compareCode } from './types.ts';
@@ -44,12 +46,93 @@ export const ZERO_SUBSTITUTER: SubstituterCounts = Object.freeze({
 
 export const NO_SUBS: ReadonlyMap<string, SubstituterCounts> = new Map();
 
+/**
+ * The connected builders of one native system at a sample: as Stats counts
+ * slots, and the summed load of those that report it, null while none does.
+ * CPUs, not millicores.
+ */
+export type PoolCounts = HostLoad &
+	Readonly<{
+		up: number;
+		running: number;
+		slots: number;
+		free: number;
+	}>;
+
+/** A pool's counts while builders are added to it. */
+export type PoolTally = { -readonly [K in keyof PoolCounts]: PoolCounts[K] };
+
+/** A pool with no builder counted yet. */
+export function newPool(): PoolTally {
+	return {
+		up: 0,
+		running: 0,
+		slots: 0,
+		free: 0,
+		cpuBusy: null,
+		cpuCores: null,
+		memUsed: null,
+		memTotal: null
+	};
+}
+
+/** Adds a builder's load to its pool's: each pair while the builder reports it. */
+export function addLoad(p: PoolTally, l: HostLoad): void {
+	if (l.cpuBusy !== null && l.cpuCores !== null) {
+		p.cpuBusy = (p.cpuBusy ?? 0) + l.cpuBusy;
+		p.cpuCores = (p.cpuCores ?? 0) + l.cpuCores;
+	}
+	if (l.memUsed !== null && l.memTotal !== null) {
+		p.memUsed = (p.memUsed ?? 0) + l.memUsed;
+		p.memTotal = (p.memTotal ?? 0) + l.memTotal;
+	}
+}
+
 /** Counter values at one time, with the per-substituter counts. */
 export type CounterSample = {
 	t: number;
 	c: CounterValues;
 	subs: ReadonlyMap<string, SubstituterCounts>;
+	/** Keyed by native system. Absent where the scheduler sent none: older ones, and its first sample. */
+	pools?: ReadonlyMap<string, PoolCounts>;
+	/** The page took it from Stats, not from Reset.history. */
+	fromPage?: boolean;
 };
+
+/** A sample's pools, or undefined for an empty list. */
+export function poolsFromProto(
+	list: readonly PoolSample[]
+): ReadonlyMap<string, PoolCounts> | undefined {
+	if (list.length === 0) return undefined;
+	const out = new Map<string, PoolCounts>();
+	for (const p of list) {
+		out.set(p.system, {
+			up: p.buildersUp,
+			running: p.running,
+			slots: p.slots,
+			free: p.free,
+			...loadFromProto(p)
+		});
+	}
+	return out;
+}
+
+/** A sample's pools as the proto has them, sorted by system. */
+export function poolsToProto(pools: ReadonlyMap<string, PoolCounts> | undefined): PoolSample[] {
+	if (!pools) return [];
+	return [...pools]
+		.sort((a, b) => compareCode(a[0], b[0]))
+		.map(([system, p]) =>
+			create(PoolSampleSchema, {
+				system,
+				buildersUp: p.up,
+				running: p.running,
+				slots: p.slots,
+				free: p.free,
+				...loadToProto(p)
+			})
+		);
+}
 
 /**
  * A substituter URL as scheme://host[:port]/path: without user, password,

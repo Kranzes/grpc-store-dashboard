@@ -477,6 +477,10 @@ The same goes for CPU and memory. Patched Linux builders read them from `/proc` 
 host, so anything else running there counts too. macOS builders report none. A pool whose
 builders do not all report says how many do, as in "170 of 177 builders".
 
+A pool's panel charts its slots in use and busy CPUs over the last hour. A patched scheduler keeps
+that hour in its minute history, so a page that opens gets all of it. With an older scheduler the
+chart starts when the page connects.
+
 ## 9. Build logs
 
 The Logs tab reads each build's log from the builder that ran it, with `GetBuildLog` through the

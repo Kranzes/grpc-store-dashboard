@@ -39,12 +39,17 @@ import {
 import {
 	COUNTER_KEYS,
 	ZERO_COUNTERS,
+	addLoad,
 	countersToProto,
 	loadToProto,
+	newPool,
 	offers,
 	priority,
+	poolsToProto,
 	substitutersToProto,
 	type CounterSample,
+	type PoolCounts,
+	type PoolTally,
 	type CounterValues,
 	type SubstituterCounts
 } from '#lib/model/sched.ts';
@@ -884,7 +889,8 @@ export class MockFarm {
 					history: this.#history.map((h) =>
 						create(CounterSampleSchema, {
 							timeMs: BigInt(Math.round(h.t)),
-							counters: this.#countersMsg(h.c, h.subs)
+							counters: this.#countersMsg(h.c, h.subs),
+							pools: poolsToProto(h.pools)
 						})
 					)
 				})
@@ -2523,8 +2529,57 @@ export class MockFarm {
 	}
 
 	#sampleHistory() {
-		this.#history.push({ t: this.now, c: { ...this.#counters }, subs: this.#subsSnapshot() });
+		this.#history.push({
+			t: this.now,
+			c: { ...this.#counters },
+			subs: this.#subsSnapshot(),
+			pools: this.#poolsNow()
+		});
 		if (this.#history.length > 60) this.#history.shift();
+	}
+
+	/** Each native system's connected builders, as the scheduler samples them. */
+	#poolsNow(): Map<string, PoolCounts> {
+		const out = new Map<string, PoolTally>();
+		for (const w of this.#workers) {
+			if (!w.up) continue;
+			let p = out.get(w.systems[0]);
+			if (!p) out.set(w.systems[0], (p = newPool()));
+			p.up++;
+			p.running += w.running.size;
+			if (this.#takesWork(w)) {
+				p.slots += w.maxJobs;
+				p.free += Math.max(0, w.maxJobs - w.running.size);
+			}
+			if (w.load) {
+				const { busy, cores, used, total } = w.load;
+				addLoad(p, { cpuBusy: busy, cpuCores: cores, memUsed: used, memTotal: total });
+			}
+		}
+		return out;
+	}
+
+	/**
+	 * The pools of a made-up minute: those of now with `f` times the work,
+	 * and the CPUs and memory that work takes.
+	 */
+	#poolsScaled(now: ReadonlyMap<string, PoolCounts>, f: number): Map<string, PoolCounts> {
+		const out = new Map<string, PoolCounts>();
+		for (const [system, p] of now) {
+			const busy = p.slots - p.free;
+			const used = Math.min(p.slots, Math.round(busy * f));
+			const k = busy > 0 ? used / busy : f;
+			const scale = (x: number | null, base: number) =>
+				x === null ? null : Math.max(base, base + (x - base) * k);
+			out.set(system, {
+				...p,
+				running: Math.max(0, Math.round(p.running * k)),
+				free: p.slots - used,
+				cpuBusy: scale(p.cpuBusy, p.up * BASE_BUSY),
+				memUsed: scale(p.memUsed, p.up * BASE_MEM)
+			});
+		}
+		return out;
 	}
 
 	// Pretend the farm ran at the warm-up rates since servingSinceMs, and
@@ -2565,6 +2620,9 @@ export class MockFarm {
 		const hist: CounterSample[] = [];
 		let t = startMs - (startMs % 60_000);
 		const cur = { ...c };
+		// The builders that report have reported their load by now.
+		for (const w of this.#workers) if (w.up && w.reportsLoad) w.load = this.#loadNow(w);
+		const poolsNow = this.#poolsNow();
 		const curSubs = new Map([...this.#subTotals].map(([u, x]) => [u, { ...x }]));
 		for (let i = 0; i < 60 && t - 60_000 > this.servingSinceMs; i++) {
 			const f = Math.max(0.2, 1 + 0.15 * this.#rng.normal());
@@ -2581,7 +2639,9 @@ export class MockFarm {
 			hist.push({
 				t,
 				c: { ...cur },
-				subs: new Map([...curSubs].map(([u, x]) => [u, { ...x }]))
+				subs: new Map([...curSubs].map(([u, x]) => [u, { ...x }])),
+				// Busier and quieter minutes, following the counters' rates.
+				pools: this.#poolsScaled(poolsNow, Math.min(1.1, f))
 			});
 		}
 		this.#history = hist.reverse();

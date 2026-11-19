@@ -54,6 +54,8 @@ const POOL: PoolView = {
 	memUsed: null,
 	memTotal: null,
 	loadBuilders: 0,
+	history: [],
+	historySince: null,
 	idle: 0,
 	idleSince: null,
 	idleBefore: false,

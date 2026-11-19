@@ -1,4 +1,4 @@
-From c8c85bca83f9dc1a953940db226df0f60f83450d Mon Sep 17 00:00:00 2001
+From a8bb9e26e4e4e4cc4a93a5f9e0feca0bf17abf00 Mon Sep 17 00:00:00 2001
 From: Ilan Joselevich <personal@ilanjoselevich.com>
 Date: Thu, 19 Nov 2026 06:50:57 +0100
 Subject: [PATCH 14/14] scheduler: sample each pool's use with the counters
@@ -20,11 +20,11 @@ older scheduler.
 
 events-test covers the samples.
 ---
- proto/events.proto              | 24 ++++++++++++--
- src/daemon/dispatcher-events.cc | 56 +++++++++++++++++++++++++++++++++
+ proto/events.proto              | 24 +++++++++++--
+ src/daemon/dispatcher-events.cc | 60 +++++++++++++++++++++++++++++++++
  src/daemon/dispatcher.hh        |  1 +
- tests/events-test.cc            | 52 ++++++++++++++++++++++++++++++
- 4 files changed, 131 insertions(+), 2 deletions(-)
+ tests/events-test.cc            | 52 ++++++++++++++++++++++++++++
+ 4 files changed, 135 insertions(+), 2 deletions(-)
 
 diff --git a/proto/events.proto b/proto/events.proto
 index 3645190..7289047 100644
@@ -69,10 +69,10 @@ index 3645190..7289047 100644
  
  message SystemStats {
 diff --git a/src/daemon/dispatcher-events.cc b/src/daemon/dispatcher-events.cc
-index 6a5ba5e..c5abc81 100644
+index c919ca5..596b596 100644
 --- a/src/daemon/dispatcher-events.cc
 +++ b/src/daemon/dispatcher-events.cc
-@@ -242,11 +242,67 @@ void Dispatcher::sampleLocked()
+@@ -243,11 +243,71 @@ void Dispatcher::sampleLocked()
      auto & sample = history.emplace_back();
      sample.set_time_ms(wallMs(now));
      *sample.mutable_counters() = counters;
@@ -111,11 +111,15 @@ index 6a5ba5e..c5abc81 100644
 +        }
 +        auto & pool = pools[wkr.systems.front()];
 +        pool.up++;
-+        if (wid >= workerInfo.size() || !workerInfo.at(wid).load) {
++        if (wid >= workerInfo.size()) {
 +            continue;
 +        }
-+        const auto & add = *workerInfo.at(wid).load;
-+        auto & sum = pool.load ? *pool.load : pool.load.emplace();
++        const auto & load = workerInfo.at(wid).load;
++        if (!load) {
++            continue;
++        }
++        const auto & add = *load;
++        auto & sum = pool.load.has_value() ? pool.load.value() : pool.load.emplace();
 +        sum.cpuBusyMillicores += add.cpuBusyMillicores;
 +        sum.cpuCores += add.cpuCores;
 +        sum.memUsedBytes += add.memUsedBytes;

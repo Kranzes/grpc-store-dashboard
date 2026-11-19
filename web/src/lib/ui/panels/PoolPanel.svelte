@@ -30,6 +30,7 @@
 	import VirtualList from '../VirtualList.svelte';
 	import WindowCaption from '../WindowCaption.svelte';
 	import LineRows from './LineRows.svelte';
+	import PoolSparkline from './PoolSparkline.svelte';
 	import { poolList, poolMembers, type PoolFilter, type PoolSort } from './pool.ts';
 
 	type Props = {
@@ -233,6 +234,8 @@
 		{/if}
 	</section>
 
+	<PoolSparkline pool={p} />
+
 	<LineRows {store} {rows} {onopenlines} />
 
 	<p class="p-links">
@@ -324,6 +327,11 @@
 
 	.facts .wide {
 		grid-column: span 2;
+	}
+
+	/* The builders' CPU and memory in muted ink, as on their cards: blue is for slots. */
+	.facts .load {
+		--fill: var(--fg-muted);
 	}
 
 	.toggle {

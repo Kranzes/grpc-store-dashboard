@@ -9,6 +9,7 @@ import {
 	DrvState_Cause as Cause,
 	DrvState_Phase as Phase,
 	InputSourceSchema,
+	PoolSampleSchema,
 	SubstituterTrafficSchema,
 	WorkerState_DrainReason as Drain,
 	OutputSchema
@@ -1514,6 +1515,108 @@ describe('host load', () => {
 			memTotal: null,
 			loadBuilders: 0
 		});
+	});
+});
+
+describe('pool history', () => {
+	const MIN = 60_000;
+	type PoolInit = {
+		system: string;
+		slots: number;
+		free: number;
+		cpuBusyMillicores?: bigint;
+		cpuCores?: number;
+	};
+	const sample = (ago: number, pools: PoolInit[] = []) =>
+		create(CounterSampleSchema, {
+			timeMs: BigInt(T0 - ago),
+			counters: create(CountersSchema, {}),
+			pools: pools.map((p) => create(PoolSampleSchema, { buildersUp: 1, ...p }))
+		});
+	const x86 = (slots: number, free: number) => ({
+		system: 'x86_64-linux',
+		slots,
+		free,
+		running: slots - free
+	});
+	const historyOf = (r: FarmReducer, now: number) =>
+		r.views(now, 15).pools.get('x86_64-linux')!.history;
+
+	it("takes the last hour from the scheduler's samples, then goes on from Stats", () => {
+		const { r, s } = started(
+			{},
+			E.reset({
+				history: [
+					// Older than the hour: left out.
+					sample(90 * MIN, [x86(8, 0)]),
+					sample(30 * MIN, [{ ...x86(8, 2), cpuBusyMillicores: 4000n, cpuCores: 16 }]),
+					// No x86_64-linux builder then: a gap.
+					sample(29 * MIN, [{ system: 'aarch64-linux', slots: 4, free: 4 }]),
+					sample(28 * MIN, [x86(8, 8)])
+				]
+			}),
+			E.worker('a', { maxJobs: 8 })
+		);
+		expect(historyOf(r, T0)).toEqual([
+			{ t: T0 - 30 * MIN, slots: 0.75, cpu: 0.25 },
+			{ t: T0 - 29 * MIN, slots: null, cpu: null },
+			{ t: T0 - 28 * MIN, slots: 0, cpu: null }
+		]);
+		// The scheduler started serving two hours ago, but kept no pools before then.
+		expect(r.views(T0, 15).pools.get('x86_64-linux')!.historySince).toEqual({
+			fromMs: T0 - 30 * MIN,
+			cause: 'history'
+		});
+		// The pool now: the last Stats' slots and the builders' load.
+		s.timeMs = T0 + 1000;
+		r.apply(
+			s.next(
+				E.worker('a', { maxJobs: 8, cpuBusyMillicores: 2000n, cpuCores: 8 }),
+				E.stats({}, [x86(8, 5)])
+			),
+			T0 + 1000
+		);
+		// The Stats came 28 minutes after the last sample, so the page takes one of its own.
+		expect(historyOf(r, T0 + 1000).slice(3)).toEqual([{ t: T0 + 1000, slots: 0.375, cpu: 0.25 }]);
+		s.timeMs = T0 + 31_000;
+		r.apply(s.next(E.stats({}, [x86(8, 0)])), T0 + 31_000);
+		expect(historyOf(r, T0 + 31_000).slice(3)).toEqual([
+			{ t: T0 + 1000, slots: 0.375, cpu: 0.25 },
+			{ t: T0 + 31_000, slots: 1, cpu: 0.25 }
+		]);
+	});
+
+	it('starts at connect against a scheduler without pool samples', () => {
+		const { r, s } = started(
+			{},
+			E.reset({ history: [sample(5 * MIN), sample(4 * MIN)] }),
+			E.worker('a', { maxJobs: 8 })
+		);
+		expect(historyOf(r, T0)).toEqual([]);
+		r.apply(s.next(E.stats({}, [x86(8, 4)])), T0);
+		expect(historyOf(r, T0)).toEqual([{ t: T0, slots: 0.5, cpu: null }]);
+		expect(r.views(T0, 15).pools.get('x86_64-linux')!.historySince).toEqual({
+			fromMs: T0,
+			cause: 'page'
+		});
+		s.timeMs = T0 + 30_000;
+		r.apply(s.next(E.stats({}, [x86(8, 2)])), T0 + 30_000);
+		expect(historyOf(r, T0 + 30_000)).toEqual([
+			{ t: T0, slots: 0.5, cpu: null },
+			{ t: T0 + 30_000, slots: 0.75, cpu: null }
+		]);
+	});
+
+	it("round-trips the demo farm's history", () => {
+		const farm = new MockFarm(mockOptions({ builders: 12, seed: 3 }), T0);
+		const r = new FarmReducer();
+		r.beginStream();
+		const res = r.apply(farm.snapshot(), farm.now);
+		expect(res).toEqual({ ok: true, snapshotDone: true });
+		const history = r.views(farm.now, 15).pools.get('x86_64-linux')!.history;
+		expect(history.length).toBeGreaterThan(50);
+		expect(history.every((p) => p.slots !== null && p.cpu !== null && p.cpu < 1)).toBe(true);
+		expect(r.views(farm.now, 15).pools.get('x86_64-linux')!.historySince).toBeNull();
 	});
 });
 

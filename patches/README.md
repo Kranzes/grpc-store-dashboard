@@ -21,6 +21,7 @@ lives in this repository's NixOS module (`nixosModules.default`).
 | 0011 | `Events.RecentBuilds`: the last 10,000 builds and 2,000 failures. Each record has a `seq`, and `before_seq` pages by it, so builds that finished in the same millisecond come once each. |
 | 0012 | `GetBuildLog` reads from the log store and the binary cache when a node has no log. |
 | 0013 | Builders report their host's busy CPUs and memory in use, host-wide, and the scheduler passes them on in `WorkerState`. |
+| 0014 | Each minute's `CounterSample` carries every pool's builders, slots and load, so `Reset.history` holds the last hour of them. |
 
 Each commit message explains its change. Each commit builds and passes nix-grpc-store's tests on
 its own.
@@ -44,19 +45,19 @@ The first commit is the head of #269 that `flake.nix` fetches. `nix flake check`
 update its commit and hash in `flake.nix`. After moving the pin, drop what it now includes, and
 rebase the series if the check fails.
 
-To change the series, edit the commits on that branch and export the ten after #269 again,
+To change the series, edit the commits on that branch and export the eleven after #269 again,
 numbered from 4:
 
 ```console
 $ rm /path/to/grpc-store-dashboard/patches/nix-grpc-store/*.patch
-$ git format-patch --start-number 4 -o /path/to/grpc-store-dashboard/patches/nix-grpc-store HEAD~10
+$ git format-patch --start-number 4 -o /path/to/grpc-store-dashboard/patches/nix-grpc-store HEAD~11
 ```
 
 ## The proto
 
-`proto/events.proto` at the root of this repository is the file the series adds. Patch 0005 adds
-it, and 0006, 0007, 0008, 0010, 0011 and 0013 change it. `proto/nix_remote.proto` is upstream's
-file as the series leaves it, after 0008, 0009, 0010, 0012 and 0013 change it. `npm run gen` generates
-`web/src/lib/gen/` from both. `nix flake check` fails when a root copy and the series differ, or
-when the generated code is out of date. After changing the proto, change the commit that owns
-that part of it, export the series again and run `npm run gen` in `web/`.
+`proto/events.proto` at the root of this repository is the file the series adds. Patch 0005 adds it,
+and 0006, 0007, 0008, 0010, 0011, 0013 and 0014 change it. `proto/nix_remote.proto` is upstream's
+file as the series leaves it, after 0008, 0009, 0010, 0012 and 0013 change it. `npm run gen`
+generates `web/src/lib/gen/` from both. `nix flake check` fails when a root copy and the series
+differ, or when the generated code is out of date. After changing the proto, change the commit that
+owns that part of it, export the series again and run `npm run gen` in `web/`.

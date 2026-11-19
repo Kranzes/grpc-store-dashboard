@@ -245,8 +245,19 @@ export function shareOf(used: number | null, total: number | null): number | nul
 	return used !== null && total ? Math.min(1, Math.max(0, used / total)) : null;
 }
 
+/** One time in a pool's history: occupied slots and busy CPUs, as shares from 0 to 1, null where unknown. */
+export type PoolPoint = Readonly<{
+	/** Browser clock. */
+	t: number;
+	slots: number | null;
+	cpu: number | null;
+}>;
+
 /** Samples of the queue size, one a second, behind SchedulerView.queuedPerMin: a minute's worth. */
 export const QUEUE_TREND_SAMPLES = 61;
+
+/** How far back a pool's history of slots and CPU reaches. */
+export const POOL_HISTORY_MINUTES = 60;
 
 /** How long pools count builders joining and leaving. */
 export const POOL_CHURN_MINUTES = 5;
@@ -318,6 +329,15 @@ export type PoolView = Readonly<{
 	memTotal: number | null;
 	/** Connected builders that report them, of up + draining. */
 	loadBuilders: number;
+	/**
+	 * The last hour, a point a minute from the scheduler's history and then
+	 * the page's own, oldest first, ending with the last Stats. Starts later
+	 * where neither reaches back: a scheduler without pool samples, or one
+	 * that started serving within the hour.
+	 */
+	history: readonly PoolPoint[];
+	/** Where the history starts while it covers less than the hour. */
+	historySince: Coverage | null;
 	/** Features and how many builders offer each, most common first. */
 	features: readonly Readonly<{ name: string; builders: number }>[];
 	/** Builders that connected or came back, and that disconnected, within POOL_CHURN_MINUTES. */

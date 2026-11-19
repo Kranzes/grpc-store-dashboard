@@ -146,8 +146,8 @@ message Reset {
   // niks3 server the scheduler asks for cache hits. Empty without a cache.
   string cache_url = 5;
   // Cumulative counters sampled once a minute, oldest first, newest last,
-  // for "last N minutes" totals right after connecting. The current
-  // values arrive with the next Stats.
+  // for "last N minutes" totals right after connecting, with each pool's
+  // use at the time. The current values arrive with the next Stats.
   repeated CounterSample history = 6;
   // The farm cache as builders list it among their substituters
   // (--niks3-cache-url, reduced like WorkerState.substituters). Empty when
@@ -427,6 +427,26 @@ message Counters {
 message CounterSample {
   uint64 time_ms = 1;
   Counters counters = 2;
+  // The builders of each native system at the time, sorted by system. Empty
+  // in the sample taken when serving starts, and from older schedulers.
+  repeated PoolSample pools = 3;
+}
+
+// The connected builders of one native system.
+message PoolSample {
+  string system = 1;
+  uint32 builders_up = 2;
+  // As SystemStats counts them: drvs assigned to these builders, and the
+  // max_jobs and free slots of those that take work.
+  uint32 running = 3;
+  uint32 slots = 4;
+  uint32 free = 5;
+  // Summed over the builders whose WorkerState has them. Unset while none
+  // does.
+  optional uint64 cpu_busy_millicores = 6;
+  optional uint32 cpu_cores = 7;
+  optional uint64 mem_used_bytes = 8;
+  optional uint64 mem_total_bytes = 9;
 }
 
 message SystemStats {

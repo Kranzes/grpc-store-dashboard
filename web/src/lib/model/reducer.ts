@@ -36,11 +36,16 @@ import {
 	countersFromProto,
 	loadFromProto,
 	offers,
+	addLoad,
+	newPool,
+	poolsFromProto,
 	priority as schedPriority,
 	reduceSubstituterUrl,
 	substitutersFromProto,
 	type CounterSample,
 	type CounterValues,
+	type PoolCounts,
+	type PoolTally,
 	type SubstituterCounts
 } from './sched.ts';
 import {
@@ -49,6 +54,7 @@ import {
 	FAILURES_KEPT,
 	OTHER_CLIENTS,
 	POOL_CHURN_MINUTES,
+	POOL_HISTORY_MINUTES,
 	QUEUE_TREND_SAMPLES,
 	SCHEDULER_ID,
 	UPSTREAM_CARD_ROWS,
@@ -63,6 +69,7 @@ import {
 	parseNodeId,
 	poolNodeId,
 	poolOf,
+	shareOf,
 	type BuildQuery,
 	type BuildRow,
 	type BuildState,
@@ -84,6 +91,7 @@ import {
 	type FarmMeta,
 	type FlowKind,
 	type InputSourceView,
+	type PoolPoint,
 	type PoolView,
 	type RateUnit,
 	type SchedulerView,
@@ -469,6 +477,7 @@ type SysCount = {
 
 const EMPTY_IDS: readonly number[] = Object.freeze([]);
 const EMPTY_STRINGS: readonly string[] = Object.freeze([]);
+const EMPTY_POINTS: readonly PoolPoint[] = Object.freeze([]);
 const EMPTY_SOURCES: readonly InputSourceRec[] = Object.freeze([]);
 const EMPTY_OUTPUTS: DrvRec['outputs'] = Object.freeze([]);
 const OFFSET_WINDOW_MS = 60_000;
@@ -508,6 +517,24 @@ function unique(xs: readonly string[]): readonly string[] {
 	for (let i = 1; i < xs.length; i++)
 		if (xs.lastIndexOf(xs[i], i - 1) >= 0) return [...new Set(xs)];
 	return xs;
+}
+
+const POOL_HISTORY_MS = POOL_HISTORY_MINUTES * 60_000;
+
+/** A pool's point: its slots in use and busy CPUs as shares, rounded so equal minutes compare equal. */
+function poolPoint(
+	t: number,
+	slots: number,
+	free: number,
+	cpuBusy: number | null,
+	cpuCores: number | null
+): PoolPoint {
+	const rounded = (x: number | null) => (x === null ? null : Math.round(x * 1000) / 1000);
+	return {
+		t,
+		slots: rounded(shareOf(slots - free, slots)),
+		cpu: rounded(shareOf(cpuBusy, cpuCores))
+	};
 }
 
 /** Three significant digits: keeps tiny rate changes from replacing views. */
@@ -734,6 +761,12 @@ export class FarmReducer {
 	#live!: RateMeter;
 	#samples: CounterSample[] = [];
 	#current: CounterSample | null = null;
+	/** Each pool's points from #samples, made again when they or the clock offset change. */
+	#poolPoints: { key: string; points: Map<string, PoolPoint[]>; fromPage: boolean } | null = null;
+	/** Bumped when #samples changes. */
+	#samplesVersion = 0;
+	/** Scheduler clock of the last Stats since the last Reset, null before one. */
+	#statsAt: number | null = null;
 	/** Totals of the last Stats since the last Reset, for per-second cache rates. */
 	#lastTotals: CounterValues | null = null;
 	/** Per-URL counts of the same Stats, for the upstream card's rates. */
@@ -749,8 +782,8 @@ export class FarmReducer {
 		unreported: number;
 	} = { byUrl: new Map(), builders: 0, unreported: 0 };
 	#systems: SystemQueueView[] = [];
-	/** Per pool at the last Stats: the scheduler's slots and free over the pool's system. */
-	#placement = new Map<string, { slots: number; free: number }>();
+	/** Per pool at the last Stats: the scheduler's running, slots and free over the pool's system. */
+	#placement = new Map<string, { running: number; slots: number; free: number }>();
 	/** Builders whose assignments, state or slots changed: their idleSince is due. */
 	readonly #idleDirty = new Set<string>();
 	#meters!: {
@@ -1023,10 +1056,13 @@ export class FarmReducer {
 			.map((s) => ({
 				t: Number(s.timeMs),
 				c: countersFromProto(s.counters),
-				subs: substitutersFromProto(s.counters?.substituters)
+				subs: substitutersFromProto(s.counters?.substituters),
+				pools: poolsFromProto(s.pools)
 			}))
 			.sort((a, b) => a.t - b.t);
+		this.#samplesVersion++;
 		this.#current = this.#samples.at(-1) ?? null;
+		this.#statsAt = null;
 		this.#phase = 'snapshot';
 		this.#seq = seq;
 		this.#workersDirty = true;
@@ -1553,6 +1589,7 @@ export class FarmReducer {
 			subs: substitutersFromProto(s.totals?.substituters)
 		};
 		this.#current = cur;
+		this.#statsAt = t;
 		// Cache hits and misses per second come from the counters, because the
 		// events do not show every miss: a second Want for a queued drv is a
 		// FOLLOWERS update. The first Stats after a Reset only sets the base.
@@ -1578,27 +1615,79 @@ export class FarmReducer {
 				m.add(d, now);
 			}
 		}
+		this.#placement = this.#placementOf(s.systems);
 		const last = this.#samples.at(-1);
 		if (!last || t - last.t >= 60_000) {
+			// The page's own minute, as the scheduler samples it.
+			cur.pools = this.#poolsNow();
+			cur.fromPage = true;
 			this.#samples.push(cur);
 			if (this.#samples.length > HISTORY_KEEP) this.#samples.shift();
+			this.#samplesVersion++;
 		}
 		this.#systems = this.#queueRows(s.systems);
-		this.#placement = this.#placementOf(s.systems);
 	}
 
-	/** The scheduler's slots and free per pool, from Stats rows keyed by what builders offer. */
+	/** The scheduler's running, slots and free per pool, from Stats rows keyed by what builders offer. */
 	#placementOf(stats: readonly SystemStats[]) {
-		const out = new Map<string, { slots: number; free: number }>();
+		const out = new Map<string, { running: number; slots: number; free: number }>();
 		for (const x of stats) {
-			if (!x.slots) continue;
+			if (!x.running && !x.slots) continue;
 			const pool = poolOf(x.system);
 			let p = out.get(pool);
-			if (!p) out.set(pool, (p = { slots: 0, free: 0 }));
+			if (!p) out.set(pool, (p = { running: 0, slots: 0, free: 0 }));
+			p.running += x.running;
 			p.slots += x.slots;
 			p.free += x.free;
 		}
 		return out;
+	}
+
+	/**
+	 * Each native system's connected builders now, as a PoolSample counts
+	 * them: slots from Stats, load from the builders' WorkerStates.
+	 */
+	#poolsNow(): ReadonlyMap<string, PoolCounts> {
+		const out = new Map<string, PoolTally>();
+		for (const [pool, pl] of this.#placement)
+			out.set(pool, { ...newPool(), running: pl.running, slots: pl.slots, free: pl.free });
+		for (const w of this.#workers.values()) {
+			if (!w.up) continue;
+			const pool = poolOf(w.systems[0] ?? '');
+			let p = out.get(pool);
+			if (!p) out.set(pool, (p = newPool()));
+			p.up++;
+			addLoad(p, w);
+		}
+		return out;
+	}
+
+	/**
+	 * Each pool's points from the samples with pools, in the last hour, on
+	 * the browser's clock. A sample without a pool that others have is a gap.
+	 */
+	#poolPointsOf(nowServer: number): { points: Map<string, PoolPoint[]>; fromPage: boolean } {
+		const key = `${this.#samplesVersion}:${this.#offset}`;
+		if (this.#poolPoints?.key === key) return this.#poolPoints;
+		const points = new Map<string, PoolPoint[]>();
+		const samples = this.#samples.filter((s) => s.pools && s.t >= nowServer - POOL_HISTORY_MS);
+		for (const s of samples) for (const system of s.pools!.keys()) points.set(system, []);
+		for (const s of samples) {
+			for (const [system, list] of points) {
+				const p = s.pools!.get(system);
+				list.push(
+					poolPoint(
+						s.t + this.#offset,
+						p?.slots ?? 0,
+						p?.free ?? 0,
+						p?.cpuBusy ?? null,
+						p?.cpuCores ?? null
+					)
+				);
+			}
+		}
+		this.#poolPoints = { key, points, fromPage: samples.length ? !!samples[0].fromPage : true };
+		return this.#poolPoints;
 	}
 
 	/** Brings idleSince up to date for builders whose state changed. `known`: the page saw it go idle. */
@@ -2169,6 +2258,22 @@ export class FarmReducer {
 			!this.#watchingSince || now - this.#watchingSince < CHURN_MS
 				? { fromMs: this.#watchingSince || now, cause: this.#startCause() }
 				: null;
+		const { points: minutes, fromPage } = this.#poolPointsOf(now - this.#offset);
+		const statsAt = this.#statsAt === null ? null : this.#statsAt + this.#offset;
+		// Where a history that covers less than the hour starts, and why.
+		const historySince = (history: readonly PoolPoint[]): Coverage | null => {
+			const end = statsAt ?? now;
+			const first = history[0];
+			if (first && first.t <= end - POOL_HISTORY_MS + 90_000) return null;
+			const servingSince = m.servingSinceServer + this.#offset;
+			const cause: Coverage['cause'] =
+				fromPage || !minutes.size
+					? this.#startCause()
+					: servingSince > end - POOL_HISTORY_MS
+						? 'restart'
+						: 'history';
+			return { fromMs: first?.t ?? end, cause };
+		};
 		for (const [system, p] of acc) {
 			// Each queue key once, however many builders of the pool could take it.
 			let queuedCanTake = 0;
@@ -2190,6 +2295,14 @@ export class FarmReducer {
 			const occupied = pl && pl.slots > 0 ? pl.slots - pl.free : p.workingRunning;
 			const builderSlots = medianOf(p.workingJobs.size > 0 ? p.workingJobs : p.connectedJobs);
 			const needed = builderSlots > 0 ? Math.ceil((occupied + queuedCanTake) / builderSlots) : null;
+			// The minutes, then a point for now: the slots at the last Stats and the load the builders report.
+			const history: readonly PoolPoint[] =
+				statsAt === null || minutes.get(system)?.at(-1)?.t === statsAt
+					? (minutes.get(system) ?? EMPTY_POINTS)
+					: [
+							...(minutes.get(system) ?? EMPTY_POINTS),
+							poolPoint(statsAt, pl?.slots ?? 0, pl?.free ?? 0, p.cpuBusy, p.cpuCores)
+						];
 			pools.set(system, {
 				system,
 				builders: p.builders,
@@ -2212,6 +2325,8 @@ export class FarmReducer {
 				memUsed: p.memTotal ? p.memUsed : null,
 				memTotal: p.memTotal || null,
 				loadBuilders: p.loadBuilders,
+				history,
+				historySince: historySince(history),
 				idle: p.idle,
 				idleSince: p.idleSince || null,
 				idleBefore: p.idleBefore,
