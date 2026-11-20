@@ -410,9 +410,12 @@ export type SystemQueueView = Readonly<{
 
 export type CacheView = Readonly<{
 	url: string;
-	/** Scheduler cache lookups only: clients skip outputs they already found in the cache. */
-	hitsPerSec: number;
-	missesPerSec: number;
+	/**
+	 * Requests found cached, or not, when they reached the scheduler, per minute over the totals
+	 * window, the one of both ratios. Clients skip outputs they already found in the cache.
+	 */
+	hitsPerMin: number;
+	missesPerMin: number;
 	/**
 	 * Of the derivations clients' graphs needed, the share already cached, which they did not
 	 * request: Counters.graph_pruned_drvs / graph_drvs over the totals window. Null while no

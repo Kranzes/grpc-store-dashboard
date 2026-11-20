@@ -820,7 +820,6 @@ export class FarmReducer {
 	#meters!: {
 		assign: RateMeter;
 		hits: RateMeter;
-		misses: RateMeter;
 		publish: RateMeter;
 		fetch: RateMeter;
 	};
@@ -1649,19 +1648,16 @@ export class FarmReducer {
 		};
 		this.#current = cur;
 		this.#statsAt = t;
-		// Cache hits and misses per second come from the counters, because the
-		// events do not show every miss: a second Want for a queued drv is a
-		// FOLLOWERS update. The first Stats after a Reset only sets the base.
+		// The cache hits line takes its rate from the counters, like the cache
+		// card. The first Stats after a Reset only sets the base.
 		const prev = this.#lastTotals;
 		this.#lastTotals = cur.c;
 		if (live && prev) {
 			const hits = cur.c.cacheHits - prev.cacheHits;
-			const misses = cur.c.cacheMisses - prev.cacheMisses;
 			if (hits > 0) {
 				this.#meters.hits.add(hits, now);
 				this.#hist.hits.add(hits, now);
 			}
-			if (misses > 0) this.#meters.misses.add(misses, now);
 		}
 		const prevSubs = this.#lastSubs;
 		this.#lastSubs = cur.subs;
@@ -1846,7 +1842,6 @@ export class FarmReducer {
 		this.#meters = {
 			assign: new RateMeter({ windowMs: w }),
 			hits: new RateMeter({ windowMs: w }),
-			misses: new RateMeter({ windowMs: w }),
 			publish: new RateMeter({ windowMs: w }),
 			fetch: new RateMeter({ windowMs: w })
 		};
@@ -2451,10 +2446,13 @@ export class FarmReducer {
 			const hits = totals.view.cached;
 			const lookups = hits + totals.cacheMisses;
 			const { graphDrvs, graphPruned } = totals;
+			// Per minute over the window of both shares, so the card's figures agree.
+			const minutes = coveredMinutes(now, windowMinutes, totals.view.since);
+			const perMin = (n: number) => (minutes > 0 ? round3(n / minutes) : 0);
 			cache = {
 				url: m.cacheUrl,
-				hitsPerSec: round3(mt.hits.rate(now)),
-				missesPerSec: round3(mt.misses.rate(now)),
+				hitsPerMin: perMin(hits),
+				missesPerMin: perMin(totals.cacheMisses),
 				cachedRatio: graphDrvs > 0 ? Math.min(1, graphPruned / graphDrvs) : null,
 				hitRatio: lookups > 0 ? hits / lookups : null,
 				publishedBytesPerSec: round3(mt.publish.rate(now)),
@@ -3465,6 +3463,11 @@ export class FarmReducer {
 type BuildFlow = 'assign' | 'publish' | 'fetch' | 'substitute';
 
 /** The start of a window in the counter history. */
+/** The minutes a window's counts cover: all of it, or from where they start. */
+function coveredMinutes(now: number, windowMinutes: number, since: Coverage | null): number {
+	return since ? Math.max(0, now - since.fromMs) / 60_000 : windowMinutes;
+}
+
 type WindowBase = {
 	cur: CounterSample;
 	/** A counter's value where the window starts. */

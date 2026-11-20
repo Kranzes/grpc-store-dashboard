@@ -47,19 +47,19 @@
 			</div>
 			<div>
 				<dt>Hits per minute</dt>
-				<dd>{formatPerMinute(c.hitsPerSec * 60)}</dd>
+				<dd>{formatPerMinute(c.hitsPerMin)}</dd>
 			</div>
 			<div>
 				<dt>Misses per minute</dt>
-				<dd>{formatPerMinute(c.missesPerSec * 60)}</dd>
+				<dd>{formatPerMinute(c.missesPerMin)}</dd>
 			</div>
 		</dl>
 		{#if c.cachedRatio !== null}
 			<p class="p-caption">
-				Cached is the share of requested derivations that were already in the cache. Clients
-				found those cached and did not request them. Hits and misses count requests the cache had, or lacked, when
-				they reached the scheduler. Clients request only what they found missing, so a hit is mostly
-				a race won between clients.
+				Cached is the share of requested derivations that were already in the cache. Clients found
+				those cached and did not request them. Hits and misses count requests the cache had, or
+				lacked, when they reached the scheduler. Clients request only what they found missing, so a
+				hit is mostly a race won between clients.
 			</p>
 		{:else}
 			<p class="p-caption">

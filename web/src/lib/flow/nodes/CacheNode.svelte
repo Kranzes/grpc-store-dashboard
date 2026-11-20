@@ -21,7 +21,7 @@
 	const host = $derived(c?.url ? hostOf(c.url) : 'Binary cache');
 	// Null while no client reports its graph: then only the line below it shows.
 	const cached = $derived(c?.cachedRatio ?? null);
-	// Both shares come from the header totals, so they cover the same window.
+	// The shares and the rates come from the header totals: one window for the card.
 	const totals = $derived(ctx.store.totals);
 </script>
 
@@ -77,11 +77,11 @@
 	<span class="grid">
 		<span class="stat">
 			<span class="label">Hits</span>
-			<span class="value num small">{formatPerMinute((c?.hitsPerSec ?? 0) * 60)}/min</span>
+			<span class="value num small">{formatPerMinute(c?.hitsPerMin ?? 0)}/min</span>
 		</span>
 		<span class="stat">
 			<span class="label">Misses</span>
-			<span class="value num small">{formatPerMinute((c?.missesPerSec ?? 0) * 60)}/min</span>
+			<span class="value num small">{formatPerMinute(c?.missesPerMin ?? 0)}/min</span>
 		</span>
 	</span>
 	<span class="caption">Scheduler lookups only</span>

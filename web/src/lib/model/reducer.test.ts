@@ -139,7 +139,7 @@ describe('snapshot', () => {
 		});
 		expect(v.cache).toMatchObject({
 			url: 'https://cache.test',
-			hitsPerSec: 0,
+			hitsPerMin: 0,
 			cachedRatio: null,
 			hitRatio: null
 		});
@@ -279,8 +279,6 @@ describe('deltas', () => {
 		expect(v.edges.get('assign:pool:aarch64-linux')!.rate).toBe(0);
 		expect(v.scheduler.assignedPerSec).toBe(0.1);
 		expect(v.cache).toMatchObject({
-			hitsPerSec: 0.1,
-			missesPerSec: 0.1,
 			publishedBytesPerSec: 500,
 			fetchedBytesPerSec: 100
 		});
@@ -700,6 +698,25 @@ describe('totals', () => {
 			since: null
 		});
 		expect(r.views(T0, 5).cache!.hitRatio).toBeCloseTo(100 / 125);
+	});
+
+	it('takes hits and misses per minute from the window of the ratio', () => {
+		// 20 hits and 5 misses a minute, and the ratio is theirs.
+		for (const minutes of [5, 15]) {
+			const c = withHistory(3 * 3600_000, 30).views(T0, minutes).cache!;
+			expect(c).toMatchObject({ hitsPerMin: 20, missesPerMin: 5 });
+			expect(c.hitRatio).toBeCloseTo(c.hitsPerMin / (c.hitsPerMin + c.missesPerMin));
+		}
+		// Only 30 minutes of history: per minute of what the counts cover.
+		expect(withHistory(3 * 3600_000, 30).views(T0, 60).cache).toMatchObject({
+			hitsPerMin: 20,
+			missesPerMin: 5
+		});
+		// The scheduler started 3 minutes ago: 60 hits and 15 misses since.
+		expect(withHistory(3 * 60_000, 2).views(T0, 15).cache).toMatchObject({
+			hitsPerMin: 20,
+			missesPerMin: 5
+		});
 	});
 
 	it('takes the cached share from the graph counts of the window', () => {
@@ -1143,31 +1160,23 @@ describe('complete state', () => {
 	});
 });
 
-describe('cache rates', () => {
-	it('counts every miss from the counters, follower Wants included', () => {
+describe('cache hits line', () => {
+	it('takes its rate from the counters', () => {
 		const { r, s } = farm();
 		r.apply(s.next(E.stats({ cacheHits: 100n, cacheMisses: 50n })), T0);
-		// Ten drvs, each wanted by two clients, and both Wants missed the cache.
-		const wants = [];
-		for (let i = 0; i < 10; i++) {
-			const p = drvPath(`miss-${i}`);
-			wants.push(E.drv(p, { cause: Cause.WANTED, clientIds: [1n], cacheChecked: true }));
-			wants.push(E.drv(p, { cause: Cause.FOLLOWERS, clientIds: [1n, 2n], cacheChecked: true }));
-		}
-		r.apply(s.next(...wants, E.stats({ cacheHits: 105n, cacheMisses: 70n })), T0 + 1000);
-		const v = r.views(T0 + 1000, 15);
-		// 20 misses and 5 hits in the 10 s window.
-		expect(v.cache).toMatchObject({ missesPerSec: 2, hitsPerSec: 0.5 });
-		expect(v.edges.get('cached:scheduler')!.rate).toBe(0.5);
+		r.apply(s.next(E.stats({ cacheHits: 105n, cacheMisses: 70n })), T0 + 1000);
+		// 5 hits in the 10 s window.
+		expect(r.views(T0 + 1000, 15).edges.get('cached:scheduler')!.rate).toBe(0.5);
 	});
 
 	it('takes the first Stats after a Reset as the base', () => {
 		const { r, s } = farm();
+		const rate = (now: number) => r.views(now, 15).edges.get('cached:scheduler')!.rate;
 		// The counters jumped since the last history sample: not a burst.
 		r.apply(s.next(E.stats({ cacheHits: 600n, cacheMisses: 600n })), T0);
-		expect(r.views(T0, 15).cache).toMatchObject({ hitsPerSec: 0, missesPerSec: 0 });
+		expect(rate(T0)).toBe(0);
 		r.apply(s.next(E.stats({ cacheHits: 601n, cacheMisses: 600n })), T0 + 1000);
-		expect(r.views(T0 + 1000, 15).cache!.hitsPerSec).toBe(0.1);
+		expect(rate(T0 + 1000)).toBe(0.1);
 
 		// A reconnect to the same instance skips what happened in between.
 		r.beginStream();
@@ -1176,9 +1185,9 @@ describe('cache rates', () => {
 			[...s2.snapshot(E.reset()), ...s2.next(E.stats({ cacheHits: 700n, cacheMisses: 650n }))],
 			T0 + 30_000
 		);
-		expect(r.views(T0 + 30_000, 15).cache).toMatchObject({ hitsPerSec: 0, missesPerSec: 0 });
+		expect(rate(T0 + 30_000)).toBe(0);
 		r.apply(s2.next(E.stats({ cacheHits: 703n, cacheMisses: 650n })), T0 + 31_000);
-		expect(r.views(T0 + 31_000, 15).cache).toMatchObject({ hitsPerSec: 0.3, missesPerSec: 0 });
+		expect(rate(T0 + 31_000)).toBe(0.3);
 	});
 });
 
