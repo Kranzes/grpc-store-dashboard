@@ -21,6 +21,8 @@
 	const host = $derived(c?.url ? hostOf(c.url) : 'Binary cache');
 	// Null while no client reports its graph: then only the line below it shows.
 	const cached = $derived(c?.cachedRatio ?? null);
+	// Measured while a builder lists the cache as a substituter.
+	const estimated = $derived(c?.fetchEstimated ?? true);
 	// The shares and the rates come from the header totals: one window for the card.
 	const totals = $derived(ctx.store.totals);
 </script>
@@ -93,9 +95,15 @@
 		</span>
 		<span
 			class="stat"
-			title="Estimated from which builder last built each input. It can count inputs a builder already has, and it misses inputs nobody here built."
+			title={estimated
+				? 'No builder lists this cache as a substituter, so this counts inputs another builder here built. It is estimated from which builder last built each input, and it can count inputs a builder already has.'
+				: 'What builders report taking from this cache, in NAR bytes before compression.'}
 		>
-			<span class="label"><i class="line-key flow-fetch"></i>Fetch (estimated)</span>
+			<span class="label"
+				><i class="line-key flow-fetch"></i>{estimated
+					? 'Fetch from peers (estimated)'
+					: 'Fetch'}</span
+			>
 			<span class="value num small">{formatByteRate(c?.fetchedBytesPerSec ?? 0)}</span>
 		</span>
 	</span>
@@ -166,6 +174,11 @@
 	.io {
 		padding-top: 6px;
 		border-top: 1px solid var(--border-subtle);
+	}
+
+	/* A label on two lines keeps both values on one baseline. */
+	.io .stat {
+		justify-content: space-between;
 	}
 
 	.small {

@@ -2449,6 +2449,11 @@ export class FarmReducer {
 			// Per minute over the window of both shares, so the card's figures agree.
 			const minutes = coveredMinutes(now, windowMinutes, totals.view.since);
 			const perMin = (n: number) => (minutes > 0 ? round3(n / minutes) : 0);
+			// Builders that list the cache as a substituter report what they take
+			// from it. Without one, only the estimate is left.
+			const farm = m.cacheSubstituterUrl;
+			const measured = farm !== '' && (this.#countSubstituters().byUrl.get(farm) ?? 0) > 0;
+			const fetched = measured ? (this.#subMeters.get(farm)?.rate(now) ?? 0) : mt.fetch.rate(now);
 			cache = {
 				url: m.cacheUrl,
 				hitsPerMin: perMin(hits),
@@ -2456,7 +2461,8 @@ export class FarmReducer {
 				cachedRatio: graphDrvs > 0 ? Math.min(1, graphPruned / graphDrvs) : null,
 				hitRatio: lookups > 0 ? hits / lookups : null,
 				publishedBytesPerSec: round3(mt.publish.rate(now)),
-				fetchedBytesPerSec: round3(mt.fetch.rate(now))
+				fetchedBytesPerSec: round3(fetched),
+				fetchEstimated: !measured
 			};
 			edge('cached', SCHEDULER_ID, mt.hits.rate(now), 'builds');
 		}

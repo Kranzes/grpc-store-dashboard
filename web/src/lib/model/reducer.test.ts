@@ -278,9 +278,11 @@ describe('deltas', () => {
 		expect(v.edges.get('fetch:pool:x86_64-linux')!.rate).toBe(100);
 		expect(v.edges.get('assign:pool:aarch64-linux')!.rate).toBe(0);
 		expect(v.scheduler.assignedPerSec).toBe(0.1);
+		// No builder lists the cache as a substituter: the estimate.
 		expect(v.cache).toMatchObject({
 			publishedBytesPerSec: 500,
-			fetchedBytesPerSec: 100
+			fetchedBytesPerSec: 100,
+			fetchEstimated: true
 		});
 		expect(v.workers.get(A)).toMatchObject({ running: 1, builtPerMin: 1 });
 
@@ -2999,6 +3001,30 @@ describe('upstream', () => {
 		expect(unnamed.workers.get('a')!.substituters).toEqual([FARM, NIXOS]);
 		expect(unnamed.upstream!.farmCache).toBeNull();
 		expect(unnamed.topology.upstreamRows).toBe(2);
+	});
+
+	it("measures the cache card's fetch while a builder lists the cache, and estimates it otherwise", () => {
+		const traffic = (nar: number) => E.stats({ substituters: [sub({ url: FARM, nar })] });
+		const { r, s } = started({}, reset(), w('a', [{ url: FARM }, { url: NIXOS }]), w('b', []));
+		r.apply(s.next(traffic(0)), T0);
+		// a took 30 MB from the farm cache: 3 MB/s over the 10 s rate window.
+		r.apply(s.next(traffic(30_000_000)), T0 + 1000);
+		expect(r.views(T0 + 1000, 15).cache).toMatchObject({
+			fetchedBytesPerSec: 3_000_000,
+			fetchEstimated: false
+		});
+
+		// a leaves, and b does not list the cache: back to the estimate of
+		// inputs another builder built, of which there are none here.
+		r.apply(s.next(w('a', [{ url: FARM }, { url: NIXOS }], { up: false })), T0 + 2000);
+		expect(r.views(T0 + 2000, 15).cache).toMatchObject({
+			fetchedBytesPerSec: 0,
+			fetchEstimated: true
+		});
+
+		// Without the farm cache's substituter URL nothing names it among a builder's.
+		const unnamed = started({}, reset({ cacheSubstituterUrl: '' }), w('a', [{ url: FARM }]));
+		expect(unnamed.r.views(T0, 15).cache).toMatchObject({ fetchEstimated: true });
 	});
 
 	it('reduces substituter URLs that come with a user, a password or a query', () => {

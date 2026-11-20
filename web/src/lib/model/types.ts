@@ -428,8 +428,14 @@ export type CacheView = Readonly<{
 	 */
 	hitRatio: number | null;
 	publishedBytesPerSec: number;
-	/** An estimate that can be too high or too low. See Counters.fetched_bytes_estimate in the proto. */
+	/**
+	 * What builders take from the cache. While a connected builder lists the cache as a
+	 * substituter, the NAR bytes builders report taking from it. Otherwise an estimate of the
+	 * inputs another builder here built, which can be too high or too low; see
+	 * Counters.fetched_bytes_estimate in the proto.
+	 */
 	fetchedBytesPerSec: number;
+	fetchEstimated: boolean;
 }>;
 
 /** Live traffic of one edge. The layout knows its kind and ends from its id. */

@@ -43,7 +43,7 @@ export const SIZE = {
 	client: { w: 232, h: 76 },
 	scheduler: { w: 280, h: 284 },
 	builder: { w: 220, h: 88 },
-	cache: { w: 260, h: 264 },
+	cache: { w: 260, h: 280 },
 	/** Its height grows with its rows: upstreamHeight. */
 	upstream: { w: 260 },
 	empty: { w: 240, h: 112 },

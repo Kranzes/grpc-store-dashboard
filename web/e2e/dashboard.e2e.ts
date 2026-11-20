@@ -189,8 +189,9 @@ test.describe('map', () => {
 		await expect(node(page, 'scheduler')).not.toContainText('free');
 		// Honest labels on the map.
 		await expect(page.getByText('Scheduler lookups only')).toBeVisible();
-		// The fetch label says it is an estimate once, so no caption repeats it.
-		await expect(page.getByText('Fetch (estimated)', { exact: true })).toBeVisible();
+		// No builder here lists a substituter, so the fetch figure is the
+		// estimate, and its label says so once, so no caption repeats it.
+		await expect(page.getByText('Fetch from peers (estimated)', { exact: true })).toBeVisible();
 		await expect(page.getByText('Fetch is an estimate')).toHaveCount(0);
 	});
 
