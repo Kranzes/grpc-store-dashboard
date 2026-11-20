@@ -55,7 +55,7 @@
               pr = 269;
               title = "daemon: upload build logs to a log store";
               rev = "fe79b92efbbeb8cd61f2eb0a36f827e21dec7160";
-              hash = "sha256-xXd9Vlhfx2G4ICq5XZUSIj24KUJInchNn1o96rQcMJk=";
+              hash = "sha256-mj14pzPW2uAwZFTc1Fw7pKn/EB5vn05a2Jy35Ud9VZg=";
             }
           ];
           envoy-1_37 = pkgs.callPackage ./envoy/envoy-1_37.nix { };
