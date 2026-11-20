@@ -19,8 +19,9 @@
 
 	const c = $derived(ctx.store.cache);
 	const host = $derived(c?.url ? hostOf(c.url) : 'Binary cache');
-	const ratio = $derived(c?.hitRatio ?? null);
-	// The ratio comes from the header totals, so it covers the same window.
+	// Null while no client reports its graph: then only the line below it shows.
+	const cached = $derived(c?.cachedRatio ?? null);
+	// Both shares come from the header totals, so they cover the same window.
 	const totals = $derived(ctx.store.totals);
 </script>
 
@@ -47,12 +48,30 @@
 
 	<!-- One share, so a thin meter under its number, like the scheduler's Slots bar. -->
 	<span class="stat ratio">
-		<span class="label">Hit ratio</span>
-		<span class="value num big">{formatPercent(ratio)}</span>
-		<span class="meter" aria-hidden="true"
-			><span style:transform="scaleX({ratio ?? 0})"></span></span
-		>
+		{#if cached !== null}
+			<span
+				class="headline"
+				title="Of the derivations clients needed, the share already in the cache. Clients do not request those."
+			>
+				<span class="label">Cached</span>
+				<span class="share"
+					><span class="value num big">{formatPercent(cached)}</span>
+					<span class="of">of requested derivations</span></span
+				>
+				<span class="meter" aria-hidden="true"
+					><span style:transform="scaleX({cached})"></span></span
+				>
+			</span>
+		{/if}
 		<WindowCaption minutes={totals.windowMinutes} since={totals.since} />
+	</span>
+
+	<span
+		class="found"
+		title="Requests the cache had by the time the scheduler got them. Clients request only what they found missing, so these are mostly races won between clients."
+	>
+		<span class="label">Found cached when scheduled</span>
+		<span class="num">{formatPercent(c?.hitRatio ?? null)}</span>
 	</span>
 
 	<span class="grid">
@@ -93,6 +112,35 @@
 
 	.ratio {
 		padding: 6px 0 2px;
+	}
+
+	.headline {
+		display: flex;
+		flex-direction: column;
+		gap: 1px;
+	}
+
+	.share {
+		display: flex;
+		align-items: baseline;
+		gap: 6px;
+		white-space: nowrap;
+	}
+
+	.of {
+		color: var(--fg-muted);
+		font-size: var(--text-2xs);
+	}
+
+	.found {
+		display: flex;
+		justify-content: space-between;
+		gap: 8px;
+		font-size: var(--text-xs);
+	}
+
+	.found .label {
+		color: var(--fg-muted);
 	}
 
 	/* Latte teal is 2.43:1 on the track; mixed with text it reaches 3.14:1. */

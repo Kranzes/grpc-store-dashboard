@@ -484,6 +484,11 @@ A pool's panel charts its slots in use and busy CPUs over the last hour. A patch
 that hour in its minute history, so a page that opens gets all of it. With an older scheduler the
 chart starts when the page connects.
 
+The binary cache card's Cached share comes from clients. A patched client counts, for each graph it
+builds, the derivations it needed and how many of those it found cached. While no client runs the
+patches, the card shows only "Found cached when scheduled": the share of requests the cache had
+when they reached the scheduler. It reads low, since clients request only what they found missing.
+
 ## 9. Build logs
 
 The Logs tab reads each build's log from the builder that ran it, with `GetBuildLog` through the

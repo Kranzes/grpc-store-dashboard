@@ -416,12 +416,19 @@ message Stats {
 // process becomes the active scheduler again, while instance and seq carry
 // on.
 message Counters {
-  uint64 wanted = 1;     // new queue entries
-  uint64 cache_hits = 2; // Wants answered Cached, one DrvCached each
-  // Wants the cache was asked about and lacked. This counts every such Want,
-  // including a repeat Want for a drv already tracked and a Want refused
-  // for its system, which the events do not show one by one. Take miss
-  // rates from this counter.
+  uint64 wanted = 1; // new queue entries
+  // cache_hits and cache_misses count Wants found cached, or not, when they
+  // reached the scheduler. A client Wants only what it found missing, so a
+  // hit is mostly a race won: another client's build published the outputs
+  // in between. They are not how much of what clients need is cached; for
+  // that, see graph_drvs.
+  //
+  // Wants found cached, one DrvCached each.
+  uint64 cache_hits = 2;
+  // Wants the cache was asked about and lacked. A Want for a drv already
+  // tracked joins it, queued or building, and counts as neither. This counts
+  // a Want refused for its system too, which the events do not show one by
+  // one. Take miss rates from this counter.
   uint64 cache_misses = 3;
   uint64 assigned = 4;
   uint64 built = 5;
@@ -440,6 +447,13 @@ message Counters {
   // substituter URL, sorted by URL. At most 64 URLs; the rest add up under
   // "other".
   repeated SubstituterTraffic substituters = 12;
+  // Summed over clients' Graph messages: the derivations whose outputs
+  // their graphs needed, and of those the ones already cached, which they
+  // did not Want. graph_pruned_drvs / graph_drvs is the share of what
+  // clients needed that was cached. Clients that send no Graph add nothing,
+  // so 0 means unknown, not nothing cached.
+  uint64 graph_drvs = 13;
+  uint64 graph_pruned_drvs = 14;
 }
 
 message CounterSample {

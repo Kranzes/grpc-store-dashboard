@@ -137,7 +137,12 @@ describe('snapshot', () => {
 			free: 3,
 			assignedPerSec: 0
 		});
-		expect(v.cache).toMatchObject({ url: 'https://cache.test', hitsPerSec: 0, hitRatio: null });
+		expect(v.cache).toMatchObject({
+			url: 'https://cache.test',
+			hitsPerSec: 0,
+			cachedRatio: null,
+			hitRatio: null
+		});
 
 		expect([...v.edges.keys()].sort()).toEqual(
 			[
@@ -631,33 +636,37 @@ describe('stream checks', () => {
 });
 
 describe('totals', () => {
-	function withHistory(servingAgoMs: number, minutes: number) {
+	/** `graph`: what clients' graphs needed, and of those found cached, a minute. */
+	function withHistory(
+		servingAgoMs: number,
+		minutes: number,
+		graph: { drvs: bigint; pruned: bigint } = { drvs: 0n, pruned: 0n }
+	) {
 		const r = new FarmReducer();
 		const s = new Stream();
 		r.beginStream();
 		const history = [];
 		// 100 builds, 10 failures, 20 cache hits and 5 misses a minute.
+		const at = (n: bigint) => ({
+			built: 100n * n,
+			failed: 10n * n,
+			cacheHits: 20n * n,
+			cacheMisses: 5n * n,
+			graphDrvs: graph.drvs * n,
+			graphPrunedDrvs: graph.pruned * n
+		});
 		for (let k = minutes; k >= 1; k--) {
-			const n = BigInt(minutes - k + 1);
 			history.push(
 				create(CounterSampleSchema, {
 					timeMs: BigInt(T0 - k * 60_000),
-					counters: create(CountersSchema, {
-						built: 100n * n,
-						failed: 10n * n,
-						cacheHits: 20n * n,
-						cacheMisses: 5n * n
-					})
+					counters: create(CountersSchema, at(BigInt(minutes - k + 1)))
 				})
 			);
 		}
-		const m = BigInt(minutes + 1);
 		r.apply(
 			[
 				...s.snapshot(E.reset({ history, servingSinceMs: BigInt(T0 - servingAgoMs) })),
-				...s.next(
-					E.stats({ built: 100n * m, failed: 10n * m, cacheHits: 20n * m, cacheMisses: 5n * m })
-				)
+				...s.next(E.stats(at(BigInt(minutes + 1))))
 			],
 			T0
 		);
@@ -691,6 +700,17 @@ describe('totals', () => {
 			since: null
 		});
 		expect(r.views(T0, 5).cache!.hitRatio).toBeCloseTo(100 / 125);
+	});
+
+	it('takes the cached share from the graph counts of the window', () => {
+		// 400 derivations needed a minute, 300 of them found cached.
+		const r = withHistory(3 * 3600_000, 30, { drvs: 400n, pruned: 300n });
+		expect(r.views(T0, 5).cache).toMatchObject({ cachedRatio: 0.75 });
+		expect(r.views(T0, 5).cache!.hitRatio).toBeCloseTo(100 / 125);
+		// Without graph counts, as from older clients, the share is unknown, not 0%.
+		const old = withHistory(3 * 3600_000, 30).views(T0, 5).cache!;
+		expect(old.cachedRatio).toBeNull();
+		expect(old.hitRatio).toBeCloseTo(100 / 125);
 	});
 
 	it('counts from the scheduler start while the window reaches before it', () => {

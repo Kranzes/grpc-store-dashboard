@@ -255,7 +255,19 @@ message ClientMsg {
   oneof msg {
     Want want = 1;
     Cancel cancel = 2;
+    Graph graph = 3;
   }
+}
+
+// What a client found when it walked the graph it builds, top down: the
+// derivations whose outputs it needed, and of those the ones whose needed
+// outputs the server held or substituted, which it does not Want. Nothing
+// below such a derivation is needed, so a cached subtree counts once, as its
+// top. Sent once per graph, ahead of its Wants, and on a stream of its own
+// when nothing is left to build. Older schedulers ignore it.
+message Graph {
+  uint64 drvs = 1;
+  uint64 pruned_drvs = 2;
 }
 
 message Assigned {

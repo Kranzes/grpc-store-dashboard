@@ -625,7 +625,9 @@ test.describe('header', () => {
 			'true'
 		);
 		await expect(cache.locator('.when')).toContainText('Last 1h');
-		await expect(cache.locator('.label').first()).toHaveText('Hit ratio');
+		await expect(cache.locator('.label').first()).toHaveText('Cached');
+		await expect(cache).toContainText('of requested derivations');
+		await expect(cache).toContainText('Found cached when scheduled');
 		await expect(page.locator('.totals .caption')).toHaveCount(0);
 	});
 
@@ -765,7 +767,9 @@ test.describe('drill-down', () => {
 		await demo(page);
 		await node(page, 'cache').click();
 		await expect(page.locator('#panel-title')).toHaveText('Binary cache');
-		await expect(panel(page)).toContainText("only the scheduler's own lookups");
+		// The demo's clients report their graphs, so the panel explains both shares.
+		await expect(panel(page)).toContainText('Cached is the share of requested derivations');
+		await expect(panel(page)).toContainText('a hit is mostly a race won between clients');
 		await expect(
 			panel(page).getByRole('list', { name: 'Recent cache activity' }).getByRole('button').first()
 		).toBeVisible();
@@ -2214,7 +2218,7 @@ test.describe('queued count on the group heading', () => {
 	});
 });
 
-test.describe('queue rows, chart readout and hit ratio', () => {
+test.describe('queue rows, chart readout and cached share', () => {
 	test('the scheduler card folds unplaceable rows into one, then the largest queues', async ({
 		page
 	}) => {
@@ -2305,7 +2309,7 @@ test.describe('queue rows, chart readout and hit ratio', () => {
 		for (const w of widths) expect(w).toBeLessThan(slot);
 	});
 
-	test('the cache card shows its hit ratio as a meter', async ({ page }) => {
+	test('the cache card shows its cached share as a meter', async ({ page }) => {
 		await demo(page);
 		const cache = node(page, 'cache');
 		await expect(cache.locator('.donut')).toHaveCount(0);

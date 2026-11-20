@@ -1,7 +1,7 @@
 From 0b9593f45346f1ec387eb8f62e0842f827a8c7e6 Mon Sep 17 00:00:00 2001
 From: Ilan Joselevich <personal@ilanjoselevich.com>
 Date: Tue, 10 Nov 2026 19:16:44 +0100
-Subject: [PATCH 04/16] auth: add a watch role below read-only
+Subject: [PATCH 04/17] auth: add a watch role below read-only
 
 A dashboard, or anything else that follows the scheduler's events,
 needs no NAR downloads or path queries, which read-only allows. watch

@@ -1,7 +1,7 @@
 From 9c17e448f2bfe23b21f9e5877e28e3848725bcef Mon Sep 17 00:00:00 2001
 From: Ilan Joselevich <personal@ilanjoselevich.com>
 Date: Thu, 19 Nov 2026 06:50:57 +0100
-Subject: [PATCH 14/16] scheduler: sample each pool's use with the counters
+Subject: [PATCH 14/17] scheduler: sample each pool's use with the counters
 
 A watcher that connects sees the counters of the last hour in
 Reset.history, but each pool's slots and load only from then on. How

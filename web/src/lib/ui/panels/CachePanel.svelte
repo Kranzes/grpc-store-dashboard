@@ -35,8 +35,14 @@
 		</dl>
 		<WindowCaption minutes={store.totals.windowMinutes} since={store.totals.since} />
 		<dl class="p-facts">
+			{#if c.cachedRatio !== null}
+				<div>
+					<dt>Cached</dt>
+					<dd>{formatPercent(c.cachedRatio)}</dd>
+				</div>
+			{/if}
 			<div>
-				<dt>Hit ratio</dt>
+				<dt>Found cached when scheduled</dt>
 				<dd>{formatPercent(c.hitRatio)}</dd>
 			</div>
 			<div>
@@ -48,10 +54,20 @@
 				<dd>{formatPerMinute(c.missesPerSec * 60)}</dd>
 			</div>
 		</dl>
-		<p class="p-caption">
-			Hits and misses count only the scheduler's own lookups. Clients skip outputs they already
-			found in the cache, so the real hit ratio is higher.
-		</p>
+		{#if c.cachedRatio !== null}
+			<p class="p-caption">
+				Cached is the share of requested derivations that were already in the cache. Clients
+				found those cached and did not request them. Hits and misses count requests the cache had, or lacked, when
+				they reached the scheduler. Clients request only what they found missing, so a hit is mostly
+				a race won between clients.
+			</p>
+		{:else}
+			<p class="p-caption">
+				No client in this window reported how much of what it needed was cached. Hits and misses
+				count only the scheduler's own lookups. Clients skip outputs they already found in the
+				cache, so the real share is higher.
+			</p>
+		{/if}
 	</section>
 
 	<LineRows {store} {rows} {onopenlines} />

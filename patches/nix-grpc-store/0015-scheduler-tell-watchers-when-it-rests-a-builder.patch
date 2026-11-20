@@ -1,7 +1,7 @@
 From 42cd1ebdc8f0eb8d06213b58454f1b76287e8645 Mon Sep 17 00:00:00 2001
 From: Ilan Joselevich <personal@ilanjoselevich.com>
 Date: Thu, 19 Nov 2026 08:36:06 +0100
-Subject: [PATCH 15/16] scheduler: tell watchers when it rests a builder
+Subject: [PATCH 15/17] scheduler: tell watchers when it rests a builder
 
 A builder that gives back builds for failures of its own more than twice
 since it last finished one gets no new builds for a while: 30 s, twice

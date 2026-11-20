@@ -779,6 +779,8 @@ export class MockFarm {
 	readonly #rng2: Rng;
 	/** Rests only, so they leave the other draws as they were. */
 	readonly #rngRest: Rng;
+	/** Clients' graph counts only, likewise. */
+	readonly #rngGraph: Rng;
 	readonly #timers = new Heap<Timer>((a, b) => a.at < b.at || (a.at === b.at && a.n < b.n));
 	#timerN = 0;
 	#seq = 0n;
@@ -828,6 +830,7 @@ export class MockFarm {
 		this.#rng = new Rng(options.seed);
 		this.#rng2 = new Rng(options.seed ^ 0x51ed);
 		this.#rngRest = new Rng(options.seed ^ 0x7e57);
+		this.#rngGraph = new Rng(options.seed ^ 0x6a4f);
 		this.instance = this.#rng.hash().slice(0, 16);
 		const warmup = WARMUP_MS;
 		this.now = startMs - warmup;
@@ -2258,8 +2261,24 @@ export class MockFarm {
 		}
 		job.remaining = job.nodes.length;
 		// The client takes a moment to upload before it sends its Wants.
-		this.#after(rng.int(20, 400), () => this.#pump(job));
+		this.#after(rng.int(20, 400), () => {
+			this.#reportGraph(job);
+			this.#pump(job);
+		});
 		return job;
+	}
+
+	/**
+	 * The counts of the client's walk, sent ahead of its first Wants: the
+	 * derivations it needed, its nodes and those it found cached and so does
+	 * not Want. A build hook walks no graph and sends none.
+	 */
+	#reportGraph(job: Job) {
+		if (job.hook) return;
+		const n = job.nodes.length;
+		const pruned = this.options.cache ? Math.round(n * (1 + 5 * this.#rngGraph.next())) : 0;
+		this.#counters.graphDrvs += n + pruned;
+		this.#counters.graphPrunedDrvs += pruned;
 	}
 
 	/** Weighted by slots, so every builder pool gets work. */

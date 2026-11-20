@@ -1,0 +1,594 @@
+From 727d7fccb6cbb8cf7cfa1f778faae556083b0661 Mon Sep 17 00:00:00 2001
+From: Ilan Joselevich <personal@ilanjoselevich.com>
+Date: Fri, 20 Nov 2026 00:48:26 +0100
+Subject: [PATCH 17/17] client, scheduler: count how much of each requested
+ graph is cached
+
+The scheduler's cache_hits and cache_misses count Wants it looked up,
+but a client Wants only what it found missing: it walks the graph top
+down and skips every derivation whose needed outputs the server already
+holds or substitutes. So the scheduler mostly sees misses, and its hit
+ratio sits low however warm the cache is. How much of what clients
+needed was cached is a figure only the client sees.
+
+The walk now counts the derivations whose outputs it needed, and of
+those the ones it found held. Nothing below a held derivation is
+needed, so a cached subtree counts once, as its top. The client sends
+both in a new ClientMsg, Graph, once per graph, ahead of its first
+Wants. When nothing is left to build, it opens a Schedule stream only
+for the counts and half-closes it, which the scheduler ends; that
+report never holds up or fails the build. Older schedulers skip a
+ClientMsg they do not know.
+
+The scheduler sums them into two new counters, graph_drvs and
+graph_pruned_drvs, which reach Stats totals and the counter history.
+One Graph adds at most 2^24 derivations, and no more pruned than
+considered.
+
+cache_hits and cache_misses stay, documented as what they are: Wants
+found cached, or not, when they reached the scheduler, where a hit is
+mostly a race won between clients. A Want for a derivation already
+tracked joins it, queued or building, and now counts as neither; it
+used to count as a miss.
+
+top-down-test covers the counts on a graph with a cached subtree;
+events-test covers the counters summed over two clients, and its
+randomized run models the misses of Wants that join.
+---
+ proto/events.proto       | 26 +++++++++---
+ proto/nix_remote.proto   | 12 ++++++
+ src/client/build.cc      | 92 +++++++++++++++++++++++++++++++++++-----
+ src/client/store.hh      | 15 +++++--
+ src/daemon/dispatcher.cc | 15 ++++++-
+ src/daemon/dispatcher.hh |  4 ++
+ src/top-down.hh          | 40 +++++++++++++----
+ tests/events-test.cc     | 50 +++++++++++++++++++++-
+ tests/top-down-test.cc   | 23 +++++++++-
+ 9 files changed, 246 insertions(+), 31 deletions(-)
+
+diff --git a/proto/events.proto b/proto/events.proto
+index 23697cf..7ab79d2 100644
+--- a/proto/events.proto
++++ b/proto/events.proto
+@@ -416,12 +416,19 @@ message Stats {
+ // process becomes the active scheduler again, while instance and seq carry
+ // on.
+ message Counters {
+-  uint64 wanted = 1;     // new queue entries
+-  uint64 cache_hits = 2; // Wants answered Cached, one DrvCached each
+-  // Wants the cache was asked about and lacked. This counts every such Want,
+-  // including a repeat Want for a drv already tracked and a Want refused
+-  // for its system, which the events do not show one by one. Take miss
+-  // rates from this counter.
++  uint64 wanted = 1; // new queue entries
++  // cache_hits and cache_misses count Wants found cached, or not, when they
++  // reached the scheduler. A client Wants only what it found missing, so a
++  // hit is mostly a race won: another client's build published the outputs
++  // in between. They are not how much of what clients need is cached; for
++  // that, see graph_drvs.
++  //
++  // Wants found cached, one DrvCached each.
++  uint64 cache_hits = 2;
++  // Wants the cache was asked about and lacked. A Want for a drv already
++  // tracked joins it, queued or building, and counts as neither. This counts
++  // a Want refused for its system too, which the events do not show one by
++  // one. Take miss rates from this counter.
+   uint64 cache_misses = 3;
+   uint64 assigned = 4;
+   uint64 built = 5;
+@@ -440,6 +447,13 @@ message Counters {
+   // substituter URL, sorted by URL. At most 64 URLs; the rest add up under
+   // "other".
+   repeated SubstituterTraffic substituters = 12;
++  // Summed over clients' Graph messages: the derivations whose outputs
++  // their graphs needed, and of those the ones already cached, which they
++  // did not Want. graph_pruned_drvs / graph_drvs is the share of what
++  // clients needed that was cached. Clients that send no Graph add nothing,
++  // so 0 means unknown, not nothing cached.
++  uint64 graph_drvs = 13;
++  uint64 graph_pruned_drvs = 14;
+ }
+ 
+ message CounterSample {
+diff --git a/proto/nix_remote.proto b/proto/nix_remote.proto
+index 66545ff..468d903 100644
+--- a/proto/nix_remote.proto
++++ b/proto/nix_remote.proto
+@@ -255,9 +255,21 @@ message ClientMsg {
+   oneof msg {
+     Want want = 1;
+     Cancel cancel = 2;
++    Graph graph = 3;
+   }
+ }
+ 
++// What a client found when it walked the graph it builds, top down: the
++// derivations whose outputs it needed, and of those the ones whose needed
++// outputs the server held or substituted, which it does not Want. Nothing
++// below such a derivation is needed, so a cached subtree counts once, as its
++// top. Sent once per graph, ahead of its Wants, and on a stream of its own
++// when nothing is left to build. Older schedulers ignore it.
++message Graph {
++  uint64 drvs = 1;
++  uint64 pruned_drvs = 2;
++}
++
+ message Assigned {
+   string drv_path = 1;
+   // IP:port the balancer knows the worker by; goes into x-nix-worker.
+diff --git a/src/client/build.cc b/src/client/build.cc
+index 03f093e..6c8054f 100644
+--- a/src/client/build.cc
++++ b/src/client/build.cc
+@@ -206,12 +206,16 @@ struct GrpcStore::Run {
+   std::set<std::pair<JobId, StorePath>> recovered; // (job, missing input) pairs already recovered
+   bool closed = false;           // WritesDone sent
+   grpc::ClientReaderWriter<remote::ClientMsgs, remote::SchedMsgs> * stream = nullptr;
++  // The graph's counts, until a stream took them.
++  std::optional<remote::Graph> graph;
+ 
+-  Run(GrpcStore & store, Store & evalStore, std::map<StorePath, Job> & jobs, size_t threads)
++  Run(GrpcStore & store, Store & evalStore, std::map<StorePath, Job> & jobs, size_t threads,
++      std::optional<remote::Graph> graph)
+       : store(store), evalStore(evalStore), jobs(jobs),
+         exe({.threads = threads,
+              .rescheduleRetries = store.config->rescheduleRetries,
+-             .keepGoing = nixcompat::keepGoing()}) {
++             .keepGoing = nixcompat::keepGoing()}),
++        graph(std::move(graph)) {
+         std::function<JobId(Job &)> add = [&](Job & job) -> JobId {
+       auto const name = std::string(job.drvPath.to_string());
+       if (auto const found = byName.find(name); found != byName.end()) {
+@@ -291,11 +295,17 @@ struct GrpcStore::Run {
+       }
+       if (stream == nullptr) {
+         exe.unsent(sent);
++      } else {
++        graph.reset(); // it went in the first batch
+       }
+       batch.Clear();
+       bytes = 0;
+       sent.clear();
+     };
++    // Once, ahead of the first Wants; a stream that fails keeps it for the next.
++    if (graph && stream != nullptr) {
++      *batch.add_msgs()->mutable_graph() = *graph;
++    }
+     for (auto const jid : cancels) {
+       batch.add_msgs()->mutable_cancel()->set_drv_path(std::string(byId.at(jid)->drvPath.to_string()));
+     }
+@@ -596,12 +606,72 @@ auto GrpcStore::scheduleUntilDone(Run & run, const Metadata & headers) -> grpc::
+   }
+ }
+ 
+-void GrpcStore::runJobs(std::map<StorePath, Job> & jobs, Store & evalStore) {
++namespace {
++// What a client's walk counted, as the scheduler takes it. nullopt for a
++// walk that considered nothing, as for a single derivation without one.
++auto graphMsg(const nixgrpc::WalkCounts & graph) -> std::optional<remote::Graph> {
++  if (graph.considered == 0) {
++    return std::nullopt;
++  }
++  remote::Graph msg;
++  msg.set_drvs(graph.considered);
++  msg.set_pruned_drvs(graph.held);
++  return msg;
++}
++} // namespace
++
++void GrpcStore::reportGraph(const nixgrpc::WalkCounts & graph, const std::vector<DerivedPath> & reqs,
++                            Store & evalStore) {
++  auto const msg = graphMsg(graph);
++  if (!msg) {
++    return;
++  }
++  // Routed like the stream it would have had: by the first requested derivation.
++  auto const first = std::ranges::find_if(
++      reqs, [](const DerivedPath & req) -> bool { return std::holds_alternative<DerivedPath::Built>(req.raw()); });
++  if (first == reqs.end()) {
++    return;
++  }
++  const auto & built = std::get<DerivedPath::Built>(first->raw());
++  // Counts only: a stream that sends them and half-closes, which the
++  // scheduler ends. It never holds up or fails the build.
++  try {
++    static constexpr std::chrono::seconds patience{10};
++    nixgrpc::Call call;
++    auto const drvPath = built.drvPath->getBaseStorePath();
++    addHeaders(call.ctx(), routingFor(basicForFarm(evalStore, drvPath, evalStore.readDerivation(drvPath))));
++    call.ctx().set_deadline(std::chrono::system_clock::now() + patience);
++    auto stream = sched->Schedule(&call.ctx());
++    remote::ClientMsgs batch;
++    *batch.add_msgs()->mutable_graph() = *msg;
++    if (stream->Write(batch)) {
++      stream->WritesDone();
++    }
++    if (auto const status = stream->Finish(); !status.ok()) {
++      debug("grpc: the graph's counts did not reach the scheduler: %s", status.error_message());
++    }
++  } catch (Error & err) {
++    debug("grpc: the graph's counts did not reach the scheduler: %s", err.what());
++  }
++}
++
++void GrpcStore::buildGraph(const std::vector<DerivedPath> & reqs, BuildMode buildMode, Store & evalStore,
++                           std::map<StorePath, Job> & jobs) {
++  nixgrpc::WalkCounts graph;
++  loadJobs(reqs, buildMode, evalStore, jobs, graph);
++  if (jobs.empty()) {
++    reportGraph(graph, reqs, evalStore);
++  } else {
++    runJobs(jobs, evalStore, graph);
++  }
++}
++
++void GrpcStore::runJobs(std::map<StorePath, Job> & jobs, Store & evalStore, const nixgrpc::WalkCounts & graph) {
+   if (jobs.empty()) {
+     return;
+   }
+   auto const threadCount = std::min<size_t>(config->maxBuilds, jobs.size());
+-  Run run(*this, evalStore, jobs, threadCount);
++  Run run(*this, evalStore, jobs, threadCount, graphMsg(graph));
+   auto const headers = routingFor(jobs.begin()->second.drv);
+   // Uploading here keeps a build from waiting on the upload of its inputs' derivations.
+   std::vector<StorePath> drvPaths;
+@@ -661,8 +731,7 @@ auto GrpcStore::dispatchBuild(const std::vector<DerivedPath> & reqs, BuildMode b
+   }
+   std::map<StorePath, Job> jobs;
+   if (evalStore != nullptr) {
+-    loadJobs(reqs, buildMode, *evalStore, jobs);
+-    runJobs(jobs, *evalStore);
++    buildGraph(reqs, buildMode, *evalStore, jobs);
+   }
+ 
+   // Opaque paths: "building" them means making them valid, i.e. substituting.
+@@ -749,8 +818,8 @@ auto GrpcStore::basicForFarm(Store & evalStore, const StorePath & drvPath, const
+ // a derivation that is actually needed do we ask the server to substitute
+ // what's missing, like nix does before building. Whatever can't be
+ // substituted, e.g. due to an untrusted signature, gets built.
+-auto GrpcStore::missingInputDrvs(const std::vector<DerivedPath> & reqs, BuildMode buildMode, Store & evalStore)
+-    -> StorePathSet {
++auto GrpcStore::missingInputDrvs(const std::vector<DerivedPath> & reqs, BuildMode buildMode, Store & evalStore,
++                                 nixgrpc::WalkCounts & graph) -> StorePathSet {
+   std::map<StorePath, Derivation> drvs;
+   std::map<StorePath, std::map<std::string, std::optional<StorePath>>> outputs;
+   std::function<void(const StorePath &)> collect = [&](const StorePath & drvPath) -> void {
+@@ -784,7 +853,8 @@ auto GrpcStore::missingInputDrvs(const std::vector<DerivedPath> & reqs, BuildMod
+         return used;
+       },
+       [&](const StorePathSet & paths) -> StorePathSet { return queryValidPaths(paths, NoSubstitute); },
+-      [&](const StorePathSet & paths) -> StorePathSet { return queryValidPaths(paths, Substitute); });
++      [&](const StorePathSet & paths) -> StorePathSet { return queryValidPaths(paths, Substitute); },
++      nixgrpc::topDownBudget, &graph);
+ }
+ 
+ auto GrpcStore::farmJob(Store & evalStore, const StorePath & drvPath, const Derivation & full,
+@@ -804,8 +874,8 @@ auto GrpcStore::farmJob(Store & evalStore, const StorePath & drvPath, const Deri
+ }
+ 
+ void GrpcStore::loadJobs(const std::vector<DerivedPath> & reqs, BuildMode buildMode, Store & evalStore,
+-                  std::map<StorePath, Job> & jobs) {
+-  auto const missing = missingInputDrvs(reqs, buildMode, evalStore);
++                  std::map<StorePath, Job> & jobs, nixgrpc::WalkCounts & graph) {
++  auto const missing = missingInputDrvs(reqs, buildMode, evalStore, graph);
+   std::function<Job &(const StorePath &)> load = [&](const StorePath & drvPath) -> Job & {
+     if (auto const found = jobs.find(drvPath); found != jobs.end()) {
+       return found->second;
+diff --git a/src/client/store.hh b/src/client/store.hh
+index bac7d92..244ce41 100644
+--- a/src/client/store.hh
++++ b/src/client/store.hh
+@@ -85,6 +85,7 @@
+ #include "nix-compat.hh"
+ #include "nar-fetcher.hh"
+ #include "retry.hh"
++#include "top-down.hh"
+ #include "path-info-wire.hh"
+ #include "nix_remote.grpc.pb.h"
+ #include "nix_remote.pb.h"
+@@ -516,7 +517,15 @@ public:
+     // usually have the derivations in the local store.
+     auto localEvalStore(const StorePathSet & drvPaths) -> std::shared_ptr<Store>;
+ 
+-    auto runJobs(std::map<StorePath, Job> & jobs, Store & evalStore) -> void;
++    // `graph`: what the walk that found the jobs counted, sent ahead of the Wants.
++    auto runJobs(std::map<StorePath, Job> & jobs, Store & evalStore, const nixgrpc::WalkCounts & graph = {})
++        -> void;
++    // Finds the jobs of `reqs` and runs them, or reports the graph alone when
++    // nothing is left to build.
++    void buildGraph(const std::vector<DerivedPath> & reqs, BuildMode buildMode, Store & evalStore,
++                    std::map<StorePath, Job> & jobs);
++    // A graph with nothing left to build: its counts alone, on a stream of their own.
++    void reportGraph(const nixgrpc::WalkCounts & graph, const std::vector<DerivedPath> & reqs, Store & evalStore);
+     auto scheduleUntilDone(Run & run, const Metadata & headers) -> grpc::Status;
+ 
+     // Single drv without a DAG (build hook, legacy buildDerivation callers).
+@@ -529,9 +538,9 @@ public:
+                  const std::function<bool(const StorePath &)> & isJob) -> Job;
+ 
+     auto missingInputDrvs(const std::vector<nix::DerivedPath> & reqs, nix::BuildMode buildMode,
+-                          nix::Store & evalStore) -> nix::StorePathSet;
++                          nix::Store & evalStore, nixgrpc::WalkCounts & graph) -> nix::StorePathSet;
+     void loadJobs(const std::vector<DerivedPath> & reqs, BuildMode buildMode, Store & evalStore,
+-                  std::map<StorePath, Job> & jobs);
++                  std::map<StorePath, Job> & jobs, nixgrpc::WalkCounts & graph);
+ 
+     void throwOnFailedBuilds(std::vector<KeyedBuildResult> & results);
+ 
+diff --git a/src/daemon/dispatcher.cc b/src/daemon/dispatcher.cc
+index 4073dc6..35fd867 100644
+--- a/src/daemon/dispatcher.cc
++++ b/src/daemon/dispatcher.cc
+@@ -665,11 +665,22 @@ void Dispatcher::applyClientMsgs(
+                 onWant(client, msg.want(), cached.at(static_cast<size_t>(i)));
+             } else if (msg.has_cancel()) {
+                 onCancel(client, msg.cancel());
++            } else if (msg.has_graph()) {
++                onGraph(msg.graph());
+             }
+         }
+     }
+ }
+ 
++// Under the lock. A client's count of its graph, for the counters. Taken as
++// sent, but at most maxGraphDrvs, and with no more pruned than considered.
++void Dispatcher::onGraph(const nix::remote::Graph & graph)
++{
++    auto const drvs = std::min(graph.drvs(), maxGraphDrvs);
++    counters.set_graph_drvs(counters.graph_drvs() + drvs);
++    counters.set_graph_pruned_drvs(counters.graph_pruned_drvs() + std::min(graph.pruned_drvs(), drvs));
++}
++
+ // Under the lock.
+ void Dispatcher::onWant(Client & client, const nix::remote::Want & want, Lookup cache)
+ {
+@@ -695,7 +706,9 @@ void Dispatcher::onWant(Client & client, const nix::remote::Want & want, Lookup
+         cachedLocked(client, want);
+         return;
+     }
+-    if (cache == Lookup::missing) {
++    // A Want for a derivation already tracked joins it, queued or building,
++    // and counts as neither a hit nor a miss.
++    if (cache == Lookup::missing && !core.findDrv(want.drv_path())) {
+         counters.set_cache_misses(counters.cache_misses() + 1);
+     }
+     if (want.system().size() > maxSystemLen) {
+diff --git a/src/daemon/dispatcher.hh b/src/daemon/dispatcher.hh
+index 5e4164d..3389765 100644
+--- a/src/daemon/dispatcher.hh
++++ b/src/daemon/dispatcher.hh
+@@ -201,6 +201,9 @@ private:
+     static constexpr size_t maxSystemLen = 64;
+     // A reported build phase is cut to this.
+     static constexpr size_t maxPhaseLen = 64;
++    // The most derivations one client's Graph adds to the counters: a typo or
++    // a hostile client cannot swamp the farm's figures.
++    static constexpr uint64_t maxGraphDrvs = uint64_t{1} << 24U;
+     Config config;
+     Metrics & metrics;
+     prometheus::Counter & assignedCtr;
+@@ -365,6 +368,7 @@ private:
+     // The nix_grpc_sched draining_* gauges.
+     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void exportDrainingLocked();
+     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void onWant(Client & client, const nix::remote::Want & want, Lookup cache);
++    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void onGraph(const nix::remote::Graph & graph);
+     ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex) void onCancel(Client & client, const nix::remote::Cancel & cancel);
+ 
+     // The event stream, in dispatcher-events.cc. The *Locked hooks keep the
+diff --git a/src/top-down.hh b/src/top-down.hh
+index 0afb1d7..b0a2965 100644
+--- a/src/top-down.hh
++++ b/src/top-down.hh
+@@ -133,6 +133,14 @@ auto missingTopDown(std::vector<Node> roots, Keys keys, Children children, Query
+         .run(std::move(roots));
+ }
+ 
++// What a build walk decided: the nodes something needed keys of, and of
++// those the ones whose needed keys the store held, which it does not build.
++struct WalkCounts
++{
++    std::size_t considered = 0;
++    std::size_t held = 0;
++};
++
+ // Decides which nodes must be built.
+ //
+ // roots: each requested node -> the keys requested of it
+@@ -163,6 +171,7 @@ template <class Node, class Key, class Uses, class Query, class Fetch> class Bui
+     std::set<Key> valid;
+     std::set<Node> queried;
+     std::set<Node> missing;
++    WalkCounts counts;
+ 
+     auto isHeld(const Node & node) -> bool
+     {
+@@ -207,10 +216,15 @@ template <class Node, class Key, class Uses, class Query, class Fetch> class Bui
+     {
+         std::vector<Node> next;
+         for (const auto & node : level) {
+-            if (needs.contains(node) && !isHeld(node)) {
+-                missing.insert(node);
+-                for (const auto & [child, keys] : used.at(node)) {
+-                    needs[child].insert(keys.begin(), keys.end());
++            if (needs.contains(node)) {
++                counts.considered++;
++                if (isHeld(node)) {
++                    counts.held++;
++                } else {
++                    missing.insert(node);
++                    for (const auto & [child, keys] : used.at(node)) {
++                        needs[child].insert(keys.begin(), keys.end());
++                    }
+                 }
+             }
+             for (const auto & [child, keys] : used.at(node)) {
+@@ -271,15 +285,25 @@ public:
+         }
+         return std::move(missing);
+     }
++
++    [[nodiscard]] auto walkCounts() const -> WalkCounts
++    {
++        return counts;
++    }
+ };
+ 
++// `counts`, when given, gets what the walk decided.
+ template <class Node, class Key, class Uses, class Query, class Fetch>
+ auto missingForBuild(const std::map<Node, std::vector<Key>> & roots, bool rebuildRoots, Uses uses, Query query,
+-                     Fetch fetch, std::size_t budget = topDownBudget) -> std::set<Node>
++                     Fetch fetch, std::size_t budget = topDownBudget, WalkCounts * counts = nullptr) -> std::set<Node>
+ {
+-    return BuildWalk<Node, Key, Uses, Query, Fetch>(roots, rebuildRoots, std::move(uses), std::move(query),
+-                                                    std::move(fetch), budget)
+-        .run();
++    BuildWalk<Node, Key, Uses, Query, Fetch> walk(roots, rebuildRoots, std::move(uses), std::move(query),
++                                                  std::move(fetch), budget);
++    auto missing = walk.run();
++    if (counts != nullptr) {
++        *counts = walk.walkCounts();
++    }
++    return missing;
+ }
+ 
+ } // namespace nixgrpc
+diff --git a/tests/events-test.cc b/tests/events-test.cc
+index 835f8bf..28a33ae 100644
+--- a/tests/events-test.cc
++++ b/tests/events-test.cc
+@@ -758,6 +758,12 @@ private:
+         for (const auto & [path, drv] : model.drvs) {
+             known.insert(path);
+         }
++        // What the scheduler tracks: a blind run has no model of it, so it
++        // asks a watcher that leaves before the Wants go in.
++        std::set<std::string> tracked;
++        for (const auto & [path, drv] : watched ? model.drvs : snapshot(disp).drvs) {
++            tracked.insert(path);
++        }
+         for (size_t n = 1 + pick(3); n > 0; n--) {
+             auto const idx = pick(drvCount);
+             auto * want = msgs.add_msgs()->mutable_want();
+@@ -775,7 +781,11 @@ private:
+             want->set_build_mode(chance(0.15) ? 1 : 0);
+             bool const checked = want->build_mode() == 0;
+             bool const cached = checked && cache.contains(want->out_keys(0));
+-            misses += checked && !cached ? 1 : 0;
++            // A Want that joins a tracked drv, from before or from this batch, is no miss.
++            misses += checked && !cached && !tracked.contains(want->drv_path()) ? 1 : 0;
++            if (!cached) {
++                tracked.insert(want->drv_path());
++            }
+             sent.push_back({.path = want->drv_path(), .cached = cached, .checked = checked && !cached});
+         }
+         disp.clientMsgs(client, msgs);
+@@ -1902,6 +1912,43 @@ void testUnits()
+     assert(capacity.at("aarch64-linux") == 3 && slots.at("aarch64-linux") == 3);
+ }
+ 
++// Graph counts from every client add up in the counters, each capped and
++// with no more pruned than considered.
++void testGraphCounts()
++{
++    double now = 0;
++    Metrics metrics("");
++    Dispatcher disp(
++        {.defaultSystem = std::string(x86), .lookupThreads = 0, .nowMs = [&] -> double { return now; }}, metrics);
++    auto const graphMsg = [](uint64_t drvs, uint64_t pruned) -> rpc::ClientMsgs {
++        rpc::ClientMsgs msgs;
++        auto * graph = msgs.add_msgs()->mutable_graph();
++        graph->set_drvs(drvs);
++        graph->set_pruned_drvs(pruned);
++        return msgs;
++    };
++    auto const send = [](const rpc::SchedMsg &) -> bool { return true; };
++    auto const one = disp.connectClient(send, [] -> void {}, "ci");
++    auto const two = disp.connectClient(send, [] -> void {}, "alice");
++    disp.clientMsgs(one, graphMsg(100, 90));
++    disp.clientMsgs(two, graphMsg(40, 10));
++    // More pruned than considered: no more than considered.
++    disp.clientMsgs(two, graphMsg(5, 9));
++    Sink sink;
++    auto const watcher = disp.watch(sink.send(), sink.end());
++    assert(watcher);
++    now += 1000;
++    disp.tick();
++    std::optional<rpc::Counters> totals;
++    for (const auto & event : sink.take()) {
++        totals = event.has_stats() ? std::optional(event.stats().totals()) : totals;
++    }
++    disp.unwatch(*watcher);
++    assert(totals && totals->graph_drvs() == 145 && totals->graph_pruned_drvs() == 105);
++    // They carry no Wants: nothing is queued and nothing is looked up.
++    assert(totals->wanted() == 0 && totals->cache_hits() == 0 && totals->cache_misses() == 0);
++}
++
+ void testRandom()
+ {
+     for (unsigned seed = 1; seed <= 8; seed++) {
+@@ -2255,6 +2302,7 @@ try {
+     testPoolSamples();
+     testRest();
+     testUnits();
++    testGraphCounts();
+     testProgress();
+     testRecentBuilds();
+     testRecentBuildsTies();
+diff --git a/tests/top-down-test.cc b/tests/top-down-test.cc
+index 0a1aeb3..5b06b78 100644
+--- a/tests/top-down-test.cc
++++ b/tests/top-down-test.cc
+@@ -21,6 +21,7 @@ struct Result
+ {
+     std::set<std::string> missing;
+     Calls calls;
++    nixgrpc::WalkCounts counts;
+ };
+ 
+ auto run(const Graph & graph, std::vector<std::string> roots, const std::set<std::string> & held, std::size_t budget) -> Result
+@@ -150,7 +151,7 @@ auto runBuild(const Uses & uses, const std::map<std::string, std::vector<std::st
+             std::ranges::set_intersection(keys, held, std::inserter(answer, answer.end()));
+             return answer;
+         },
+-        [](const Names &) -> Names { return {}; }, 1);
++        [](const Names &) -> Names { return {}; }, 1, &result.counts);
+     return result;
+ }
+ 
+@@ -201,6 +202,25 @@ void anInputUsedOnlyByAHeldNodeIsNotNeeded()
+     assert((result.missing == Names{"x"}));
+ }
+ 
++// The counts a client reports for its graph: the nodes it needed keys of, and
++// of those the held ones. Nothing below a held node is needed, so a cached
++// subtree counts once, as its top.
++void aCachedSubtreeCountsAsItsTop()
++{
++    // x builds on a's out and b's out, b on c's out, c on d's out.
++    Uses const uses{
++        {"x", {{"a", {"a-out"}}, {"b", {"b-out"}}}}, {"b", {{"c", {"c-out"}}}}, {"c", {{"d", {"d-out"}}}}, {"a", {}}, {"d", {}}};
++    auto const cached = runBuild(uses, {{"x", {"x-out"}}}, {"b-out", "c-out", "d-out"}, false);
++    assert((cached.missing == Names{"a", "x"}));
++    assert(cached.counts.considered == 3 && cached.counts.held == 1);
++    // All of it held: the root alone.
++    auto const warm = runBuild(uses, {{"x", {"x-out"}}}, {"x-out"}, false);
++    assert(warm.missing.empty() && warm.counts.considered == 1 && warm.counts.held == 1);
++    // None of it: every node, none held.
++    auto const cold = runBuild(uses, {{"x", {"x-out"}}}, {}, false);
++    assert(cold.counts.considered == 5 && cold.counts.held == 0);
++}
++
+ void aRootAnotherBuildsOnNeedsWhatBothAsk()
+ {
+     auto const held = runBuild(bOnA(), {{"b", {"b-out"}}, {"a", {"a-out"}}}, {"a-out"}, false);
+@@ -294,6 +314,7 @@ try {
+     anInputNeedsTheKeysOfAllItsDependants();
+     anInputUsedOnlyByAHeldNodeIsNotNeeded();
+     aRootAnotherBuildsOnNeedsWhatBothAsk();
++    aCachedSubtreeCountsAsItsTop();
+     aFetchableInputIsNotBuilt();
+     anInputTheStoreCannotFetchIsBuilt();
+     aFetchableRootIsNotBuilt();
+-- 
+2.56.0
+

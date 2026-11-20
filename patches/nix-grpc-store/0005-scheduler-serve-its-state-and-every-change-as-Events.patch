@@ -1,7 +1,7 @@
 From afee989f8f194fe7def2fcb5e7b8322fe1fd68b6 Mon Sep 17 00:00:00 2001
 From: Ilan Joselevich <personal@ilanjoselevich.com>
 Date: Tue, 10 Nov 2026 19:22:36 +0100
-Subject: [PATCH 05/16] scheduler: serve its state and every change as
+Subject: [PATCH 05/17] scheduler: serve its state and every change as
  Events.Watch
 
 A dashboard that draws a farm live, or anything else that follows the

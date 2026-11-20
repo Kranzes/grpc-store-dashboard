@@ -1,7 +1,7 @@
 From 512120520009569044a71afd02a4bb7aa29858d4 Mon Sep 17 00:00:00 2001
 From: Ilan Joselevich <personal@ilanjoselevich.com>
 Date: Thu, 19 Nov 2026 09:58:08 +0100
-Subject: [PATCH 16/16] scheduler: tell watchers the units of its slot
+Subject: [PATCH 16/17] scheduler: tell watchers the units of its slot
  accounting
 
 Stats.systems gives slots and free in the scheduler's own units, but

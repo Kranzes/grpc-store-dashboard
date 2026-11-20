@@ -2450,10 +2450,12 @@ export class FarmReducer {
 			const mt = this.#meters;
 			const hits = totals.view.cached;
 			const lookups = hits + totals.cacheMisses;
+			const { graphDrvs, graphPruned } = totals;
 			cache = {
 				url: m.cacheUrl,
 				hitsPerSec: round3(mt.hits.rate(now)),
 				missesPerSec: round3(mt.misses.rate(now)),
+				cachedRatio: graphDrvs > 0 ? Math.min(1, graphPruned / graphDrvs) : null,
 				hitRatio: lookups > 0 ? hits / lookups : null,
 				publishedBytesPerSec: round3(mt.publish.rate(now)),
 				fetchedBytesPerSec: round3(mt.fetch.rate(now))
@@ -2606,7 +2608,12 @@ export class FarmReducer {
 			cached: d('cacheHits'),
 			since: w.since
 		};
-		return { view, cacheMisses: d('cacheMisses') };
+		return {
+			view,
+			cacheMisses: d('cacheMisses'),
+			graphDrvs: d('graphDrvs'),
+			graphPruned: d('graphPrunedDrvs')
+		};
 	}
 
 	/** One substituter's counts within the window. */

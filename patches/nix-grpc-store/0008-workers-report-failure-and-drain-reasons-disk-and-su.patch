@@ -1,7 +1,7 @@
 From 8b7681ff691e28a0c727922e3921f77438e9279c Mon Sep 17 00:00:00 2001
 From: Ilan Joselevich <personal@ilanjoselevich.com>
 Date: Tue, 10 Nov 2026 19:20:21 +0100
-Subject: [PATCH 08/16] workers: report failure and drain reasons, disk and
+Subject: [PATCH 08/17] workers: report failure and drain reasons, disk and
  substituter traffic
 
 A builder knows more than the scheduler hears. It gets Nix's

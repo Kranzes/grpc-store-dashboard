@@ -413,7 +413,16 @@ export type CacheView = Readonly<{
 	/** Scheduler cache lookups only: clients skip outputs they already found in the cache. */
 	hitsPerSec: number;
 	missesPerSec: number;
-	/** hits / (hits + misses) over the totals window, or null without lookups. */
+	/**
+	 * Of the derivations clients' graphs needed, the share already cached, which they did not
+	 * request: Counters.graph_pruned_drvs / graph_drvs over the totals window. Null while no
+	 * client in the window reported its graph, as older clients do not.
+	 */
+	cachedRatio: number | null;
+	/**
+	 * Requests found cached when they reached the scheduler, hits / (hits + misses) over the
+	 * totals window, or null without lookups. Mostly races won between clients.
+	 */
 	hitRatio: number | null;
 	publishedBytesPerSec: number;
 	/** An estimate that can be too high or too low. See Counters.fetched_bytes_estimate in the proto. */

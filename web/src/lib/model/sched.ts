@@ -24,7 +24,9 @@ export const COUNTER_KEYS = [
 	'dropped',
 	'requeued',
 	'publishedBytes',
-	'fetchedBytesEstimate'
+	'fetchedBytesEstimate',
+	'graphDrvs',
+	'graphPrunedDrvs'
 ] as const;
 
 export type CounterValues = Record<(typeof COUNTER_KEYS)[number], number>;
