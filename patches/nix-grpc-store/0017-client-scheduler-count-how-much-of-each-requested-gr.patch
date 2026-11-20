@@ -1,4 +1,4 @@
-From 727d7fccb6cbb8cf7cfa1f778faae556083b0661 Mon Sep 17 00:00:00 2001
+From 423bbbcdb7d20242051a34ff7b6b272e7dac6bac Mon Sep 17 00:00:00 2001
 From: Ilan Joselevich <personal@ilanjoselevich.com>
 Date: Fri, 20 Nov 2026 00:48:26 +0100
 Subject: [PATCH 17/17] client, scheduler: count how much of each requested
@@ -15,10 +15,14 @@ The walk now counts the derivations whose outputs it needed, and of
 those the ones it found held. Nothing below a held derivation is
 needed, so a cached subtree counts once, as its top. The client sends
 both in a new ClientMsg, Graph, once per graph, ahead of its first
-Wants. When nothing is left to build, it opens a Schedule stream only
-for the counts and half-closes it, which the scheduler ends; that
-report never holds up or fails the build. Older schedulers skip a
-ClientMsg they do not know.
+Wants. Older schedulers skip a ClientMsg they do not know.
+
+When nothing is left to build, the client opens a Schedule stream only
+for the counts and half-closes it, which the scheduler ends. The counts
+are best-effort statistics, so a fully cached build waits for that 2 s
+at most, GrpcStore::graphReportDeadline. Past it, or on any error, the
+counts are lost, not retried, the build's own result stands, and a
+debug line says how many reports the client has dropped so far.
 
 The scheduler sums them into two new counters, graph_drvs and
 graph_pruned_drvs, which reach Stats totals and the counter history.
@@ -31,21 +35,59 @@ mostly a race won between clients. A Want for a derivation already
 tracked joins it, queued or building, and now counts as neither; it
 used to count as a miss.
 
-top-down-test covers the counts on a graph with a cached subtree;
-events-test covers the counters summed over two clients, and its
-randomized run models the misses of Wants that join.
+top-down-test covers the counts on a graph with a cached subtree.
+graph-report-test sends a report to a scheduler that never answers,
+which costs the deadline at most, and to one that answers or is down,
+which ends it at once. events-test covers the counters summed over two
+clients, and its randomized run models the misses of Wants that join.
 ---
- proto/events.proto       | 26 +++++++++---
- proto/nix_remote.proto   | 12 ++++++
- src/client/build.cc      | 92 +++++++++++++++++++++++++++++++++++-----
- src/client/store.hh      | 15 +++++--
- src/daemon/dispatcher.cc | 15 ++++++-
- src/daemon/dispatcher.hh |  4 ++
- src/top-down.hh          | 40 +++++++++++++----
- tests/events-test.cc     | 50 +++++++++++++++++++++-
- tests/top-down-test.cc   | 23 +++++++++-
- 9 files changed, 246 insertions(+), 31 deletions(-)
+ meson.build                     |   7 ++
+ nix/packages/nix-grpc-store.nix |   1 +
+ proto/events.proto              |  26 ++++--
+ proto/nix_remote.proto          |  12 +++
+ src/client/build.cc             |  89 +++++++++++++++---
+ src/client/graph-report.hh      |  38 ++++++++
+ src/client/store.hh             |  21 ++++-
+ src/daemon/dispatcher.cc        |  15 ++-
+ src/daemon/dispatcher.hh        |   4 +
+ src/top-down.hh                 |  40 ++++++--
+ tests/events-test.cc            |  50 +++++++++-
+ tests/graph-report-test.cc      | 157 ++++++++++++++++++++++++++++++++
+ tests/top-down-test.cc          |  23 ++++-
+ 13 files changed, 452 insertions(+), 31 deletions(-)
+ create mode 100644 src/client/graph-report.hh
+ create mode 100644 tests/graph-report-test.cc
 
+diff --git a/meson.build b/meson.build
+index 8324dda..976aa9b 100644
+--- a/meson.build
++++ b/meson.build
+@@ -477,6 +477,13 @@ if build_server
+     dependencies : common_deps + [nix_store_dep, nix_util_dep],
+   ), timeout : 30)
+ 
++  test('graph-report', executable('graph-report-test',
++    sources : ['tests/graph-report-test.cc', gen],
++    include_directories : [gen_inc, src_inc, include_directories('src/client')],
++    cpp_args : nix_compat_args + ['-UNDEBUG'],
++    dependencies : common_deps + [nix_store_dep, nix_util_dep],
++  ), timeout : 30)
++
+   test('top-down', executable('top-down-test',
+     sources : ['tests/top-down-test.cc'],
+     include_directories : [src_inc],
+diff --git a/nix/packages/nix-grpc-store.nix b/nix/packages/nix-grpc-store.nix
+index d7411cd..db578c5 100644
+--- a/nix/packages/nix-grpc-store.nix
++++ b/nix/packages/nix-grpc-store.nix
+@@ -84,6 +84,7 @@ stdenv.mkDerivation {
+         ../../tests/top-down-test.cc
+         ../../tests/upload-spool-test.cc
+         ../../tests/call-test.cc
++        ../../tests/graph-report-test.cc
+         ../../tests/nar-fetcher-test.cc
+         ../../tests/executor-test.cc
+         ../../tests/retry-test.cc
 diff --git a/proto/events.proto b/proto/events.proto
 index 23697cf..7ab79d2 100644
 --- a/proto/events.proto
@@ -117,10 +159,18 @@ index 66545ff..468d903 100644
    string drv_path = 1;
    // IP:port the balancer knows the worker by; goes into x-nix-worker.
 diff --git a/src/client/build.cc b/src/client/build.cc
-index 03f093e..6c8054f 100644
+index 03f093e..e578d19 100644
 --- a/src/client/build.cc
 +++ b/src/client/build.cc
-@@ -206,12 +206,16 @@ struct GrpcStore::Run {
+@@ -48,6 +48,7 @@
+ 
+ #include "channel.hh"
+ #include "executor.hh"
++#include "graph-report.hh"
+ #include "nix-compat.hh"
+ #include "nix_remote.grpc.pb.h"
+ #include "nix_remote.pb.h"
+@@ -206,12 +207,16 @@ struct GrpcStore::Run {
    std::set<std::pair<JobId, StorePath>> recovered; // (job, missing input) pairs already recovered
    bool closed = false;           // WritesDone sent
    grpc::ClientReaderWriter<remote::ClientMsgs, remote::SchedMsgs> * stream = nullptr;
@@ -139,7 +189,7 @@ index 03f093e..6c8054f 100644
          std::function<JobId(Job &)> add = [&](Job & job) -> JobId {
        auto const name = std::string(job.drvPath.to_string());
        if (auto const found = byName.find(name); found != byName.end()) {
-@@ -291,11 +295,17 @@ struct GrpcStore::Run {
+@@ -291,11 +296,17 @@ struct GrpcStore::Run {
        }
        if (stream == nullptr) {
          exe.unsent(sent);
@@ -157,7 +207,7 @@ index 03f093e..6c8054f 100644
      for (auto const jid : cancels) {
        batch.add_msgs()->mutable_cancel()->set_drv_path(std::string(byId.at(jid)->drvPath.to_string()));
      }
-@@ -596,12 +606,72 @@ auto GrpcStore::scheduleUntilDone(Run & run, const Metadata & headers) -> grpc::
+@@ -596,12 +607,68 @@ auto GrpcStore::scheduleUntilDone(Run & run, const Metadata & headers) -> grpc::
    }
  }
  
@@ -189,26 +239,22 @@ index 03f093e..6c8054f 100644
 +    return;
 +  }
 +  const auto & built = std::get<DerivedPath::Built>(first->raw());
-+  // Counts only: a stream that sends them and half-closes, which the
-+  // scheduler ends. It never holds up or fails the build.
++  // Best effort: on any failure the counts are dropped and the build's own
++  // result stands.
++  std::string why;
 +  try {
-+    static constexpr std::chrono::seconds patience{10};
 +    nixgrpc::Call call;
 +    auto const drvPath = built.drvPath->getBaseStorePath();
 +    addHeaders(call.ctx(), routingFor(basicForFarm(evalStore, drvPath, evalStore.readDerivation(drvPath))));
-+    call.ctx().set_deadline(std::chrono::system_clock::now() + patience);
-+    auto stream = sched->Schedule(&call.ctx());
-+    remote::ClientMsgs batch;
-+    *batch.add_msgs()->mutable_graph() = *msg;
-+    if (stream->Write(batch)) {
-+      stream->WritesDone();
++    auto const status = nixgrpc::reportGraph(*sched, call.ctx(), *msg, graphReportDeadline);
++    if (status.ok()) {
++      return;
 +    }
-+    if (auto const status = stream->Finish(); !status.ok()) {
-+      debug("grpc: the graph's counts did not reach the scheduler: %s", status.error_message());
-+    }
++    why = status.error_message();
 +  } catch (Error & err) {
-+    debug("grpc: the graph's counts did not reach the scheduler: %s", err.what());
++    why = err.what();
 +  }
++  debug("grpc: dropped the graph's counts (%d so far): %s", ++graphReportsDropped, why);
 +}
 +
 +void GrpcStore::buildGraph(const std::vector<DerivedPath> & reqs, BuildMode buildMode, Store & evalStore,
@@ -232,7 +278,7 @@ index 03f093e..6c8054f 100644
    auto const headers = routingFor(jobs.begin()->second.drv);
    // Uploading here keeps a build from waiting on the upload of its inputs' derivations.
    std::vector<StorePath> drvPaths;
-@@ -661,8 +731,7 @@ auto GrpcStore::dispatchBuild(const std::vector<DerivedPath> & reqs, BuildMode b
+@@ -661,8 +728,7 @@ auto GrpcStore::dispatchBuild(const std::vector<DerivedPath> & reqs, BuildMode b
    }
    std::map<StorePath, Job> jobs;
    if (evalStore != nullptr) {
@@ -242,7 +288,7 @@ index 03f093e..6c8054f 100644
    }
  
    // Opaque paths: "building" them means making them valid, i.e. substituting.
-@@ -749,8 +818,8 @@ auto GrpcStore::basicForFarm(Store & evalStore, const StorePath & drvPath, const
+@@ -749,8 +815,8 @@ auto GrpcStore::basicForFarm(Store & evalStore, const StorePath & drvPath, const
  // a derivation that is actually needed do we ask the server to substitute
  // what's missing, like nix does before building. Whatever can't be
  // substituted, e.g. due to an untrusted signature, gets built.
@@ -253,7 +299,7 @@ index 03f093e..6c8054f 100644
    std::map<StorePath, Derivation> drvs;
    std::map<StorePath, std::map<std::string, std::optional<StorePath>>> outputs;
    std::function<void(const StorePath &)> collect = [&](const StorePath & drvPath) -> void {
-@@ -784,7 +853,8 @@ auto GrpcStore::missingInputDrvs(const std::vector<DerivedPath> & reqs, BuildMod
+@@ -784,7 +850,8 @@ auto GrpcStore::missingInputDrvs(const std::vector<DerivedPath> & reqs, BuildMod
          return used;
        },
        [&](const StorePathSet & paths) -> StorePathSet { return queryValidPaths(paths, NoSubstitute); },
@@ -263,7 +309,7 @@ index 03f093e..6c8054f 100644
  }
  
  auto GrpcStore::farmJob(Store & evalStore, const StorePath & drvPath, const Derivation & full,
-@@ -804,8 +874,8 @@ auto GrpcStore::farmJob(Store & evalStore, const StorePath & drvPath, const Deri
+@@ -804,8 +871,8 @@ auto GrpcStore::farmJob(Store & evalStore, const StorePath & drvPath, const Deri
  }
  
  void GrpcStore::loadJobs(const std::vector<DerivedPath> & reqs, BuildMode buildMode, Store & evalStore,
@@ -274,8 +320,52 @@ index 03f093e..6c8054f 100644
    std::function<Job &(const StorePath &)> load = [&](const StorePath & drvPath) -> Job & {
      if (auto const found = jobs.find(drvPath); found != jobs.end()) {
        return found->second;
+diff --git a/src/client/graph-report.hh b/src/client/graph-report.hh
+new file mode 100644
+index 0000000..fbebd44
+--- /dev/null
++++ b/src/client/graph-report.hh
+@@ -0,0 +1,38 @@
++#pragma once
++// A graph's counts on a Schedule stream of their own, for a build with
++// nothing left to schedule. See nix.remote.Graph.
++
++#include <chrono>
++#include <memory>
++
++#include <grpcpp/client_context.h>
++#include <grpcpp/support/status.h>
++#include <grpcpp/support/sync_stream.h>
++
++#include "nix_remote.grpc.pb.h"
++#include "nix_remote.pb.h"
++
++namespace nixgrpc {
++
++// Sends `graph` and half-closes; a scheduler that took it ends the stream.
++// Gives up once `deadline` passed: then the status is not OK and the counts
++// are lost, not retried. Blocks for `deadline` at most and never throws, so
++// the caller's build is not held up or failed by it.
++inline auto reportGraph(nix::remote::Scheduler::Stub & sched, grpc::ClientContext & ctx,
++                        const nix::remote::Graph & graph, std::chrono::milliseconds deadline) -> grpc::Status
++{
++    ctx.set_deadline(std::chrono::system_clock::now() + deadline);
++    std::unique_ptr<grpc::ClientReaderWriter<nix::remote::ClientMsgs, nix::remote::SchedMsgs>> stream =
++        sched.Schedule(&ctx);
++    nix::remote::ClientMsgs batch;
++    *batch.add_msgs()->mutable_graph() = graph;
++    if (stream->Write(batch)) {
++        stream->WritesDone();
++    }
++    // Finish wants what the scheduler sent read first, as a Restarting.
++    for (nix::remote::SchedMsgs ignored; stream->Read(&ignored);) {
++    }
++    return stream->Finish();
++}
++
++} // namespace nixgrpc
 diff --git a/src/client/store.hh b/src/client/store.hh
-index bac7d92..244ce41 100644
+index bac7d92..d4a5f5f 100644
 --- a/src/client/store.hh
 +++ b/src/client/store.hh
 @@ -85,6 +85,7 @@
@@ -286,7 +376,18 @@ index bac7d92..244ce41 100644
  #include "path-info-wire.hh"
  #include "nix_remote.grpc.pb.h"
  #include "nix_remote.pb.h"
-@@ -516,7 +517,15 @@ public:
+@@ -329,6 +330,10 @@ public:
+       return everConnected ? restartGrace() : std::chrono::seconds(config->connectTimeout.get());
+     }
+     static constexpr int minReconnectBackoffMs = 2000;
++    // The longest a fully cached build waits for its graph's counts to reach
++    // the scheduler. They are best-effort statistics and must never
++    // noticeably delay a build, so past this they are dropped, not retried.
++    static constexpr std::chrono::seconds graphReportDeadline{2};
+     template<typename F>
+     void retrying(const char * what, const F & attempt) {
+       // From the first failure, not the call's start: a long upload cut
+@@ -516,7 +521,15 @@ public:
      // usually have the derivations in the local store.
      auto localEvalStore(const StorePathSet & drvPaths) -> std::shared_ptr<Store>;
  
@@ -303,7 +404,7 @@ index bac7d92..244ce41 100644
      auto scheduleUntilDone(Run & run, const Metadata & headers) -> grpc::Status;
  
      // Single drv without a DAG (build hook, legacy buildDerivation callers).
-@@ -529,9 +538,9 @@ public:
+@@ -529,9 +542,9 @@ public:
                   const std::function<bool(const StorePath &)> & isJob) -> Job;
  
      auto missingInputDrvs(const std::vector<nix::DerivedPath> & reqs, nix::BuildMode buildMode,
@@ -314,6 +415,15 @@ index bac7d92..244ce41 100644
 +                  std::map<StorePath, Job> & jobs, nixgrpc::WalkCounts & graph);
  
      void throwOnFailedBuilds(std::vector<KeyedBuildResult> & results);
+ 
+@@ -545,6 +558,8 @@ private:
+     using PathInfoMap = std::map<StorePath, std::shared_ptr<const ValidPathInfo>>;
+ 
+     std::atomic<bool> everConnected = false;
++    // Graph counts dropped so far, in the debug log line of each drop.
++    std::atomic<uint64_t> graphReportsDropped = 0;
+     std::once_flag trustedOnce;
+     std::optional<TrustedFlag> trusted;
  
 diff --git a/src/daemon/dispatcher.cc b/src/daemon/dispatcher.cc
 index 4073dc6..35fd867 100644
@@ -534,6 +644,169 @@ index 835f8bf..28a33ae 100644
      testProgress();
      testRecentBuilds();
      testRecentBuildsTies();
+diff --git a/tests/graph-report-test.cc b/tests/graph-report-test.cc
+new file mode 100644
+index 0000000..395305a
+--- /dev/null
++++ b/tests/graph-report-test.cc
+@@ -0,0 +1,157 @@
++// nixgrpc::reportGraph against an in-process scheduler. A fully cached build
++// sends its graph's counts this way before it returns, so a scheduler that
++// never answers must cost it GrpcStore::graphReportDeadline at most.
++
++#include <atomic>
++#include <cassert>
++#include <chrono>
++#include <cstdint>
++#include <memory>
++#include <string>
++#include <thread>
++#include <utility>
++
++#include <grpcpp/client_context.h>
++#include <grpcpp/create_channel.h>
++#include <grpcpp/security/credentials.h>
++#include <grpcpp/security/server_credentials.h>
++#include <grpcpp/server.h>
++#include <grpcpp/server_builder.h>
++#include <grpcpp/server_context.h>
++#include <grpcpp/support/status.h>
++#include <grpcpp/support/sync_stream.h>
++
++#include "graph-report.hh"
++#include "nix_remote.grpc.pb.h"
++#include "nix_remote.pb.h"
++#include "store.hh"
++
++namespace {
++
++using Clock = std::chrono::steady_clock;
++using std::chrono::milliseconds;
++using std::chrono::seconds;
++
++// Takes the counts. One that answers ends the stream once the client
++// half-closed, as the scheduler does; a hung one never ends it.
++class Scheduler final : public nix::remote::Scheduler::Service
++{
++public:
++    explicit Scheduler(bool answers)
++        : answers(answers)
++    {
++    }
++
++    [[nodiscard]] auto graphCount() const -> int { return graphs; }
++
++    auto Schedule(grpc::ServerContext * ctx,
++                  grpc::ServerReaderWriter<nix::remote::SchedMsgs, nix::remote::ClientMsgs> * stream)
++        -> grpc::Status override
++    {
++        for (nix::remote::ClientMsgs msgs; stream->Read(&msgs);) {
++            for (const auto & msg : msgs.msgs()) {
++                graphs += msg.has_graph() ? 1 : 0;
++            }
++        }
++        constexpr milliseconds poll{10};
++        while (!answers && !ctx->IsCancelled()) {
++            std::this_thread::sleep_for(poll);
++        }
++        return grpc::Status::OK;
++    }
++
++private:
++    bool answers;
++    std::atomic<int> graphs = 0;
++};
++
++struct Fixture
++{
++    Scheduler service;
++    std::unique_ptr<grpc::Server> server;
++    std::unique_ptr<nix::remote::Scheduler::Stub> stub;
++
++    explicit Fixture(bool answers)
++        : service(answers)
++    {
++        grpc::ServerBuilder builder;
++        int port = 0;
++        builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &port);
++        builder.RegisterService(&service);
++        server = builder.BuildAndStart();
++        assert(server);
++        stub = nix::remote::Scheduler::NewStub(
++            grpc::CreateChannel("127.0.0.1:" + std::to_string(port), grpc::InsecureChannelCredentials()));
++    }
++
++    ~Fixture() { server->Shutdown(std::chrono::system_clock::now() + seconds{1}); }
++
++    Fixture(const Fixture &) = delete;
++    Fixture(Fixture &&) = delete;
++    auto operator=(const Fixture &) -> Fixture & = delete;
++    auto operator=(Fixture &&) -> Fixture & = delete;
++};
++
++struct Sent
++{
++    grpc::Status status;
++    Clock::duration took;
++};
++
++auto send(nix::remote::Scheduler::Stub & stub) -> Sent
++{
++    constexpr uint64_t drvs = 120;
++    constexpr uint64_t pruned = 100;
++    nix::remote::Graph graph;
++    graph.set_drvs(drvs);
++    graph.set_pruned_drvs(pruned);
++    grpc::ClientContext ctx;
++    auto const start = Clock::now();
++    auto status = nixgrpc::reportGraph(stub, ctx, graph, nix::GrpcStore::graphReportDeadline);
++    return {.status = std::move(status), .took = Clock::now() - start};
++}
++
++// Room for scheduling on a loaded test machine, well under another deadline.
++constexpr seconds margin{1};
++// Within a tick of the deadline.
++constexpr milliseconds early{100};
++
++void aHungSchedulerCostsTheDeadlineAtMost()
++{
++    Fixture fix(false);
++    auto const sent = send(*fix.stub);
++    assert(sent.status.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED);
++    assert(sent.took >= nix::GrpcStore::graphReportDeadline - early);
++    assert(sent.took < nix::GrpcStore::graphReportDeadline + margin);
++    // The counts arrived; only the end of the stream never did.
++    assert(fix.service.graphCount() == 1);
++}
++
++void aSchedulerThatAnswersEndsTheReportAtOnce()
++{
++    Fixture fix(true);
++    auto const sent = send(*fix.stub);
++    assert(sent.status.ok());
++    assert(sent.took < margin);
++    assert(fix.service.graphCount() == 1);
++}
++
++void aSchedulerThatIsDownFailsTheReportAtOnce()
++{
++    // Nothing listens on port 1 of the loopback.
++    auto stub = nix::remote::Scheduler::NewStub(
++        grpc::CreateChannel("127.0.0.1:1", grpc::InsecureChannelCredentials()));
++    auto const sent = send(*stub);
++    assert(!sent.status.ok());
++    assert(sent.took < margin);
++}
++
++} // namespace
++
++auto main() -> int
++{
++    aHungSchedulerCostsTheDeadlineAtMost();
++    aSchedulerThatAnswersEndsTheReportAtOnce();
++    aSchedulerThatIsDownFailsTheReportAtOnce();
++    return 0;
++}
 diff --git a/tests/top-down-test.cc b/tests/top-down-test.cc
 index 0a1aeb3..5b06b78 100644
 --- a/tests/top-down-test.cc

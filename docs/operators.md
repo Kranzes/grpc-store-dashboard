@@ -489,6 +489,11 @@ builds, the derivations it needed and how many of those it found cached. While n
 patches, the card shows only "Found cached when scheduled": the share of requests the cache had
 when they reached the scheduler. It reads low, since clients request only what they found missing.
 
+A fully cached build has nothing to schedule and sends its counts on a call of their own, so it may
+wait up to 2 seconds for the scheduler to take them. Past that, or when the call fails, the counts
+are lost, not retried, and the build's result is unaffected. The client's debug log counts the
+reports it dropped.
+
 ## 9. Build logs
 
 The Logs tab reads each build's log from the builder that ran it, with `GetBuildLog` through the
